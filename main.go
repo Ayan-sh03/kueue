@@ -58,7 +58,16 @@ type CreateRequest struct {
 	MaxRetries int    `json:"maxRetries"`
 }
 
+type AckRequest struct {
+	MessageId string `json:"messageId"`
+	QueueId   string `json:"queueId"`
+}
+
 func create(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var publishRequest CreateRequest
 
 	err := json.NewDecoder(r.Body).Decode(&publishRequest)
@@ -85,6 +94,10 @@ func create(w http.ResponseWriter, r *http.Request) {
 }
 
 func getQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	params := r.URL.Query()
 	id := params.Get("id")
 
@@ -117,6 +130,10 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func publish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	// publish should , 1. take task 2. put it in queue 3. return id
 	var message PublishRequest
 
@@ -155,6 +172,10 @@ func publish(w http.ResponseWriter, r *http.Request) {
 }
 
 func receive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	// get the queue id from url
 	params := r.URL.Query()
 	id := params.Get("id")
@@ -165,9 +186,9 @@ func receive(w http.ResponseWriter, r *http.Request) {
 
 	// find queue from the id
 	var queue *Queue
-	for _, q := range Queues {
+	for i, q := range Queues {
 		if q.Id == id {
-			queue = &q
+			queue = &Queues[i]
 			break
 		}
 	}
@@ -199,44 +220,102 @@ func receive(w http.ResponseWriter, r *http.Request) {
 }
 
 func ack(w http.ResponseWriter, r *http.Request) {
-	// worker sends the message id to ack
-	params := r.URL.Query()
-	messageId := params.Get("messageId")
-	if messageId == "" {
-		http.Error(w, "messageId is required in the url", http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	queueId := params.Get("queueId")
-	if queueId == "" {
-		http.Error(w, "queueId is required in the url", http.StatusBadRequest)
+	var ackReq AckRequest
+	err := json.NewDecoder(r.Body).Decode(&ackReq)
+	if err != nil {
+		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if ackReq.MessageId == "" {
+		http.Error(w, "messageId is required", http.StatusBadRequest)
+		return
+	}
+	if ackReq.QueueId == "" {
+		http.Error(w, "queueId is required", http.StatusBadRequest)
 		return
 	}
 
 	// find queue from the id
 	var queue *Queue
 	for i, q := range Queues {
-		if q.Id == queueId {
+		if q.Id == ackReq.QueueId {
 			queue = &Queues[i]
 			break
 		}
 	}
 
 	if queue == nil {
-		http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
+		http.Error(w, "Queue Not Found for id: "+ackReq.QueueId, http.StatusNotFound)
 		return
 	}
 	// find the message in the queue and remove it
 	for i, msg := range queue.Messages {
-		if msg.ID == messageId {
+		if msg.ID == ackReq.MessageId {
 			// remove the message from the queue
 			queue.Messages = append(queue.Messages[:i], queue.Messages[i+1:]...)
 			break
 		}
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
 		"message": "Message Acknowledged and removed from queue",
+	})
+
+}
+
+func nack(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var ackReq AckRequest
+	err := json.NewDecoder(r.Body).Decode(&ackReq)
+	if err != nil {
+		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if ackReq.MessageId == "" {
+		http.Error(w, "messageId is required", http.StatusBadRequest)
+		return
+	}
+	if ackReq.QueueId == "" {
+		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+
+	// find queue from the id
+	var queue *Queue
+	for i, q := range Queues {
+		if q.Id == ackReq.QueueId {
+			queue = &Queues[i]
+			break
+		}
+	}
+
+	if queue == nil {
+		http.Error(w, "Queue Not Found for id: "+ackReq.QueueId, http.StatusNotFound)
+		return
+	}
+
+	// find the message in the queue and update its state to ready
+	for i, msg := range queue.Messages {
+		if msg.ID == ackReq.MessageId {
+			queue.Messages[i].State = StateReady
+			break
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "Message Nacked and state updated to ready",
 	})
 
 }
@@ -270,6 +349,7 @@ func main() {
 	http.HandleFunc("/get", getQueue)
 	http.HandleFunc("/publish", publish)
 	http.HandleFunc("/ack", ack)
+	http.HandleFunc("/nack", nack)
 	http.HandleFunc("/receive", receive)
 
 	reaper()

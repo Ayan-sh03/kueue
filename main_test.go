@@ -107,7 +107,10 @@ func TestAck(t *testing.T) {
 		}},
 	}}
 
-	req := httptest.NewRequest("GET", "/ack?messageId=msg-1&queueId=queue-1", nil)
+	ackReq := AckRequest{MessageId: "msg-1", QueueId: "queue-1"}
+	bodyBytes, _ := json.Marshal(ackReq)
+
+	req := httptest.NewRequest("POST", "/ack", bytes.NewReader(bodyBytes))
 	w := httptest.NewRecorder()
 
 	ack(w, req)
@@ -150,4 +153,28 @@ func TestQueueHandler(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected status %d, got %d", http.StatusOK, w.Code)
 	}
+}
+
+func TestNack(t *testing.T) {
+	Queues = []Queue{{
+		Id: "queue-1",
+		Messages: []Message{{
+			ID:    "msg-1",
+			State: StateInFlight,
+		}},
+	}}
+
+	ackReq := AckRequest{MessageId: "msg-1", QueueId: "queue-1"}
+	bodyBytes, _ := json.Marshal(ackReq)
+
+	req := httptest.NewRequest("POST", "/nack", bytes.NewReader(bodyBytes))
+	w := httptest.NewRecorder()
+	nack(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected status %d, got %d", http.StatusAccepted, w.Code)
+	}
+	if Queues[0].Messages[0].State != StateReady {
+		t.Errorf("expected state Ready after nack, got %s", Queues[0].Messages[0].State)
+	}
+
 }
