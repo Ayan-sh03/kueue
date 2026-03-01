@@ -38,6 +38,9 @@ type Queue struct {
 var Queues []Queue
 var DeadLetterQueue []Message
 
+// channel for long polling in receive
+var receiveChannel = make(chan struct{}, 1)
+
 func queueHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
@@ -162,6 +165,12 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	message.Message.EnqueuedAt = time.Now()
 	queue.Messages = append(queue.Messages, message.Message)
 
+	//publish to channel for long polling in receive
+	select {
+	case receiveChannel <- struct{}{}:
+	default:
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -198,20 +207,47 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// return the first message in readyState
-	for i, msg := range queue.Messages {
-		if msg.State == StateReady {
-			// update the message state to in-flight and set visibility deadline
-			queue.Messages[i].State = StateInFlight
-			queue.Messages[i].VisibilityDeadline = time.Now().Add(30 * time.Second)
-			queue.Messages[i].DeliveryCount += 1
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(map[string]any{
-				"id":    msg.ID,
-				"state": StateInFlight,
-			})
-			return
+	if wait := params.Get("wait"); wait == "true" {
+
+		// long poll for 30 seconds if no message in ready state
+		select {
+		case <-receiveChannel:
+			// check for ready message again
+			for i, msg := range queue.Messages {
+				if msg.State == StateReady {
+					// update the message state to in-flight and set visibility deadline
+					queue.Messages[i].State = StateInFlight
+					queue.Messages[i].VisibilityDeadline = time.Now().Add(30 * time.Second)
+					queue.Messages[i].DeliveryCount += 1
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusAccepted)
+					json.NewEncoder(w).Encode(map[string]any{
+						"id":    msg.ID,
+						"state": StateInFlight,
+					})
+					return
+				}
+			}
+		case <-time.After(30 * time.Second):
+			// timeout after 30 seconds
+		}
+	} else {
+
+		// return the first message in readyState
+		for i, msg := range queue.Messages {
+			if msg.State == StateReady {
+				// update the message state to in-flight and set visibility deadline
+				queue.Messages[i].State = StateInFlight
+				queue.Messages[i].VisibilityDeadline = time.Now().Add(30 * time.Second)
+				queue.Messages[i].DeliveryCount += 1
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				json.NewEncoder(w).Encode(map[string]any{
+					"id":    msg.ID,
+					"state": StateInFlight,
+				})
+				return
+			}
 		}
 	}
 

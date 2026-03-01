@@ -98,6 +98,57 @@ func TestReceive(t *testing.T) {
 	}
 }
 
+// TestReceiveLongPoll verifies that a waiting receive call unblocks when a
+// message is published. It exercises the long-polling logic which depends on
+// the global `receiveChannel` being signaled by `publish`.
+func TestReceiveLongPoll(t *testing.T) {
+	// reset global state
+	receiveChannel = make(chan struct{}, 1)
+	Queues = []Queue{{
+		Id:       "queue-1",
+		Messages: []Message{},
+	}}
+
+	// start a goroutine that will call receive with wait=true
+	req := httptest.NewRequest("GET", "/receive?id=queue-1&wait=true", nil)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		receive(w, req)
+		close(done)
+	}()
+
+	// let the handler block on the channel
+	time.Sleep(50 * time.Millisecond)
+
+	// now publish a message which should trigger the channel
+	msg := Message{Body: []byte("test")}
+	pubReq := PublishRequest{Message: msg, QueueId: "queue-1"}
+	bodyBytes, _ := json.Marshal(pubReq)
+	reqPub := httptest.NewRequest("POST", "/publish", bytes.NewReader(bodyBytes))
+	wPub := httptest.NewRecorder()
+	publish(wPub, reqPub)
+
+	// wait for receive to complete
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("long-poll receive did not return after publish")
+	}
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected status %d after long poll, got %d", http.StatusAccepted, w.Code)
+	}
+
+	if len(Queues[0].Messages) != 1 {
+		t.Errorf("expected 1 message in queue, got %d", len(Queues[0].Messages))
+	}
+
+	if Queues[0].Messages[0].State != StateInFlight {
+		t.Errorf("expected the message to be marked InFlight, got %s", Queues[0].Messages[0].State)
+	}
+}
+
 func TestAck(t *testing.T) {
 	Queues = []Queue{{
 		Id: "queue-1",
