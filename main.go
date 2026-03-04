@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/google/uuid"
 )
 
@@ -34,6 +36,8 @@ type Queue struct {
 	Messages   []Message `json:"messages"`
 	MaxRetries int       `json:"maxRetries"`
 }
+
+var Db *badger.DB
 
 var Queues []Queue
 var DeadLetterQueue []Message
@@ -86,7 +90,14 @@ func create(w http.ResponseWriter, r *http.Request) {
 		MaxRetries: publishRequest.MaxRetries,
 	}
 
-	Queues = append(Queues, queue)
+	err = Db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(queue.Id), []byte(queue.Name))
+	})
+	if err != nil {
+		http.Error(w, "Failed to create queue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// 	Queues = append(Queues, queue)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -112,23 +123,28 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	for _, q := range Queues {
-		if q.Id == id {
+	//get from db
+
+	err := Db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(id))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(map[string]any{
 				"id":   id,
-				"name": q.Name,
+				"name": string(val),
 			})
-			return
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotFound)
-	json.NewEncoder(w).Encode(map[string]any{
-		"Error": "Queue Not Found for id: " + id,
+			return nil
+		})
 	})
+	if err != nil {
+		log.Println(err)
+		http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+		return
+	}
 
 }
 
@@ -380,6 +396,14 @@ func reaper() {
 }
 
 func main() {
+	db, err := badger.Open(badger.DefaultOptions("/tmp/badger"))
+	if err != nil {
+		fmt.Println("Error opening BadgerDB:", err)
+		return
+	}
+	Db = db
+	defer Db.Close()
+	fmt.Println("DB initialised successfully")
 	http.HandleFunc("/", queueHandler)
 	http.HandleFunc("/create", create)
 	http.HandleFunc("/get", getQueue)
