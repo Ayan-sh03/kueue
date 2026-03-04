@@ -163,13 +163,19 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 	queueId := message.QueueId
 	var queue *Queue
-	for i, q := range Queues {
-		if q.Id == queueId {
-			queue = &Queues[i]
-			break
+	err = Db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(queueId))
+		if err != nil {
+			return err
 		}
-
-	}
+		return item.Value(func(val []byte) error {
+			queue = &Queue{
+				Id:   queueId,
+				Name: string(val),
+			}
+			return nil
+		})
+	})
 	if queue == nil {
 		http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
 		return
@@ -179,7 +185,22 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	message.Message.ID = uuid.NewString()
 	message.Message.State = StateReady
 	message.Message.EnqueuedAt = time.Now()
-	queue.Messages = append(queue.Messages, message.Message)
+
+	messageJson, err := json.Marshal(message.Message)
+	if err != nil {
+		http.Error(w, "Bad Reqeust: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	err = Db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(message.Message.ID), messageJson)
+	})
+	if err != nil {
+		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// queue.Messages = append(queue.Messages, message.Message)
 
 	//publish to channel for long polling in receive
 	select {
