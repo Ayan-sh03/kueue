@@ -193,7 +193,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(message.Message.ID), messageJson)
+		return txn.Set([]byte(queueId+"|"+message.Message.ID), messageJson)
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -217,12 +217,60 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 }
 
+// claimNextReadyMessage scans all messages for a queue (prefix queueId|),
+// finds the first one in StateReady, atomically updates it to StateInFlight
+// in the same Db.Update transaction, and returns it.
+func claimNextReadyMessage(queueId string) (*Message, error) {
+	var claimed *Message
+	err := Db.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.Prefix = []byte(queueId + "|")
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			err := item.Value(func(v []byte) error {
+				var msg Message
+				if err := json.Unmarshal(v, &msg); err != nil {
+					return err
+				}
+				if msg.State != StateReady {
+					return nil // skip non-ready messages
+				}
+				// claim: flip to in-flight
+				msg.State = StateInFlight
+				msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
+				msg.DeliveryCount++
+				updated, err := json.Marshal(msg)
+				if err != nil {
+					return err
+				}
+				// must copy the key — item.Key() is only valid inside this callback
+				if err := txn.Set(item.KeyCopy(nil), updated); err != nil {
+					return err
+				}
+				claimed = &msg
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if claimed != nil {
+				return nil // stop after first ready message
+			}
+		}
+		return nil
+	})
+	return claimed, err
+}
+
 func receive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// get the queue id from url
 	params := r.URL.Query()
 	id := params.Get("id")
 	if id == "" {
@@ -230,66 +278,46 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// find queue from the id
-	var queue *Queue
-	for i, q := range Queues {
-		if q.Id == id {
-			queue = &Queues[i]
-			break
-		}
-	}
-
-	if queue == nil {
+	// verify queue exists
+	err := Db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get([]byte(id))
+		return err
+	})
+	if err != nil {
+		log.Println(err)
 		http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 		return
 	}
 
-	if wait := params.Get("wait"); wait == "true" {
+	var msg *Message
 
-		// long poll for 30 seconds if no message in ready state
+	if wait := params.Get("wait"); wait == "true" {
+		// long poll: block until a publish signal arrives or 30s timeout
 		select {
 		case <-receiveChannel:
-			// check for ready message again
-			for i, msg := range queue.Messages {
-				if msg.State == StateReady {
-					// update the message state to in-flight and set visibility deadline
-					queue.Messages[i].State = StateInFlight
-					queue.Messages[i].VisibilityDeadline = time.Now().Add(30 * time.Second)
-					queue.Messages[i].DeliveryCount += 1
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusAccepted)
-					json.NewEncoder(w).Encode(map[string]any{
-						"id":    msg.ID,
-						"state": StateInFlight,
-					})
-					return
-				}
-			}
+			msg, err = claimNextReadyMessage(id)
 		case <-time.After(30 * time.Second):
-			// timeout after 30 seconds
+			// timed out — fall through with msg == nil
 		}
 	} else {
-
-		// return the first message in readyState
-		for i, msg := range queue.Messages {
-			if msg.State == StateReady {
-				// update the message state to in-flight and set visibility deadline
-				queue.Messages[i].State = StateInFlight
-				queue.Messages[i].VisibilityDeadline = time.Now().Add(30 * time.Second)
-				queue.Messages[i].DeliveryCount += 1
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusAccepted)
-				json.NewEncoder(w).Encode(map[string]any{
-					"id":    msg.ID,
-					"state": StateInFlight,
-				})
-				return
-			}
-		}
+		msg, err = claimNextReadyMessage(id)
 	}
 
-	http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
+	if err != nil {
+		http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if msg == nil {
+		http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
+		return
+	}
 
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":    msg.ID,
+		"state": StateInFlight,
+	})
 }
 
 func ack(w http.ResponseWriter, r *http.Request) {
