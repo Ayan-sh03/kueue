@@ -242,8 +242,12 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+			return
+		}
 		log.Println(err)
-		http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -263,22 +267,21 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queueId := message.QueueId
-	var queue *Queue
 	err = Db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(queueId))
 		if err != nil {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			queue = &Queue{
-				Id:   queueId,
-				Name: string(val),
-			}
 			return nil
 		})
 	})
-	if queue == nil {
-		http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -387,8 +390,12 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+			return
+		}
 		log.Println(err)
-		http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
