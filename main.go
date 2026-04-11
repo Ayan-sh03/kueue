@@ -446,11 +446,15 @@ func receive(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if msg == nil {
+				timer := time.NewTimer(30 * time.Second)
+				defer timer.Stop()
 				select {
 				case <-readyCh:
 					msg, err = claimNextReadyMessage(id)
-				case <-time.After(30 * time.Second):
+				case <-timer.C:
 					// timed out — fall through with msg == nil
+				case <-r.Context().Done():
+					return
 				}
 			}
 		}
