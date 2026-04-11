@@ -15,7 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $tmpDir = Join-Path $repoRoot "tmp"
 $containerName = "kueue-benchmark-rabbitmq"
 $dbPath = Join-Path $tmpDir ("benchmark-badger-" + $KueuePort)
@@ -28,22 +28,45 @@ if ([System.IO.Path]::IsPathRooted($Output)) {
     $outputPath = Join-Path $repoRoot $Output
 }
 
+function Get-CanonicalPath {
+    param([string]$PathToNormalize)
+
+    $fullPath = [System.IO.Path]::GetFullPath($PathToNormalize)
+    if ($fullPath.Length -gt 3) {
+        $fullPath = $fullPath.TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+    }
+
+    return $fullPath
+}
+
+$repoRoot = Get-CanonicalPath $repoRoot
+
 function Assert-WithinRepo {
     param([string]$PathToCheck)
 
-    $repoFull = [System.IO.Path]::GetFullPath($repoRoot)
-    $targetFull = [System.IO.Path]::GetFullPath($PathToCheck)
-    if (-not $targetFull.StartsWith($repoFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $repoFull = $repoRoot
+    $targetFull = Get-CanonicalPath $PathToCheck
+    $repoPrefix = $repoFull + [System.IO.Path]::DirectorySeparatorChar
+
+    if (
+        $targetFull -ne $repoFull -and
+        -not $targetFull.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
         throw "Refusing to operate outside the repo: $targetFull"
     }
+
+    return $targetFull
 }
 
 function Reset-RepoDir {
     param([string]$PathToReset)
 
-    Assert-WithinRepo -PathToCheck $PathToReset
-    if (Test-Path -LiteralPath $PathToReset) {
-        Remove-Item -LiteralPath $PathToReset -Recurse -Force
+    $resolvedPath = Assert-WithinRepo -PathToCheck $PathToReset
+    if (Test-Path -LiteralPath $resolvedPath) {
+        Remove-Item -LiteralPath $resolvedPath -Recurse -Force
     }
 }
 
@@ -86,8 +109,19 @@ function Wait-RabbitReady {
     throw "RabbitMQ container did not become ready"
 }
 
+$tmpDir = Assert-WithinRepo -PathToCheck $tmpDir
+$dbPath = Assert-WithinRepo -PathToCheck $dbPath
+$stdoutLogPath = Assert-WithinRepo -PathToCheck $stdoutLogPath
+$stderrLogPath = Assert-WithinRepo -PathToCheck $stderrLogPath
+$outputPath = Assert-WithinRepo -PathToCheck $outputPath
+if ($outputPath -eq $repoRoot) {
+    $outputDir = $repoRoot
+} else {
+    $outputDir = Assert-WithinRepo -PathToCheck ([System.IO.Path]::GetDirectoryName($outputPath))
+}
+
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($outputPath)) | Out-Null
+New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 Stop-ListenerOnPort -Port $KueuePort
 Start-Sleep -Milliseconds 500
