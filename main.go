@@ -595,6 +595,8 @@ func main() {
 	reaper()
 	fmt.Println("Producer Running on Port " + port)
 
-	http.ListenAndServe(":"+port, nil)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("server failed: %v", err)
+	}
 
 }
