@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -50,8 +51,70 @@ var receiveChannel = make(chan struct{}, 1)
 var queueReadyChans = map[string]chan struct{}{}
 var queueReadyChansMu sync.Mutex
 
-func messageKey(queueID, messageID string) []byte {
-	return []byte(queueID + "|" + messageID)
+func queueMessagePrefix(queueID string) []byte {
+	return []byte(queueID + "|")
+}
+
+func messageKey(queueID string, seq uint64, messageID string) []byte {
+	prefix := queueMessagePrefix(queueID)
+	key := make([]byte, 0, len(prefix)+8+1+len(messageID))
+	key = append(key, prefix...)
+
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	key = append(key, seqBytes[:]...)
+	key = append(key, '|')
+	key = append(key, messageID...)
+
+	return key
+}
+
+func queueSequenceKey(queueID string) []byte {
+	return []byte("seq:" + queueID)
+}
+
+func nextMessageSequence(queueID string) (uint64, error) {
+	seq, err := Db.GetSequence(queueSequenceKey(queueID), 1)
+	if err != nil {
+		return 0, err
+	}
+	defer seq.Release()
+
+	return seq.Next()
+}
+
+func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Message, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = true
+	opts.Prefix = queueMessagePrefix(queueID)
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	for it.Rewind(); it.Valid(); it.Next() {
+		item := it.Item()
+		var found *Message
+
+		err := item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+			if msg.ID != messageID {
+				return nil
+			}
+
+			found = &msg
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if found != nil {
+			return item.KeyCopy(nil), found, nil
+		}
+	}
+
+	return nil, nil, badger.ErrKeyNotFound
 }
 
 func queueReadyChan(queueID string) chan struct{} {
@@ -220,6 +283,12 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// push to queue and return id
+	seq, err := nextMessageSequence(queueId)
+	if err != nil {
+		http.Error(w, "Error Allocating Message Sequence: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	message.Message.ID = uuid.NewString()
 	message.Message.State = StateReady
 	message.Message.EnqueuedAt = time.Now()
@@ -231,7 +300,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		return txn.Set(messageKey(queueId, message.Message.ID), messageJson)
+		return txn.Set(messageKey(queueId, seq, message.Message.ID), messageJson)
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -259,7 +328,7 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
-		opts.Prefix = []byte(queueId + "|")
+		opts.Prefix = queueMessagePrefix(queueId)
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
@@ -397,10 +466,11 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
-		if _, err := txn.Get(messageKey(ackReq.QueueId, ackReq.MessageId)); err != nil {
+		key, _, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
+		if err != nil {
 			return err
 		}
-		return txn.Delete(messageKey(ackReq.QueueId, ackReq.MessageId))
+		return txn.Delete(key)
 	})
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
@@ -445,27 +515,20 @@ func nack(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		item, err := txn.Get(messageKey(ackReq.QueueId, ackReq.MessageId))
+		key, msg, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
 		if err != nil {
 			return err
 		}
 
-		return item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
+		msg.State = StateReady
+		msg.VisibilityDeadline = time.Time{}
 
-			msg.State = StateReady
-			msg.VisibilityDeadline = time.Time{}
+		updated, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
 
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-
-			return txn.Set(messageKey(ackReq.QueueId, ackReq.MessageId), updated)
-		})
+		return txn.Set(key, updated)
 	})
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
