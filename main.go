@@ -17,6 +17,15 @@ import (
 
 var queue []int
 
+type ErrDeliveryTokenMismatch struct {
+	Expected string
+	Got      string
+}
+
+func (e *ErrDeliveryTokenMismatch) Error() string {
+	return fmt.Sprintf("delivery token mismatch: expected %q, got %q", e.Expected, e.Got)
+}
+
 type MessageState string
 
 const (
@@ -32,6 +41,7 @@ type Message struct {
 	EnqueuedAt         time.Time    `json:"enqueuedAt"`
 	DeliveryCount      int          `json:"deliveryCount"`
 	VisibilityDeadline time.Time    `json:"visibilityDeadline"`
+	DeliveryAttemptID  string       `json:"deliveryAttemptId"`
 }
 
 type Queue struct {
@@ -167,8 +177,9 @@ type CreateRequest struct {
 }
 
 type AckRequest struct {
-	MessageId string `json:"messageId"`
-	QueueId   string `json:"queueId"`
+	MessageId     string `json:"messageId"`
+	QueueId       string `json:"queueId"`
+	DeliveryToken string `json:"deliveryToken"`
 }
 
 func create(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +360,7 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 				msg.State = StateInFlight
 				msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
 				msg.DeliveryCount++
+				msg.DeliveryAttemptID = uuid.NewString()
 				updated, err := json.Marshal(msg)
 				if err != nil {
 					return err
@@ -442,9 +454,10 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":    msg.ID,
-		"body":  msg.Body,
-		"state": StateInFlight,
+		"id":            msg.ID,
+		"body":          msg.Body,
+		"state":         StateInFlight,
+		"deliveryToken": msg.DeliveryAttemptID,
 	})
 }
 
@@ -468,20 +481,31 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
 		return
 	}
+	if ackReq.DeliveryToken == "" {
+		http.Error(w, "deliveryToken is required", http.StatusBadRequest)
+		return
+	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
-		key, _, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
+		key, msg, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
 		if err != nil {
 			return err
+		}
+		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
+			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
 		}
 		return txn.Delete(key)
 	})
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
+		}
+		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
@@ -516,6 +540,10 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
 		return
 	}
+	if ackReq.DeliveryToken == "" {
+		http.Error(w, "deliveryToken is required", http.StatusBadRequest)
+		return
+	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
@@ -527,8 +555,13 @@ func nack(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
+			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
+		}
+
 		msg.State = StateReady
 		msg.VisibilityDeadline = time.Time{}
+		msg.DeliveryAttemptID = ""
 
 		updated, err := json.Marshal(msg)
 		if err != nil {
@@ -540,6 +573,10 @@ func nack(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
+		}
+		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
@@ -585,6 +622,7 @@ func reapExpiredMessages(now time.Time) ([]string, error) {
 
 				msg.State = StateReady
 				msg.VisibilityDeadline = time.Time{}
+				msg.DeliveryAttemptID = ""
 
 				updated, err := json.Marshal(msg)
 				if err != nil {
