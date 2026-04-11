@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -46,9 +47,40 @@ var DeadLetterQueue []Message
 
 // channel for long polling in receive
 var receiveChannel = make(chan struct{}, 1)
+var queueReadyChans = map[string]chan struct{}{}
+var queueReadyChansMu sync.Mutex
 
 func messageKey(queueID, messageID string) []byte {
 	return []byte(queueID + "|" + messageID)
+}
+
+func queueReadyChan(queueID string) chan struct{} {
+	queueReadyChansMu.Lock()
+	defer queueReadyChansMu.Unlock()
+
+	ch, ok := queueReadyChans[queueID]
+	if !ok {
+		ch = make(chan struct{})
+		queueReadyChans[queueID] = ch
+	}
+
+	return ch
+}
+
+func signalQueueReady(queueID string) {
+	queueReadyChansMu.Lock()
+	ch, ok := queueReadyChans[queueID]
+	if !ok {
+		ch = make(chan struct{})
+	}
+	close(ch)
+	queueReadyChans[queueID] = make(chan struct{})
+	queueReadyChansMu.Unlock()
+
+	select {
+	case receiveChannel <- struct{}{}:
+	default:
+	}
 }
 
 func queueHandler(w http.ResponseWriter, r *http.Request) {
@@ -208,11 +240,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 	// queue.Messages = append(queue.Messages, message.Message)
 
-	//publish to channel for long polling in receive
-	select {
-	case receiveChannel <- struct{}{}:
-	default:
-	}
+	signalQueueReady(queueId)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -298,12 +326,29 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	var msg *Message
 
 	if wait := params.Get("wait"); wait == "true" {
-		// long poll: block until a publish signal arrives or 30s timeout
-		select {
-		case <-receiveChannel:
+		msg, err = claimNextReadyMessage(id)
+		if err != nil {
+			http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if msg == nil {
+			readyCh := queueReadyChan(id)
+
+			// Re-check after subscribing to avoid missing a publish between the
+			// initial claim attempt and the wait setup.
 			msg, err = claimNextReadyMessage(id)
-		case <-time.After(30 * time.Second):
-			// timed out — fall through with msg == nil
+			if err != nil {
+				http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if msg == nil {
+				select {
+				case <-readyCh:
+					msg, err = claimNextReadyMessage(id)
+				case <-time.After(30 * time.Second):
+					// timed out — fall through with msg == nil
+				}
+			}
 		}
 	} else {
 		msg, err = claimNextReadyMessage(id)
@@ -438,8 +483,8 @@ func nack(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func reapExpiredMessages(now time.Time) (bool, error) {
-	var recovered bool
+func reapExpiredMessages(now time.Time) ([]string, error) {
+	recoveredQueues := map[string]struct{}{}
 
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -449,9 +494,12 @@ func reapExpiredMessages(now time.Time) (bool, error) {
 
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			if bytes.IndexByte(item.Key(), '|') == -1 {
+			key := item.KeyCopy(nil)
+			pipeIndex := bytes.IndexByte(key, '|')
+			if pipeIndex == -1 {
 				continue
 			}
+			queueID := string(key[:pipeIndex])
 
 			err := item.Value(func(v []byte) error {
 				var msg Message
@@ -476,7 +524,7 @@ func reapExpiredMessages(now time.Time) (bool, error) {
 					return err
 				}
 
-				recovered = true
+				recoveredQueues[queueID] = struct{}{}
 				return nil
 			})
 			if err != nil {
@@ -487,7 +535,12 @@ func reapExpiredMessages(now time.Time) (bool, error) {
 		return nil
 	})
 
-	return recovered, err
+	queueIDs := make([]string, 0, len(recoveredQueues))
+	for queueID := range recoveredQueues {
+		queueIDs = append(queueIDs, queueID)
+	}
+
+	return queueIDs, err
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.
@@ -498,17 +551,14 @@ func reaper() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			recovered, err := reapExpiredMessages(time.Now())
+			recoveredQueueIDs, err := reapExpiredMessages(time.Now())
 			if err != nil {
 				log.Println("reaper:", err)
 				continue
 			}
 
-			if recovered {
-				select {
-				case receiveChannel <- struct{}{}:
-				default:
-				}
+			for _, queueID := range recoveredQueueIDs {
+				signalQueueReady(queueID)
 			}
 		}
 	}()
