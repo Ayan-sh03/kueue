@@ -118,6 +118,27 @@ func storedMessageKey(t *testing.T, queueID, messageID string) []byte {
 	return key
 }
 
+type receiveResponse struct {
+	ID            string       `json:"id"`
+	Body          []byte       `json:"body"`
+	State         MessageState `json:"state"`
+	DeliveryToken string       `json:"deliveryToken"`
+}
+
+func receiveTestMessage(t *testing.T, queueID string) receiveResponse {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	recorder := httptest.NewRecorder()
+	receive(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	return decodeResponse[receiveResponse](t, recorder)
+}
+
 func TestCreateAndGetQueue(t *testing.T) {
 	setupTestDB(t)
 
@@ -150,19 +171,7 @@ func TestPublishReceiveAck(t *testing.T) {
 	queueID := createTestQueue(t, "ack-queue")
 	messageID := publishTestMessage(t, queueID, []byte("hello"))
 
-	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-	recorder := httptest.NewRecorder()
-	receive(recorder, req)
-
-	if recorder.Code != http.StatusAccepted {
-		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-
-	resp := decodeResponse[struct {
-		ID    string       `json:"id"`
-		Body  []byte       `json:"body"`
-		State MessageState `json:"state"`
-	}](t, recorder)
+	resp := receiveTestMessage(t, queueID)
 
 	if resp.ID != messageID {
 		t.Fatalf("expected message id %s, got %s", messageID, resp.ID)
@@ -173,9 +182,12 @@ func TestPublishReceiveAck(t *testing.T) {
 	if resp.State != StateInFlight {
 		t.Fatalf("expected in-flight state, got %s", resp.State)
 	}
+	if resp.DeliveryToken == "" {
+		t.Fatal("expected non-empty delivery token")
+	}
 
 	storedKey := storedMessageKey(t, queueID, messageID)
-	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID})
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: resp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal ack request: %v", err)
 	}
@@ -203,14 +215,9 @@ func TestNackMakesMessageReceivableAgain(t *testing.T) {
 	queueID := createTestQueue(t, "nack-queue")
 	messageID := publishTestMessage(t, queueID, []byte("retry"))
 
-	firstReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-	firstRecorder := httptest.NewRecorder()
-	receive(firstRecorder, firstReceive)
-	if firstRecorder.Code != http.StatusAccepted {
-		t.Fatalf("first receive status = %d, body = %s", firstRecorder.Code, firstRecorder.Body.String())
-	}
+	firstResp := receiveTestMessage(t, queueID)
 
-	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID})
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: firstResp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal nack request: %v", err)
 	}
@@ -222,23 +229,13 @@ func TestNackMakesMessageReceivableAgain(t *testing.T) {
 		t.Fatalf("nack status = %d, body = %s", nackRecorder.Code, nackRecorder.Body.String())
 	}
 
-	secondReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-	secondRecorder := httptest.NewRecorder()
-	receive(secondRecorder, secondReceive)
-	if secondRecorder.Code != http.StatusAccepted {
-		t.Fatalf("second receive status = %d, body = %s", secondRecorder.Code, secondRecorder.Body.String())
-	}
+	secondResp := receiveTestMessage(t, queueID)
 
-	resp := decodeResponse[struct {
-		ID   string `json:"id"`
-		Body []byte `json:"body"`
-	}](t, secondRecorder)
-
-	if resp.ID != messageID {
-		t.Fatalf("expected same message id after nack, got %s", resp.ID)
+	if secondResp.ID != messageID {
+		t.Fatalf("expected same message id after nack, got %s", secondResp.ID)
 	}
-	if string(resp.Body) != "retry" {
-		t.Fatalf("expected body retry, got %q", string(resp.Body))
+	if string(secondResp.Body) != "retry" {
+		t.Fatalf("expected body retry, got %q", string(secondResp.Body))
 	}
 }
 
@@ -258,18 +255,7 @@ func TestReceiveReturnsMessagesInEnqueueOrder(t *testing.T) {
 		{id: secondID, body: "second"},
 		{id: thirdID, body: "third"},
 	} {
-		req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-		recorder := httptest.NewRecorder()
-		receive(recorder, req)
-
-		if recorder.Code != http.StatusAccepted {
-			t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
-		}
-
-		resp := decodeResponse[struct {
-			ID   string `json:"id"`
-			Body []byte `json:"body"`
-		}](t, recorder)
+		resp := receiveTestMessage(t, queueID)
 
 		if resp.ID != expected.id {
 			t.Fatalf("expected message id %s, got %s", expected.id, resp.ID)
@@ -278,7 +264,7 @@ func TestReceiveReturnsMessagesInEnqueueOrder(t *testing.T) {
 			t.Fatalf("expected body %s, got %q", expected.body, string(resp.Body))
 		}
 
-		ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: resp.ID})
+		ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: resp.ID, DeliveryToken: resp.DeliveryToken})
 		if err != nil {
 			t.Fatalf("marshal ack request: %v", err)
 		}
@@ -319,10 +305,7 @@ func TestReceiveLongPollUnblocksOnPublish(t *testing.T) {
 		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 
-	resp := decodeResponse[struct {
-		ID   string `json:"id"`
-		Body []byte `json:"body"`
-	}](t, recorder)
+	resp := decodeResponse[receiveResponse](t, recorder)
 
 	if resp.ID != messageID {
 		t.Fatalf("expected message id %s, got %s", messageID, resp.ID)
@@ -368,10 +351,7 @@ func TestReceiveLongPollIgnoresOtherQueuePublishes(t *testing.T) {
 		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 
-	resp := decodeResponse[struct {
-		ID   string `json:"id"`
-		Body []byte `json:"body"`
-	}](t, recorder)
+	resp := decodeResponse[receiveResponse](t, recorder)
 
 	if resp.ID != messageID {
 		t.Fatalf("expected message id %s, got %s", messageID, resp.ID)
@@ -387,12 +367,8 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 	queueID := createTestQueue(t, "reaper-queue")
 	messageID := publishTestMessage(t, queueID, []byte("expired"))
 
-	firstReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-	firstRecorder := httptest.NewRecorder()
-	receive(firstRecorder, firstReceive)
-	if firstRecorder.Code != http.StatusAccepted {
-		t.Fatalf("first receive status = %d, body = %s", firstRecorder.Code, firstRecorder.Body.String())
-	}
+	firstResp := receiveTestMessage(t, queueID)
+	firstToken := firstResp.DeliveryToken
 
 	storedKey := storedMessageKey(t, queueID, messageID)
 	err := Db.Update(func(txn *badger.Txn) error {
@@ -429,27 +405,72 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 		t.Fatal("expected reapExpiredMessages to recover the expired message")
 	}
 
-	secondReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
-	secondRecorder := httptest.NewRecorder()
-	receive(secondRecorder, secondReceive)
-	if secondRecorder.Code != http.StatusAccepted {
-		t.Fatalf("second receive status = %d, body = %s", secondRecorder.Code, secondRecorder.Body.String())
+	secondResp := receiveTestMessage(t, queueID)
+
+	if secondResp.ID != messageID {
+		t.Fatalf("expected same message id after reap, got %s", secondResp.ID)
+	}
+	if string(secondResp.Body) != "expired" {
+		t.Fatalf("expected body expired, got %q", string(secondResp.Body))
+	}
+	if secondResp.State != StateInFlight {
+		t.Fatalf("expected in-flight state after re-receive, got %s", secondResp.State)
 	}
 
-	resp := decodeResponse[struct {
-		ID    string       `json:"id"`
-		Body  []byte       `json:"body"`
-		State MessageState `json:"state"`
-	}](t, secondRecorder)
+	// Stale delivery token should be rejected
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: firstToken})
+	if err != nil {
+		t.Fatalf("marshal ack request: %v", err)
+	}
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+	if ackRecorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for stale delivery token, got %d: %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+}
 
-	if resp.ID != messageID {
-		t.Fatalf("expected same message id after reap, got %s", resp.ID)
+func TestAckRejectsWrongDeliveryToken(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "token-queue")
+	messageID := publishTestMessage(t, queueID, []byte("secret"))
+
+	_ = receiveTestMessage(t, queueID)
+
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: "wrong-token"})
+	if err != nil {
+		t.Fatalf("marshal ack request: %v", err)
 	}
-	if string(resp.Body) != "expired" {
-		t.Fatalf("expected body expired, got %q", string(resp.Body))
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+
+	if ackRecorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for wrong delivery token, got %d: %s", ackRecorder.Code, ackRecorder.Body.String())
 	}
-	if resp.State != StateInFlight {
-		t.Fatalf("expected in-flight state after re-receive, got %s", resp.State)
+}
+
+func TestNackRejectsWrongDeliveryToken(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "nack-token-queue")
+	messageID := publishTestMessage(t, queueID, []byte("secret"))
+
+	_ = receiveTestMessage(t, queueID)
+
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: "wrong-token"})
+	if err != nil {
+		t.Fatalf("marshal nack request: %v", err)
+	}
+
+	nackReq := httptest.NewRequest(http.MethodPost, "/nack", bytes.NewReader(nackBody))
+	nackRecorder := httptest.NewRecorder()
+	nack(nackRecorder, nackReq)
+
+	if nackRecorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for wrong delivery token, got %d: %s", nackRecorder.Code, nackRecorder.Body.String())
 	}
 }
 
