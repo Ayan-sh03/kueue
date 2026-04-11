@@ -23,6 +23,7 @@ func setupTestDB(t *testing.T) {
 	Queues = nil
 	DeadLetterQueue = nil
 	receiveChannel = make(chan struct{}, 1)
+	queueReadyChans = map[string]chan struct{}{}
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -260,6 +261,55 @@ func TestReceiveLongPollUnblocksOnPublish(t *testing.T) {
 	}
 }
 
+func TestReceiveLongPollIgnoresOtherQueuePublishes(t *testing.T) {
+	setupTestDB(t)
+
+	queueAID := createTestQueue(t, "queue-a")
+	queueBID := createTestQueue(t, "queue-b")
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueAID+"&wait=true", nil)
+	recorder := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		receive(recorder, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	publishTestMessage(t, queueBID, []byte("wrong-queue"))
+
+	select {
+	case <-done:
+		t.Fatal("queue A long-poll returned after publish to queue B")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	messageID := publishTestMessage(t, queueAID, []byte("right-queue"))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queue A long-poll did not complete after publish to queue A")
+	}
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	resp := decodeResponse[struct {
+		ID   string `json:"id"`
+		Body []byte `json:"body"`
+	}](t, recorder)
+
+	if resp.ID != messageID {
+		t.Fatalf("expected message id %s, got %s", messageID, resp.ID)
+	}
+	if string(resp.Body) != "right-queue" {
+		t.Fatalf("expected body right-queue, got %q", string(resp.Body))
+	}
+}
+
 func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 	setupTestDB(t)
 
@@ -299,11 +349,11 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 		t.Fatalf("prepare expired in-flight message: %v", err)
 	}
 
-	recovered, err := reapExpiredMessages(time.Now())
+	recoveredQueueIDs, err := reapExpiredMessages(time.Now())
 	if err != nil {
 		t.Fatalf("reap expired messages: %v", err)
 	}
-	if !recovered {
+	if len(recoveredQueueIDs) != 1 || recoveredQueueIDs[0] != queueID {
 		t.Fatal("expected reapExpiredMessages to recover the expired message")
 	}
 
