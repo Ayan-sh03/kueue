@@ -371,11 +371,6 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 	producerWG.Wait()
 	publishDone := time.Now()
 
-	if firstErr != nil {
-		consumerWG.Wait()
-		return result, firstErr
-	}
-
 	consumerWG.Wait()
 	consumeDone := time.Now()
 
