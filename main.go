@@ -40,8 +40,14 @@ type Message struct {
 	State              MessageState `json:"state"`
 	EnqueuedAt         time.Time    `json:"enqueuedAt"`
 	DeliveryCount      int          `json:"deliveryCount"`
+	MaxDeliveryCount   int          `json:"maxDeliveryCount"`
 	VisibilityDeadline time.Time    `json:"visibilityDeadline"`
 	DeliveryAttemptID  string       `json:"deliveryAttemptId"`
+}
+
+type QueueConfig struct {
+	Name       string `json:"name"`
+	MaxRetries int    `json:"maxRetries"`
 }
 
 type Queue struct {
@@ -203,7 +209,11 @@ func create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(queue.Id), []byte(queue.Name))
+		config, err := json.Marshal(QueueConfig{Name: queue.Name, MaxRetries: queue.MaxRetries})
+		if err != nil {
+			return err
+		}
+		return txn.Set([]byte(queue.Id), config)
 	})
 	if err != nil {
 		http.Error(w, "Failed to create queue: "+err.Error(), http.StatusInternalServerError)
@@ -243,11 +253,15 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		return item.Value(func(val []byte) error {
+			var config QueueConfig
+			if err := json.Unmarshal(val, &config); err != nil {
+				return err
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(map[string]any{
 				"id":   id,
-				"name": string(val),
+				"name": config.Name,
 			})
 			return nil
 		})
@@ -278,13 +292,14 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queueId := message.QueueId
+	var queueConfig QueueConfig
 	err = Db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(queueId))
 		if err != nil {
 			return err
 		}
 		return item.Value(func(val []byte) error {
-			return nil
+			return json.Unmarshal(val, &queueConfig)
 		})
 	})
 	if err != nil {
@@ -306,6 +321,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	message.Message.ID = uuid.NewString()
 	message.Message.State = StateReady
 	message.Message.EnqueuedAt = time.Now()
+	message.Message.MaxDeliveryCount = queueConfig.MaxRetries
 
 	messageJson, err := json.Marshal(message.Message)
 	if err != nil {
@@ -545,6 +561,7 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var nackResultState MessageState
 	err = Db.Update(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
@@ -559,9 +576,15 @@ func nack(w http.ResponseWriter, r *http.Request) {
 			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
 		}
 
-		msg.State = StateReady
+		if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+			msg.State = StateDead
+		} else {
+			msg.State = StateReady
+		}
 		msg.VisibilityDeadline = time.Time{}
 		msg.DeliveryAttemptID = ""
+
+		nackResultState = msg.State
 
 		updated, err := json.Marshal(msg)
 		if err != nil {
@@ -585,7 +608,8 @@ func nack(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
-		"message": "Message Nacked and state updated to ready",
+		"message": "Message Nacked and state updated",
+		"state":   nackResultState,
 	})
 
 }
@@ -620,7 +644,11 @@ func reapExpiredMessages(now time.Time) ([]string, error) {
 					return nil
 				}
 
-				msg.State = StateReady
+				if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+					msg.State = StateDead
+				} else {
+					msg.State = StateReady
+				}
 				msg.VisibilityDeadline = time.Time{}
 				msg.DeliveryAttemptID = ""
 

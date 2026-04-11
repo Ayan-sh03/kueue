@@ -474,6 +474,126 @@ func TestNackRejectsWrongDeliveryToken(t *testing.T) {
 	}
 }
 
+func TestReapDeadLettersAfterMaxDeliveries(t *testing.T) {
+	setupTestDB(t)
+
+	body, err := json.Marshal(CreateRequest{Name: "dl-queue", MaxRetries: 1})
+	if err != nil {
+		t.Fatalf("marshal create request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	create(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	createResp := decodeResponse[struct {
+		ID string `json:"id"`
+	}](t, recorder)
+
+	queueID := createResp.ID
+	messageID := publishTestMessage(t, queueID, []byte("poison"))
+
+	_ = receiveTestMessage(t, queueID)
+
+	storedKey := storedMessageKey(t, queueID, messageID)
+	err = Db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(storedKey)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+			return txn.Set(storedKey, updated)
+		})
+	})
+	if err != nil {
+		t.Fatalf("prepare expired in-flight message: %v", err)
+	}
+
+	_, err = reapExpiredMessages(time.Now())
+	if err != nil {
+		t.Fatalf("reap expired messages: %v", err)
+	}
+
+	err = Db.View(func(txn *badger.Txn) error {
+		_, msg, err := findMessageRecord(txn, queueID, messageID)
+		if err != nil {
+			return err
+		}
+		if msg.State != StateDead {
+			t.Fatalf("expected StateDead after max deliveries, got %s", msg.State)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("find message record: %v", err)
+	}
+}
+
+func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
+	setupTestDB(t)
+
+	body, err := json.Marshal(CreateRequest{Name: "nack-dl-queue", MaxRetries: 1})
+	if err != nil {
+		t.Fatalf("marshal create request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	create(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	createResp := decodeResponse[struct {
+		ID string `json:"id"`
+	}](t, recorder)
+
+	queueID := createResp.ID
+	messageID := publishTestMessage(t, queueID, []byte("nack-poison"))
+
+	resp := receiveTestMessage(t, queueID)
+
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: resp.DeliveryToken})
+	if err != nil {
+		t.Fatalf("marshal nack request: %v", err)
+	}
+	nackReq := httptest.NewRequest(http.MethodPost, "/nack", bytes.NewReader(nackBody))
+	nackRecorder := httptest.NewRecorder()
+	nack(nackRecorder, nackReq)
+	if nackRecorder.Code != http.StatusAccepted {
+		t.Fatalf("nack status = %d, body = %s", nackRecorder.Code, nackRecorder.Body.String())
+	}
+
+	nackResp := decodeResponse[struct {
+		State MessageState `json:"state"`
+	}](t, nackRecorder)
+	if nackResp.State != StateDead {
+		t.Fatalf("expected StateDead after nack with max deliveries, got %s", nackResp.State)
+	}
+
+	err = Db.View(func(txn *badger.Txn) error {
+		_, msg, err := findMessageRecord(txn, queueID, messageID)
+		if err != nil {
+			return err
+		}
+		if msg.State != StateDead {
+			t.Fatalf("expected persisted StateDead, got %s", msg.State)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("find message record: %v", err)
+	}
+}
+
 func TestQueueHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	recorder := httptest.NewRecorder()
