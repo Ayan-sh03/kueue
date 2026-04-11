@@ -260,6 +260,77 @@ func TestReceiveLongPollUnblocksOnPublish(t *testing.T) {
 	}
 }
 
+func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "reaper-queue")
+	messageID := publishTestMessage(t, queueID, []byte("expired"))
+
+	firstReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	firstRecorder := httptest.NewRecorder()
+	receive(firstRecorder, firstReceive)
+	if firstRecorder.Code != http.StatusAccepted {
+		t.Fatalf("first receive status = %d, body = %s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+
+	err := Db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(messageKey(queueID, messageID))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+
+			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+
+			return txn.Set(messageKey(queueID, messageID), updated)
+		})
+	})
+	if err != nil {
+		t.Fatalf("prepare expired in-flight message: %v", err)
+	}
+
+	recovered, err := reapExpiredMessages(time.Now())
+	if err != nil {
+		t.Fatalf("reap expired messages: %v", err)
+	}
+	if !recovered {
+		t.Fatal("expected reapExpiredMessages to recover the expired message")
+	}
+
+	secondReceive := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	secondRecorder := httptest.NewRecorder()
+	receive(secondRecorder, secondReceive)
+	if secondRecorder.Code != http.StatusAccepted {
+		t.Fatalf("second receive status = %d, body = %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+
+	resp := decodeResponse[struct {
+		ID    string       `json:"id"`
+		Body  []byte       `json:"body"`
+		State MessageState `json:"state"`
+	}](t, secondRecorder)
+
+	if resp.ID != messageID {
+		t.Fatalf("expected same message id after reap, got %s", resp.ID)
+	}
+	if string(resp.Body) != "expired" {
+		t.Fatalf("expected body expired, got %q", string(resp.Body))
+	}
+	if resp.State != StateInFlight {
+		t.Fatalf("expected in-flight state after re-receive, got %s", resp.State)
+	}
+}
+
 func TestQueueHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	recorder := httptest.NewRecorder()

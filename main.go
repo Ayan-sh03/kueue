@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -437,22 +438,76 @@ func nack(w http.ResponseWriter, r *http.Request) {
 
 }
 
-// runs every second and checks for each queue and each messsage that if now > visibility deadline and message is in-flight then change the state to ready if delivery count < max retries else change the state to dead
+func reapExpiredMessages(now time.Time) (bool, error) {
+	var recovered bool
+
+	err := Db.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			if bytes.IndexByte(item.Key(), '|') == -1 {
+				continue
+			}
+
+			err := item.Value(func(v []byte) error {
+				var msg Message
+				if err := json.Unmarshal(v, &msg); err != nil {
+					return err
+				}
+				if msg.State != StateInFlight {
+					return nil
+				}
+				if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
+					return nil
+				}
+
+				msg.State = StateReady
+				msg.VisibilityDeadline = time.Time{}
+
+				updated, err := json.Marshal(msg)
+				if err != nil {
+					return err
+				}
+				if err := txn.Set(item.KeyCopy(nil), updated); err != nil {
+					return err
+				}
+
+				recovered = true
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	return recovered, err
+}
+
+// runs every second and resets expired in-flight messages back to ready in Badger.
 func reaper() {
 
 	go func() {
-		for {
-			time.Sleep(1 * time.Second)
-			for i, q := range Queues {
-				for j, msg := range q.Messages {
-					if msg.State == StateInFlight && time.Now().After(msg.VisibilityDeadline) {
-						if msg.DeliveryCount < q.MaxRetries {
-							Queues[i].Messages[j].State = StateReady
-						} else {
-							Queues[i].Messages[j].State = StateDead
-							DeadLetterQueue = append(DeadLetterQueue, msg)
-						}
-					}
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			recovered, err := reapExpiredMessages(time.Now())
+			if err != nil {
+				log.Println("reaper:", err)
+				continue
+			}
+
+			if recovered {
+				select {
+				case receiveChannel <- struct{}{}:
+				default:
 				}
 			}
 		}
