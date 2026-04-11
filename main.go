@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -44,6 +45,10 @@ var DeadLetterQueue []Message
 
 // channel for long polling in receive
 var receiveChannel = make(chan struct{}, 1)
+
+func messageKey(queueID, messageID string) []byte {
+	return []byte(queueID + "|" + messageID)
+}
 
 func queueHandler(w http.ResponseWriter, r *http.Request) {
 
@@ -193,7 +198,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(queueId+"|"+message.Message.ID), messageJson)
+		return txn.Set(messageKey(queueId, message.Message.ID), messageJson)
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -316,6 +321,7 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
 		"id":    msg.ID,
+		"body":  msg.Body,
 		"state": StateInFlight,
 	})
 }
@@ -341,26 +347,22 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// find queue from the id
-	var queue *Queue
-	for i, q := range Queues {
-		if q.Id == ackReq.QueueId {
-			queue = &Queues[i]
-			break
+	err = Db.Update(func(txn *badger.Txn) error {
+		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
+			return err
 		}
-	}
-
-	if queue == nil {
-		http.Error(w, "Queue Not Found for id: "+ackReq.QueueId, http.StatusNotFound)
+		if _, err := txn.Get(messageKey(ackReq.QueueId, ackReq.MessageId)); err != nil {
+			return err
+		}
+		return txn.Delete(messageKey(ackReq.QueueId, ackReq.MessageId))
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
 		return
-	}
-	// find the message in the queue and remove it
-	for i, msg := range queue.Messages {
-		if msg.ID == ackReq.MessageId {
-			// remove the message from the queue
-			queue.Messages = append(queue.Messages[:i], queue.Messages[i+1:]...)
-			break
-		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -392,26 +394,40 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// find queue from the id
-	var queue *Queue
-	for i, q := range Queues {
-		if q.Id == ackReq.QueueId {
-			queue = &Queues[i]
-			break
+	err = Db.Update(func(txn *badger.Txn) error {
+		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
+			return err
 		}
-	}
 
-	if queue == nil {
-		http.Error(w, "Queue Not Found for id: "+ackReq.QueueId, http.StatusNotFound)
+		item, err := txn.Get(messageKey(ackReq.QueueId, ackReq.MessageId))
+		if err != nil {
+			return err
+		}
+
+		return item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+
+			msg.State = StateReady
+			msg.VisibilityDeadline = time.Time{}
+
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+
+			return txn.Set(messageKey(ackReq.QueueId, ackReq.MessageId), updated)
+		})
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	// find the message in the queue and update its state to ready
-	for i, msg := range queue.Messages {
-		if msg.ID == ackReq.MessageId {
-			queue.Messages[i].State = StateReady
-			break
-		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -445,7 +461,17 @@ func reaper() {
 }
 
 func main() {
-	db, err := badger.Open(badger.DefaultOptions("/tmp/badger"))
+	dbPath := os.Getenv("KUEUE_DB_PATH")
+	if dbPath == "" {
+		dbPath = "./tmp/badger"
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	db, err := badger.Open(badger.DefaultOptions(dbPath))
 	if err != nil {
 		fmt.Println("Error opening BadgerDB:", err)
 		return
@@ -462,8 +488,8 @@ func main() {
 	http.HandleFunc("/receive", receive)
 
 	reaper()
-	fmt.Println("Producer Running on Port 8080")
+	fmt.Println("Producer Running on Port " + port)
 
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":"+port, nil)
 
 }
