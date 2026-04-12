@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -61,6 +62,21 @@ var Db *badger.DB
 
 var Queues []Queue
 var DeadLetterQueue []Message
+
+type queueMetrics struct {
+	readyCount     atomic.Int64
+	inFlightCount  atomic.Int64
+	deadCount      atomic.Int64
+	totalPublished atomic.Int64
+	totalReceived  atomic.Int64
+	totalAcked     atomic.Int64
+	totalNacked    atomic.Int64
+	ackWindow      []time.Time
+	ackMu          sync.Mutex
+	startedAt      time.Time
+}
+
+var metricsStore sync.Map
 
 // channel for long polling in receive
 var receiveChannel = make(chan struct{}, 1)
