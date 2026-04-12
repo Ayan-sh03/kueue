@@ -78,6 +78,34 @@ type queueMetrics struct {
 
 var metricsStore sync.Map
 
+func (m *queueMetrics) recordAck() {
+	m.totalAcked.Add(1)
+	m.inFlightCount.Add(-1)
+	m.ackMu.Lock()
+	m.ackWindow = append(m.ackWindow, time.Now())
+	m.ackMu.Unlock()
+}
+
+func (m *queueMetrics) trimAckWindow() {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+	windowStart := time.Now().Add(-60 * time.Second)
+	i := 0
+	for i < len(m.ackWindow) && m.ackWindow[i].Before(windowStart) {
+		i++
+	}
+	m.ackWindow = m.ackWindow[i:]
+}
+
+func (m *queueMetrics) ackRatePerSec() float64 {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+	if len(m.ackWindow) == 0 {
+		return 0
+	}
+	return float64(len(m.ackWindow)) / 60.0
+}
+
 func getOrCreateMetrics(queueID string) *queueMetrics {
 	if m, ok := metricsStore.Load(queueID); ok {
 		return m.(*queueMetrics)
@@ -614,11 +642,7 @@ func ack(w http.ResponseWriter, r *http.Request) {
 	})
 
 	m := getOrCreateMetrics(ackReq.QueueId)
-	m.totalAcked.Add(1)
-	m.inFlightCount.Add(-1)
-	m.ackMu.Lock()
-	m.ackWindow = append(m.ackWindow, time.Now())
-	m.ackMu.Unlock()
+	m.recordAck()
 
 }
 
@@ -805,6 +829,11 @@ func reaper() {
 					signaled[t.QueueID] = struct{}{}
 				}
 			}
+
+			metricsStore.Range(func(_, value any) bool {
+				value.(*queueMetrics).trimAckWindow()
+				return true
+			})
 		}
 	}()
 
@@ -837,22 +866,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	m := getOrCreateMetrics(id)
 	reconcileMetricsFromDB(id, m)
-
-	m.ackMu.Lock()
-	now := time.Now()
-	windowStart := now.Add(-60 * time.Second)
-	i := 0
-	for i < len(m.ackWindow) && m.ackWindow[i].Before(windowStart) {
-		i++
-	}
-	m.ackWindow = m.ackWindow[i:]
-	windowLen := len(m.ackWindow)
-	m.ackMu.Unlock()
-
-	var ackRatePerSec float64
-	if windowLen > 0 {
-		ackRatePerSec = float64(windowLen) / 60.0
-	}
+	m.trimAckWindow()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -865,8 +879,8 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		"totalReceived":  m.totalReceived.Load(),
 		"totalAcked":     m.totalAcked.Load(),
 		"totalNacked":    m.totalNacked.Load(),
-		"ackRatePerSec":  ackRatePerSec,
-		"uptimeSeconds":  now.Sub(m.startedAt).Seconds(),
+		"ackRatePerSec":  m.ackRatePerSec(),
+		"uptimeSeconds":  time.Now().Sub(m.startedAt).Seconds(),
 	})
 }
 
