@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ func setupTestDB(t *testing.T) {
 	DeadLetterQueue = nil
 	receiveChannel = make(chan struct{}, 1)
 	queueReadyChans = map[string]chan struct{}{}
+	metricsStore = sync.Map{}
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -397,11 +399,11 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 		t.Fatalf("prepare expired in-flight message: %v", err)
 	}
 
-	recoveredQueueIDs, err := reapExpiredMessages(time.Now())
+	recoveredTransitions, err := reapExpiredMessages(time.Now())
 	if err != nil {
 		t.Fatalf("reap expired messages: %v", err)
 	}
-	if len(recoveredQueueIDs) != 1 || recoveredQueueIDs[0] != queueID {
+	if len(recoveredTransitions) != 1 || recoveredTransitions[0].QueueID != queueID {
 		t.Fatal("expected reapExpiredMessages to recover the expired message")
 	}
 
