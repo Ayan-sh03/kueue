@@ -78,6 +78,56 @@ type queueMetrics struct {
 
 var metricsStore sync.Map
 
+func getOrCreateMetrics(queueID string) *queueMetrics {
+	if m, ok := metricsStore.Load(queueID); ok {
+		return m.(*queueMetrics)
+	}
+	m := &queueMetrics{
+		startedAt: time.Now(),
+	}
+	actual, _ := metricsStore.LoadOrStore(queueID, m)
+	return actual.(*queueMetrics)
+}
+
+func reconcileMetricsFromDB(queueID string, m *queueMetrics) {
+	var ready, inFlight, dead int64
+	err := Db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.Prefix = queueMessagePrefix(queueID)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			err := item.Value(func(v []byte) error {
+				var msg Message
+				if err := json.Unmarshal(v, &msg); err != nil {
+					return err
+				}
+				switch msg.State {
+				case StateReady:
+					ready++
+				case StateInFlight:
+					inFlight++
+				case StateDead:
+					dead++
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return
+	}
+	m.readyCount.Store(ready)
+	m.inFlightCount.Store(inFlight)
+	m.deadCount.Store(dead)
+}
+
 // channel for long polling in receive
 var receiveChannel = make(chan struct{}, 1)
 var queueReadyChans = map[string]chan struct{}{}
