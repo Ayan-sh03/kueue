@@ -117,7 +117,7 @@ func getOrCreateMetrics(queueID string) *queueMetrics {
 	return actual.(*queueMetrics)
 }
 
-func reconcileMetricsFromDB(queueID string, m *queueMetrics) {
+func reconcileMetricsFromDB(queueID string, m *queueMetrics) error {
 	var ready, inFlight, dead int64
 	err := Db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -127,7 +127,7 @@ func reconcileMetricsFromDB(queueID string, m *queueMetrics) {
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			err := item.Value(func(v []byte) error {
+			if err := item.Value(func(v []byte) error {
 				var msg Message
 				if err := json.Unmarshal(v, &msg); err != nil {
 					return err
@@ -141,19 +141,20 @@ func reconcileMetricsFromDB(queueID string, m *queueMetrics) {
 					dead++
 				}
 				return nil
-			})
-			if err != nil {
+			}); err != nil {
+				log.Printf("reconcileMetricsFromDB: error reading message in queue %s: %v", queueID, err)
 				return err
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return
+		return err
 	}
 	m.readyCount.Store(ready)
 	m.inFlightCount.Store(inFlight)
 	m.deadCount.Store(dead)
+	return nil
 }
 
 // channel for long polling in receive
@@ -865,7 +866,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := getOrCreateMetrics(id)
-	reconcileMetricsFromDB(id, m)
+	if err := reconcileMetricsFromDB(id, m); err != nil {
+		http.Error(w, "Error reconciling metrics: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	m.trimAckWindow()
 
 	w.Header().Set("Content-Type", "application/json")
