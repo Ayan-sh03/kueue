@@ -822,12 +822,12 @@ func reaper() {
 				m.inFlightCount.Add(-1)
 				if t.ToState == StateReady {
 					m.readyCount.Add(1)
+					if _, ok := signaled[t.QueueID]; !ok {
+						signalQueueReady(t.QueueID)
+						signaled[t.QueueID] = struct{}{}
+					}
 				} else if t.ToState == StateDead {
 					m.deadCount.Add(1)
-				}
-				if _, ok := signaled[t.QueueID]; !ok {
-					signalQueueReady(t.QueueID)
-					signaled[t.QueueID] = struct{}{}
 				}
 			}
 
