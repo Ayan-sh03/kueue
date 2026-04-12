@@ -407,6 +407,10 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 	signalQueueReady(queueId)
 
+	m := getOrCreateMetrics(queueId)
+	m.totalPublished.Add(1)
+	m.readyCount.Add(1)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -536,6 +540,11 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
 		return
 	}
+
+	m := getOrCreateMetrics(id)
+	m.totalReceived.Add(1)
+	m.readyCount.Add(-1)
+	m.inFlightCount.Add(1)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
