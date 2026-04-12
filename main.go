@@ -616,6 +616,9 @@ func ack(w http.ResponseWriter, r *http.Request) {
 	m := getOrCreateMetrics(ackReq.QueueId)
 	m.totalAcked.Add(1)
 	m.inFlightCount.Add(-1)
+	m.ackMu.Lock()
+	m.ackWindow = append(m.ackWindow, time.Now())
+	m.ackMu.Unlock()
 
 }
 
@@ -807,6 +810,66 @@ func reaper() {
 
 }
 
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	params := r.URL.Query()
+	id := params.Get("id")
+	if id == "" {
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	err := Db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get([]byte(id))
+		return err
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Error checking queue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	m := getOrCreateMetrics(id)
+	reconcileMetricsFromDB(id, m)
+
+	m.ackMu.Lock()
+	now := time.Now()
+	windowStart := now.Add(-60 * time.Second)
+	i := 0
+	for i < len(m.ackWindow) && m.ackWindow[i].Before(windowStart) {
+		i++
+	}
+	m.ackWindow = m.ackWindow[i:]
+	windowLen := len(m.ackWindow)
+	m.ackMu.Unlock()
+
+	var ackRatePerSec float64
+	if windowLen > 0 {
+		ackRatePerSec = float64(windowLen) / 60.0
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"queueId":        id,
+		"readyCount":     m.readyCount.Load(),
+		"inFlightCount":  m.inFlightCount.Load(),
+		"deadCount":      m.deadCount.Load(),
+		"totalPublished": m.totalPublished.Load(),
+		"totalReceived":  m.totalReceived.Load(),
+		"totalAcked":     m.totalAcked.Load(),
+		"totalNacked":    m.totalNacked.Load(),
+		"ackRatePerSec":  ackRatePerSec,
+		"uptimeSeconds":  now.Sub(m.startedAt).Seconds(),
+	})
+}
+
 func main() {
 	dbPath := os.Getenv("KUEUE_DB_PATH")
 	if dbPath == "" {
@@ -833,6 +896,7 @@ func main() {
 	http.HandleFunc("/ack", ack)
 	http.HandleFunc("/nack", nack)
 	http.HandleFunc("/receive", receive)
+	http.HandleFunc("/metrics", metricsHandler)
 
 	reaper()
 	fmt.Println("Producer Running on Port " + port)
