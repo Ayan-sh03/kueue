@@ -613,6 +613,10 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		"message": "Message Acknowledged and removed from queue",
 	})
 
+	m := getOrCreateMetrics(ackReq.QueueId)
+	m.totalAcked.Add(1)
+	m.inFlightCount.Add(-1)
+
 }
 
 func nack(w http.ResponseWriter, r *http.Request) {
