@@ -752,8 +752,6 @@ type reapTransition struct {
 }
 
 func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
-	recoveredQueues := map[string]struct{}{}
-
 	transitions := []reapTransition{}
 
 	err := Db.Update(func(txn *badger.Txn) error {
@@ -799,7 +797,6 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 					return err
 				}
 
-				recoveredQueues[queueID] = struct{}{}
 				transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
 				return nil
 			})
