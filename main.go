@@ -78,6 +78,18 @@ type queueMetrics struct {
 
 var metricsStore sync.Map
 
+func snapshotMax(counter *atomic.Int64, val int64) {
+	for {
+		cur := counter.Load()
+		if cur >= val {
+			return
+		}
+		if counter.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
 func (m *queueMetrics) recordAck() {
 	m.totalAcked.Add(1)
 	m.inFlightCount.Add(-1)
@@ -151,9 +163,9 @@ func reconcileMetricsFromDB(queueID string, m *queueMetrics) error {
 	if err != nil {
 		return err
 	}
-	m.readyCount.Store(ready)
-	m.inFlightCount.Store(inFlight)
-	m.deadCount.Store(dead)
+	snapshotMax(&m.readyCount, ready)
+	snapshotMax(&m.inFlightCount, inFlight)
+	snapshotMax(&m.deadCount, dead)
 	return nil
 }
 
