@@ -695,6 +695,15 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		"state":   nackResultState,
 	})
 
+	m := getOrCreateMetrics(ackReq.QueueId)
+	m.totalNacked.Add(1)
+	m.inFlightCount.Add(-1)
+	if nackResultState == StateReady {
+		m.readyCount.Add(1)
+	} else if nackResultState == StateDead {
+		m.deadCount.Add(1)
+	}
+
 }
 
 func reapExpiredMessages(now time.Time) ([]string, error) {
