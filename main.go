@@ -706,8 +706,15 @@ func nack(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func reapExpiredMessages(now time.Time) ([]string, error) {
+type reapTransition struct {
+	QueueID string
+	ToState MessageState
+}
+
+func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 	recoveredQueues := map[string]struct{}{}
+
+	transitions := []reapTransition{}
 
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -753,6 +760,7 @@ func reapExpiredMessages(now time.Time) ([]string, error) {
 				}
 
 				recoveredQueues[queueID] = struct{}{}
+				transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
 				return nil
 			})
 			if err != nil {
@@ -763,12 +771,7 @@ func reapExpiredMessages(now time.Time) ([]string, error) {
 		return nil
 	})
 
-	queueIDs := make([]string, 0, len(recoveredQueues))
-	for queueID := range recoveredQueues {
-		queueIDs = append(queueIDs, queueID)
-	}
-
-	return queueIDs, err
+	return transitions, err
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.
@@ -779,14 +782,25 @@ func reaper() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			recoveredQueueIDs, err := reapExpiredMessages(time.Now())
+			transitions, err := reapExpiredMessages(time.Now())
 			if err != nil {
 				log.Println("reaper:", err)
 				continue
 			}
 
-			for _, queueID := range recoveredQueueIDs {
-				signalQueueReady(queueID)
+			signaled := map[string]struct{}{}
+			for _, t := range transitions {
+				m := getOrCreateMetrics(t.QueueID)
+				m.inFlightCount.Add(-1)
+				if t.ToState == StateReady {
+					m.readyCount.Add(1)
+				} else if t.ToState == StateDead {
+					m.deadCount.Add(1)
+				}
+				if _, ok := signaled[t.QueueID]; !ok {
+					signalQueueReady(t.QueueID)
+					signaled[t.QueueID] = struct{}{}
+				}
 			}
 		}
 	}()
