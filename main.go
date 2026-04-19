@@ -252,15 +252,25 @@ func parseMessageKeySeq(key []byte) (uint64, error) {
 }
 
 func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
-	parts := bytes.SplitN(key, []byte(readyKeySep), 4)
-	if len(parts) != 4 || string(parts[0]) != "ready" {
-		return 0, "", fmt.Errorf("invalid ready key format: %s", string(key))
+	// Key format: ready|<queueID>|<8-byte-seq>|<messageID>
+	// Find the start of the seq by locating the second '|' after "ready|"
+	firstPipe := bytes.IndexByte(key, '|')
+	if firstPipe == -1 {
+		return 0, "", fmt.Errorf("invalid ready key: no pipes: %s", string(key))
 	}
-	if len(parts[2]) != 8 {
-		return 0, "", fmt.Errorf("invalid seq in ready key: %s", string(key))
+	secondPipe := bytes.IndexByte(key[firstPipe+1:], '|')
+	if secondPipe == -1 {
+		return 0, "", fmt.Errorf("invalid ready key: missing queueID delimiter: %s", string(key))
 	}
-	seq = binary.BigEndian.Uint64(parts[2])
-	messageID = string(parts[3])
+	seqStart := firstPipe + 1 + secondPipe + 1
+	if seqStart+8 > len(key) {
+		return 0, "", fmt.Errorf("invalid ready key: too short: %s", string(key))
+	}
+	seq = binary.BigEndian.Uint64(key[seqStart : seqStart+8])
+	if key[seqStart+8] != '|' {
+		return 0, "", fmt.Errorf("invalid ready key: missing delimiter after seq: %s", string(key))
+	}
+	messageID = string(key[seqStart+8+1:])
 	return seq, messageID, nil
 }
 
