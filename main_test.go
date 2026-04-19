@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -608,4 +609,83 @@ func TestQueueHandler(t *testing.T) {
 	if got := recorder.Body.String(); got != "Hello Consumer\n" {
 		t.Fatalf("unexpected body %q", got)
 	}
+}
+
+func BenchmarkReceiveLatencyVsDepth(b *testing.B) {
+	depths := []int{100, 1000, 10000}
+	for _, depth := range depths {
+		b.Run(fmt.Sprintf("depth_%d", depth), func(b *testing.B) {
+			db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLogger(nil))
+			if err != nil {
+				b.Fatalf("open db: %v", err)
+			}
+			Db = db
+			metricsStore = sync.Map{}
+			receiveChannel = make(chan struct{}, 1)
+			queueReadyChans = map[string]chan struct{}{}
+			b.Cleanup(func() {
+				db.Close()
+				Db = nil
+			})
+
+			queueID := createBenchQueue(b, "bench-queue")
+
+			for i := 0; i < depth; i++ {
+				publishBenchMessage(b, queueID, []byte("fill"))
+			}
+
+			for i := 0; i < depth; i++ {
+				receiveBenchMessage(b, queueID)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				publishBenchMessage(b, queueID, []byte("lat"))
+				receiveBenchMessage(b, queueID)
+			}
+		})
+	}
+}
+
+func createBenchQueue(b testing.TB, name string) string {
+	b.Helper()
+	body, _ := json.Marshal(CreateRequest{Name: name, MaxRetries: 3})
+	req := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	create(rec, req)
+	if rec.Code != http.StatusAccepted {
+		b.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(rec.Body).Decode(&resp)
+	return resp.ID
+}
+
+func publishBenchMessage(b testing.TB, queueID string, body []byte) {
+	b.Helper()
+	msgBody, _ := json.Marshal(PublishRequest{
+		Message: Message{Body: body},
+		QueueId: queueID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader(msgBody))
+	rec := httptest.NewRecorder()
+	publish(rec, req)
+	if rec.Code != http.StatusAccepted {
+		b.Fatalf("publish status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
+	b.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	rec := httptest.NewRecorder()
+	receive(rec, req)
+	if rec.Code != http.StatusAccepted {
+		b.Fatalf("receive status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp receiveResponse
+	json.NewDecoder(rec.Body).Decode(&resp)
+	return resp
 }
