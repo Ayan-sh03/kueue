@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -26,6 +27,8 @@ type ErrDeliveryTokenMismatch struct {
 func (e *ErrDeliveryTokenMismatch) Error() string {
 	return fmt.Sprintf("delivery token mismatch: expected %q, got %q", e.Expected, e.Got)
 }
+
+var ErrNoReadyMessages = errors.New("no ready messages")
 
 type MessageState string
 
@@ -204,6 +207,37 @@ func nextMessageSequence(queueID string) (uint64, error) {
 	defer seq.Release()
 
 	return seq.Next()
+}
+
+const readyKeySep = "|"
+
+func readyKey(queueID string, seq uint64, messageID string) []byte {
+	prefix := readyPrefix(queueID)
+	key := make([]byte, 0, len(prefix)+8+1+len(messageID))
+	key = append(key, prefix...)
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	key = append(key, seqBytes[:]...)
+	key = append(key, '|')
+	key = append(key, messageID...)
+	return key
+}
+
+func readyPrefix(queueID string) []byte {
+	return []byte("ready|" + queueID + readyKeySep)
+}
+
+func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
+	parts := bytes.SplitN(key, []byte(readyKeySep), 4)
+	if len(parts) != 4 || string(parts[0]) != "ready" {
+		return 0, "", fmt.Errorf("invalid ready key format: %s", string(key))
+	}
+	if len(parts[2]) != 8 {
+		return 0, "", fmt.Errorf("invalid seq in ready key: %s", string(key))
+	}
+	seq = binary.BigEndian.Uint64(parts[2])
+	messageID = string(parts[3])
+	return seq, messageID, nil
 }
 
 func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Message, error) {
