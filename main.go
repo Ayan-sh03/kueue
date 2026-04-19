@@ -227,6 +227,30 @@ func readyPrefix(queueID string) []byte {
 	return []byte("ready|" + queueID + readyKeySep)
 }
 
+func readyValue(originalSeq uint64) []byte {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], originalSeq)
+	return buf[:]
+}
+
+func parseReadyValue(val []byte) (uint64, error) {
+	if len(val) != 8 {
+		return 0, fmt.Errorf("invalid ready value length: %d", len(val))
+	}
+	return binary.BigEndian.Uint64(val), nil
+}
+
+func parseMessageKeySeq(key []byte) (uint64, error) {
+	parts := bytes.SplitN(key, []byte("|"), 3)
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid message key format")
+	}
+	if len(parts[1]) != 8 {
+		return 0, fmt.Errorf("invalid seq in message key")
+	}
+	return binary.BigEndian.Uint64(parts[1]), nil
+}
+
 func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
 	parts := bytes.SplitN(key, []byte(readyKeySep), 4)
 	if len(parts) != 4 || string(parts[0]) != "ready" {
@@ -474,7 +498,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 		if err := txn.Set(messageKey(queueId, seq, message.Message.ID), messageJson); err != nil {
 			return err
 		}
-		return txn.Set(readyKey(queueId, seq, message.Message.ID), []byte{})
+		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(seq))
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -506,7 +530,7 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 	var claimed *Message
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
+		opts.PrefetchValues = true
 		opts.Prefix = readyPrefix(queueId)
 		it := txn.NewIterator(opts)
 		defer it.Close()
@@ -514,11 +538,20 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			rKey := item.KeyCopy(nil)
-			seq, msgID, err := parseReadyKey(rKey)
+			_, msgID, err := parseReadyKey(rKey)
 			if err != nil {
 				return fmt.Errorf("parse ready key: %w", err)
 			}
-			msgKey := messageKey(queueId, seq, msgID)
+
+			var originalSeq uint64
+			if err := item.Value(func(v []byte) error {
+				originalSeq, err = parseReadyValue(v)
+				return err
+			}); err != nil {
+				return fmt.Errorf("parse ready value: %w", err)
+			}
+
+			msgKey := messageKey(queueId, originalSeq, msgID)
 
 			msgItem, err := txn.Get(msgKey)
 			if err != nil {
@@ -744,7 +777,9 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var nackResultState MessageState
+var nackResultState MessageState
+	var needReadyPointer bool
+
 	err = Db.Update(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
@@ -768,13 +803,32 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		msg.DeliveryAttemptID = ""
 
 		nackResultState = msg.State
+		needReadyPointer = nackResultState == StateReady
 
 		updated, err := json.Marshal(msg)
 		if err != nil {
 			return err
 		}
 
-		return txn.Set(key, updated)
+		if err := txn.Set(key, updated); err != nil {
+			return err
+		}
+
+		if needReadyPointer {
+			originalSeq, err := parseMessageKeySeq(key)
+			if err != nil {
+				return fmt.Errorf("parse message key seq: %w", err)
+			}
+			newSeq, err := nextMessageSequence(ackReq.QueueId)
+			if err != nil {
+				return fmt.Errorf("allocate nack sequence: %w", err)
+			}
+			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, ackReq.MessageId), readyValue(originalSeq)); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	})
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
