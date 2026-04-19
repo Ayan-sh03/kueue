@@ -498,54 +498,78 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 }
 
-// claimNextReadyMessage scans all messages for a queue (prefix queueId|),
-// finds the first one in StateReady, atomically updates it to StateInFlight
-// in the same Db.Update transaction, and returns it.
+// claimNextReadyMessage seeks the first ready pointer for the queue,
+// reads the corresponding message, atomically transitions it to StateInFlight,
+// and deletes the ready pointer — all in a single Db.Update transaction.
+// Returns ErrNoReadyMessages if no ready messages are available.
 func claimNextReadyMessage(queueId string) (*Message, error) {
 	var claimed *Message
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
-		opts.Prefix = queueMessagePrefix(queueId)
+		opts.PrefetchValues = false
+		opts.Prefix = readyPrefix(queueId)
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			err := item.Value(func(v []byte) error {
-				var msg Message
-				if err := json.Unmarshal(v, &msg); err != nil {
-					return err
-				}
-				if msg.State != StateReady {
-					return nil // skip non-ready messages
-				}
-				// claim: flip to in-flight
-				msg.State = StateInFlight
-				msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
-				msg.DeliveryCount++
-				msg.DeliveryAttemptID = uuid.NewString()
-				updated, err := json.Marshal(msg)
-				if err != nil {
-					return err
-				}
-				// must copy the key — item.Key() is only valid inside this callback
-				if err := txn.Set(item.KeyCopy(nil), updated); err != nil {
-					return err
-				}
-				claimed = &msg
-				return nil
-			})
+			rKey := item.KeyCopy(nil)
+			seq, msgID, err := parseReadyKey(rKey)
 			if err != nil {
-				return err
+				return fmt.Errorf("parse ready key: %w", err)
 			}
-			if claimed != nil {
-				return nil // stop after first ready message
+			msgKey := messageKey(queueId, seq, msgID)
+
+			msgItem, err := txn.Get(msgKey)
+			if err != nil {
+				if err == badger.ErrKeyNotFound {
+					txn.Delete(rKey)
+					continue
+				}
+				return fmt.Errorf("get message for ready key: %w", err)
 			}
+
+			var msg Message
+			if err := msgItem.Value(func(v []byte) error {
+				return json.Unmarshal(v, &msg)
+			}); err != nil {
+				return fmt.Errorf("unmarshal message: %w", err)
+			}
+
+			if msg.State != StateReady {
+				txn.Delete(rKey)
+				continue
+			}
+
+			if err := txn.Delete(rKey); err != nil {
+				return fmt.Errorf("delete ready key: %w", err)
+			}
+
+			msg.State = StateInFlight
+			msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
+			msg.DeliveryCount++
+			msg.DeliveryAttemptID = uuid.NewString()
+
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				return fmt.Errorf("marshal claimed message: %w", err)
+			}
+			if err := txn.Set(msgKey, updated); err != nil {
+				return fmt.Errorf("set claimed message: %w", err)
+			}
+
+			claimed = &msg
+			return nil
 		}
 		return nil
 	})
-	return claimed, err
+	if err != nil {
+		return nil, err
+	}
+	if claimed == nil {
+		return nil, ErrNoReadyMessages
+	}
+return claimed, nil
 }
 
 func receive(w http.ResponseWriter, r *http.Request) {
@@ -576,29 +600,28 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var msg *Message
+	var claimErr error
 
 	if wait := params.Get("wait"); wait == "true" {
-		msg, err = claimNextReadyMessage(id)
-		if err != nil {
-			http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+		msg, claimErr = claimNextReadyMessage(id)
+		if claimErr != nil && claimErr != ErrNoReadyMessages {
+			http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
 			return
 		}
-		if msg == nil {
+		if claimErr == ErrNoReadyMessages {
 			readyCh := queueReadyChan(id)
 
-			// Re-check after subscribing to avoid missing a publish between the
-			// initial claim attempt and the wait setup.
-			msg, err = claimNextReadyMessage(id)
-			if err != nil {
-				http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+			msg, claimErr = claimNextReadyMessage(id)
+			if claimErr != nil && claimErr != ErrNoReadyMessages {
+				http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
 				return
 			}
-			if msg == nil {
+			if claimErr == ErrNoReadyMessages {
 				timer := time.NewTimer(30 * time.Second)
 				defer timer.Stop()
 				select {
 				case <-readyCh:
-					msg, err = claimNextReadyMessage(id)
+					msg, claimErr = claimNextReadyMessage(id)
 				case <-timer.C:
 					// timed out — fall through with msg == nil
 				case <-r.Context().Done():
@@ -607,14 +630,14 @@ func receive(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		msg, err = claimNextReadyMessage(id)
+		msg, claimErr = claimNextReadyMessage(id)
 	}
 
-	if err != nil {
-		http.Error(w, "Error retrieving message: "+err.Error(), http.StatusInternalServerError)
+	if claimErr != nil && claimErr != ErrNoReadyMessages {
+		http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
 		return
 	}
-	if msg == nil {
+	if claimErr == ErrNoReadyMessages || msg == nil {
 		http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
 		return
 	}
