@@ -471,7 +471,10 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		return txn.Set(messageKey(queueId, seq, message.Message.ID), messageJson)
+		if err := txn.Set(messageKey(queueId, seq, message.Message.ID), messageJson); err != nil {
+			return err
+		}
+		return txn.Set(readyKey(queueId, seq, message.Message.ID), []byte{})
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -797,6 +800,9 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			key := item.KeyCopy(nil)
+			if bytes.HasPrefix(key, []byte("ready|")) || bytes.HasPrefix(key, []byte("seq:")) {
+				continue
+			}
 			pipeIndex := bytes.IndexByte(key, '|')
 			if pipeIndex == -1 {
 				continue
