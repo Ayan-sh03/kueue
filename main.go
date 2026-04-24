@@ -916,17 +916,9 @@ type reapTransition struct {
 }
 
 func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
-	type expiredMsg struct {
-		queueID     string
-		msgID       string
-		key         []byte
-		originalSeq uint64
-		toDead      bool
-	}
+	var transitions []reapTransition
 
-	var expired []expiredMsg
-
-	err := Db.View(func(txn *badger.Txn) error {
+	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
 		it := txn.NewIterator(opts)
@@ -944,54 +936,6 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 			}
 			queueID := string(key[:pipeIndex])
 
-			if err := item.Value(func(v []byte) error {
-				var msg Message
-				if err := json.Unmarshal(v, &msg); err != nil {
-					return err
-				}
-				if msg.State != StateInFlight {
-					return nil
-				}
-				if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
-					return nil
-				}
-
-				originalSeq, err := parseMessageKeySeq(key)
-				if err != nil {
-					return err
-				}
-
-				toDead := msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount
-				expired = append(expired, expiredMsg{
-					queueID:     queueID,
-					msgID:       msg.ID,
-					key:         key,
-					originalSeq: originalSeq,
-					toDead:      toDead,
-				})
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	transitions := make([]reapTransition, 0, len(expired))
-
-	err = Db.Update(func(txn *badger.Txn) error {
-		for _, exp := range expired {
-			item, err := txn.Get(exp.key)
-			if err != nil {
-				if err == badger.ErrKeyNotFound {
-					continue
-				}
-				return err
-			}
-
 			var msg Message
 			if err := item.Value(func(v []byte) error {
 				return json.Unmarshal(v, &msg)
@@ -1006,7 +950,8 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 				continue
 			}
 
-			if exp.toDead {
+			toDead := msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount
+			if toDead {
 				msg.State = StateDead
 			} else {
 				msg.State = StateReady
@@ -1018,26 +963,26 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 			if err != nil {
 				return err
 			}
-			if err := txn.Set(exp.key, updated); err != nil {
+			if err := txn.Set(key, updated); err != nil {
 				return err
 			}
 
 			if msg.State == StateReady {
-				newSeq, err := nextMessageSequence(exp.queueID)
+				newSeq, err := nextMessageSequence(queueID)
 				if err != nil {
 					return fmt.Errorf("allocate reaper sequence: %w", err)
 				}
-				if err := txn.Set(readyKey(exp.queueID, newSeq, exp.msgID), readyValue(exp.key)); err != nil {
+				if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(key)); err != nil {
 					return err
 				}
 			}
 
-			transitions = append(transitions, reapTransition{QueueID: exp.queueID, ToState: msg.State})
+			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
 		}
 		return nil
 	})
 
-return transitions, err
+	return transitions, err
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.
