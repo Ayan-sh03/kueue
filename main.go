@@ -241,17 +241,15 @@ func readyPrefix(queueID string) []byte {
 	return []byte("ready|" + queueID + readyKeySep)
 }
 
-func readyValue(originalSeq uint64) []byte {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], originalSeq)
-	return buf[:]
+func readyValue(msgKey []byte) []byte {
+	return msgKey
 }
 
-func parseReadyValue(val []byte) (uint64, error) {
-	if len(val) != 8 {
-		return 0, fmt.Errorf("invalid ready value length: %d", len(val))
+func parseReadyValue(val []byte) ([]byte, error) {
+	if len(val) == 0 {
+		return nil, fmt.Errorf("invalid ready value: empty")
 	}
-	return binary.BigEndian.Uint64(val), nil
+	return val, nil
 }
 
 func parseMessageKeySeq(key []byte) (uint64, error) {
@@ -526,7 +524,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		cacheMessageKey(queueId, message.Message.ID, msgKey)
-		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(seq))
+		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(msgKey))
 	})
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
@@ -566,20 +564,19 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			rKey := item.KeyCopy(nil)
-			_, msgID, err := parseReadyKey(rKey)
+			_, _, err := parseReadyKey(rKey)
 			if err != nil {
 				return fmt.Errorf("parse ready key: %w", err)
 			}
 
-			var originalSeq uint64
+			var msgKey []byte
 			if err := item.Value(func(v []byte) error {
-				originalSeq, err = parseReadyValue(v)
+				var err error
+				msgKey, err = parseReadyValue(v)
 				return err
 			}); err != nil {
 				return fmt.Errorf("parse ready value: %w", err)
 			}
-
-			msgKey := messageKey(queueId, originalSeq, msgID)
 
 			msgItem, err := txn.Get(msgKey)
 			if err != nil {
@@ -868,15 +865,11 @@ var nackResultState MessageState
 		}
 
 		if needReadyPointer {
-			originalSeq, err := parseMessageKeySeq(msgKey)
-			if err != nil {
-				return fmt.Errorf("parse message key seq: %w", err)
-			}
 			newSeq, err := nextMessageSequence(ackReq.QueueId)
 			if err != nil {
 				return fmt.Errorf("allocate nack sequence: %w", err)
 			}
-			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, ackReq.MessageId), readyValue(originalSeq)); err != nil {
+			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, ackReq.MessageId), readyValue(msgKey)); err != nil {
 				return err
 			}
 		}
@@ -1034,7 +1027,7 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 				if err != nil {
 					return fmt.Errorf("allocate reaper sequence: %w", err)
 				}
-				if err := txn.Set(readyKey(exp.queueID, newSeq, exp.msgID), readyValue(exp.originalSeq)); err != nil {
+				if err := txn.Set(readyKey(exp.queueID, newSeq, exp.msgID), readyValue(exp.key)); err != nil {
 					return err
 				}
 			}
