@@ -196,6 +196,20 @@ func messageKey(queueID string, seq uint64, messageID string) []byte {
 	return key
 }
 
+func messageKeyBytes(queueID string, seq uint64, messageID []byte) []byte {
+	prefix := queueMessagePrefix(queueID)
+	key := make([]byte, 0, len(prefix)+8+1+len(messageID))
+	key = append(key, prefix...)
+
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	key = append(key, seqBytes[:]...)
+	key = append(key, '|')
+	key = append(key, messageID...)
+
+	return key
+}
+
 func queueSequenceKey(queueID string) []byte {
 	return []byte("seq:" + queueID)
 }
@@ -254,27 +268,21 @@ func parseMessageKeySeq(key []byte) (uint64, error) {
 	return binary.BigEndian.Uint64(key[seqStart:seqEnd]), nil
 }
 
-func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
-	// Key format: ready|<queueID>|<8-byte-seq>|<messageID>
-	// Find the start of the seq by locating the second '|' after "ready|"
-	firstPipe := bytes.IndexByte(key, '|')
-	if firstPipe == -1 {
-		return 0, "", fmt.Errorf("invalid ready key: no pipes: %s", string(key))
+func readyPartsFromKey(key, prefix []byte) (uint64, []byte, error) {
+	if !bytes.HasPrefix(key, prefix) {
+		return 0, nil, fmt.Errorf("ready key does not match prefix")
 	}
-	secondPipe := bytes.IndexByte(key[firstPipe+1:], '|')
-	if secondPipe == -1 {
-		return 0, "", fmt.Errorf("invalid ready key: missing queueID delimiter: %s", string(key))
+	rest := key[len(prefix):]
+	if len(rest) < 9 {
+		return 0, nil, fmt.Errorf("invalid ready key: too short")
 	}
-	seqStart := firstPipe + 1 + secondPipe + 1
-	if seqStart+8 > len(key) {
-		return 0, "", fmt.Errorf("invalid ready key: too short: %s", string(key))
+	if rest[8] != '|' {
+		return 0, nil, fmt.Errorf("invalid ready key: missing delimiter after seq")
 	}
-	seq = binary.BigEndian.Uint64(key[seqStart : seqStart+8])
-	if key[seqStart+8] != '|' {
-		return 0, "", fmt.Errorf("invalid ready key: missing delimiter after seq: %s", string(key))
+	if len(rest[9:]) == 0 {
+		return 0, nil, fmt.Errorf("invalid ready key: missing message id")
 	}
-	messageID = string(key[seqStart+8+1:])
-	return seq, messageID, nil
+	return binary.BigEndian.Uint64(rest[:8]), rest[9:], nil
 }
 
 func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Message, error) {
@@ -543,36 +551,46 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 	var claimed *Message
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
-		opts.Prefix = readyPrefix(queueId)
+		opts.PrefetchValues = false
+		prefix := readyPrefix(queueId)
+		opts.Prefix = prefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			rKey := item.KeyCopy(nil)
-			_, msgID, err := parseReadyKey(rKey)
+			readySeq, msgID, err := readyPartsFromKey(rKey, prefix)
 			if err != nil {
 				return fmt.Errorf("parse ready key: %w", err)
 			}
 
-			var originalSeq uint64
-			if err := item.Value(func(v []byte) error {
-				originalSeq, err = parseReadyValue(v)
-				return err
-			}); err != nil {
-				return fmt.Errorf("parse ready value: %w", err)
-			}
-
-			msgKey := messageKey(queueId, originalSeq, msgID)
-
+			msgKey := messageKeyBytes(queueId, readySeq, msgID)
 			msgItem, err := txn.Get(msgKey)
 			if err != nil {
 				if err == badger.ErrKeyNotFound {
-					txn.Delete(rKey)
-					continue
+					var originalSeq uint64
+					valueErr := item.Value(func(v []byte) error {
+						parsedSeq, parseErr := parseReadyValue(v)
+						if parseErr != nil {
+							return parseErr
+						}
+						originalSeq = parsedSeq
+						return nil
+					})
+					if valueErr != nil {
+						return fmt.Errorf("parse ready value: %w", valueErr)
+					}
+					msgKey = messageKeyBytes(queueId, originalSeq, msgID)
+					msgItem, err = txn.Get(msgKey)
+					if err == badger.ErrKeyNotFound {
+						txn.Delete(rKey)
+						continue
+					}
 				}
-				return fmt.Errorf("get message for ready key: %w", err)
+				if err != nil {
+					return fmt.Errorf("get message for ready key: %w", err)
+				}
 			}
 
 			var msg Message
@@ -615,7 +633,7 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 	if claimed == nil {
 		return nil, ErrNoReadyMessages
 	}
-return claimed, nil
+	return claimed, nil
 }
 
 func receive(w http.ResponseWriter, r *http.Request) {
@@ -794,7 +812,7 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-var nackResultState MessageState
+	var nackResultState MessageState
 	var needReadyPointer bool
 
 	err = Db.Update(func(txn *badger.Txn) error {
@@ -1008,7 +1026,7 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 		return nil
 	})
 
-return transitions, err
+	return transitions, err
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.

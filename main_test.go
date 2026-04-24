@@ -143,6 +143,26 @@ func receiveTestMessage(t *testing.T, queueID string) receiveResponse {
 	return decodeResponse[receiveResponse](t, recorder)
 }
 
+func TestReadyPartsFromKeyUsesKnownPrefix(t *testing.T) {
+	prefix := readyPrefix("queue-a")
+	key := readyKey("queue-a", 0x7c, "message-1")
+
+	seq, msgID, err := readyPartsFromKey(key, prefix)
+	if err != nil {
+		t.Fatalf("readyPartsFromKey returned error: %v", err)
+	}
+	if seq != 0x7c {
+		t.Fatalf("ready seq = %d, want %d", seq, 0x7c)
+	}
+	if string(msgID) != "message-1" {
+		t.Fatalf("message id = %q, want message-1", string(msgID))
+	}
+
+	if _, _, err := readyPartsFromKey(key, readyPrefix("queue-b")); err == nil {
+		t.Fatal("expected mismatched prefix error")
+	}
+}
+
 func TestCreateAndGetQueue(t *testing.T) {
 	setupTestDB(t)
 
