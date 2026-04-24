@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -674,6 +675,50 @@ func publishBenchMessage(b testing.TB, queueID string, body []byte) {
 	publish(rec, req)
 	if rec.Code != http.StatusAccepted {
 		b.Fatalf("publish status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAckRatePerSec_NewQueue(t *testing.T) {
+	m := &queueMetrics{
+		startedAt: time.Now().Add(-5 * time.Second),
+	}
+	for i := 0; i < 10; i++ {
+		m.ackWindow = append(m.ackWindow, time.Now())
+	}
+
+	rate := m.ackRatePerSec()
+
+	elapsed := math.Min(60.0, 5.0)
+	expected := 10.0 / elapsed
+	if math.Abs(rate-expected) > 0.01 {
+		t.Errorf("ackRatePerSec = %.4f, want %.4f", rate, expected)
+	}
+}
+
+func TestAckRatePerSec_MatureQueue(t *testing.T) {
+	m := &queueMetrics{
+		startedAt: time.Now().Add(-120 * time.Second),
+	}
+	for i := 0; i < 60; i++ {
+		m.ackWindow = append(m.ackWindow, time.Now())
+	}
+
+	rate := m.ackRatePerSec()
+
+	expected := 1.0
+	if math.Abs(rate-expected) > 0.01 {
+		t.Errorf("ackRatePerSec = %.4f, want %.4f", rate, expected)
+	}
+}
+
+func TestAckRatePerSec_EmptyWindow(t *testing.T) {
+	m := &queueMetrics{
+		startedAt: time.Now(),
+	}
+
+	rate := m.ackRatePerSec()
+	if rate != 0 {
+		t.Errorf("ackRatePerSec = %.4f, want 0", rate)
 	}
 }
 
