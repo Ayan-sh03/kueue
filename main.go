@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,7 +81,26 @@ type queueMetrics struct {
 	startedAt      time.Time
 }
 
+var messageKeyCache sync.Map // key: "queueID\x00messageID" -> value: []byte (message key)
+
+func cacheMessageKey(queueID, messageID string, key []byte) {
+	messageKeyCache.Store(queueID+"\x00"+messageID, key)
+}
+
+func getCachedMessageKey(queueID, messageID string) ([]byte, bool) {
+	val, ok := messageKeyCache.Load(queueID + "\x00" + messageID)
+	if !ok {
+		return nil, false
+	}
+	return val.([]byte), true
+}
+
+func deleteCachedMessageKey(queueID, messageID string) {
+	messageKeyCache.Delete(queueID + "\x00" + messageID)
+}
+
 var metricsStore sync.Map
+
 
 func snapshotMax(counter *atomic.Int64, val int64) {
 	for {
@@ -508,9 +528,11 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = Db.Update(func(txn *badger.Txn) error {
-		if err := txn.Set(messageKey(queueId, seq, message.Message.ID), messageJson); err != nil {
+		msgKey := messageKey(queueId, seq, message.Message.ID)
+		if err := txn.Set(msgKey, messageJson); err != nil {
 			return err
 		}
+		cacheMessageKey(queueId, message.Message.ID, msgKey)
 		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(seq))
 	})
 	if err != nil {
@@ -736,14 +758,25 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
-		key, msg, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
+		msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
+		if !ok {
+			return badger.ErrKeyNotFound
+		}
+		item, err := txn.Get(msgKey)
 		if err != nil {
+			return err
+		}
+		var msg Message
+		if err := item.Value(func(v []byte) error {
+			return json.Unmarshal(v, &msg)
+		}); err != nil {
 			return err
 		}
 		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
 			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
 		}
-		return txn.Delete(key)
+		deleteCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
+		return txn.Delete(msgKey)
 	})
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
@@ -802,8 +835,18 @@ var nackResultState MessageState
 			return err
 		}
 
-		key, msg, err := findMessageRecord(txn, ackReq.QueueId, ackReq.MessageId)
+		msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
+		if !ok {
+			return badger.ErrKeyNotFound
+		}
+		item, err := txn.Get(msgKey)
 		if err != nil {
+			return err
+		}
+		var msg Message
+		if err := item.Value(func(v []byte) error {
+			return json.Unmarshal(v, &msg)
+		}); err != nil {
 			return err
 		}
 
@@ -827,12 +870,12 @@ var nackResultState MessageState
 			return err
 		}
 
-		if err := txn.Set(key, updated); err != nil {
+		if err := txn.Set(msgKey, updated); err != nil {
 			return err
 		}
 
 		if needReadyPointer {
-			originalSeq, err := parseMessageKeySeq(key)
+			originalSeq, err := parseMessageKeySeq(msgKey)
 			if err != nil {
 				return fmt.Errorf("parse message key seq: %w", err)
 			}
@@ -1127,6 +1170,19 @@ func main() {
 
 	reaper()
 	fmt.Println("Producer Running on Port " + port)
+
+	if profFile := os.Getenv("KUEUE_CPU_PROFILE"); profFile != "" {
+		f, err := os.Create(profFile)
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+		log.Println("CPU profiling enabled, writing to", profFile)
+	}
 
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("server failed: %v", err)
