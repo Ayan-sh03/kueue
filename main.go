@@ -241,14 +241,16 @@ func parseReadyValue(val []byte) (uint64, error) {
 }
 
 func parseMessageKeySeq(key []byte) (uint64, error) {
-	parts := bytes.SplitN(key, []byte("|"), 3)
-	if len(parts) < 2 {
-		return 0, fmt.Errorf("invalid message key format")
+	idx := bytes.IndexByte(key, '|')
+	if idx == -1 {
+		return 0, fmt.Errorf("invalid message key format: no delimiter")
 	}
-	if len(parts[1]) != 8 {
-		return 0, fmt.Errorf("invalid seq in message key")
+	seqStart := idx + 1
+	seqEnd := seqStart + 8
+	if seqEnd > len(key) {
+		return 0, fmt.Errorf("invalid message key format: seq too short")
 	}
-	return binary.BigEndian.Uint64(parts[1]), nil
+	return binary.BigEndian.Uint64(key[seqStart:seqEnd]), nil
 }
 
 func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
