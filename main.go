@@ -655,20 +655,24 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		}
 		if claimErr == ErrNoReadyMessages {
 			readyCh := queueReadyChan(id)
-
-			msg, claimErr = claimNextReadyMessage(id)
-			if claimErr != nil && claimErr != ErrNoReadyMessages {
-				http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
-				return
-			}
-			if claimErr == ErrNoReadyMessages {
-				timer := time.NewTimer(30 * time.Second)
-				defer timer.Stop()
+			timer := time.NewTimer(30 * time.Second)
+			defer timer.Stop()
+		waitLoop:
+			for {
+				msg, claimErr = claimNextReadyMessage(id)
+				if claimErr == nil {
+					break
+				}
+				if claimErr != nil && claimErr != ErrNoReadyMessages {
+					http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
+					return
+				}
 				select {
 				case <-readyCh:
-					msg, claimErr = claimNextReadyMessage(id)
+					readyCh = queueReadyChan(id)
+					continue
 				case <-timer.C:
-					// timed out — fall through with msg == nil
+					break waitLoop
 				case <-r.Context().Done():
 					return
 				}
