@@ -861,6 +861,10 @@ var nackResultState MessageState
 		"state":   nackResultState,
 	})
 
+	if needReadyPointer {
+		signalQueueReady(ackReq.QueueId)
+	}
+
 	m := getOrCreateMetrics(ackReq.QueueId)
 	m.totalNacked.Add(1)
 	m.inFlightCount.Add(-1)
