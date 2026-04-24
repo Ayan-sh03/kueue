@@ -68,19 +68,6 @@ var Db *badger.DB
 var Queues []Queue
 var DeadLetterQueue []Message
 
-type queueMetrics struct {
-	readyCount     atomic.Int64
-	inFlightCount  atomic.Int64
-	deadCount      atomic.Int64
-	totalPublished atomic.Int64
-	totalReceived  atomic.Int64
-	totalAcked     atomic.Int64
-	totalNacked    atomic.Int64
-	ackWindow      []time.Time
-	ackMu          sync.Mutex
-	startedAt      time.Time
-}
-
 var messageKeyCache sync.Map // key: "queueID\x00messageID" -> value: []byte (message key)
 
 func cacheMessageKey(queueID, messageID string, key []byte) {
@@ -99,8 +86,19 @@ func deleteCachedMessageKey(queueID, messageID string) {
 	messageKeyCache.Delete(queueID + "\x00" + messageID)
 }
 
-var metricsStore sync.Map
+type queueMetrics struct {
+	readyCount     atomic.Int64
+	inFlightCount  atomic.Int64
+	deadCount      atomic.Int64
+	totalPublished atomic.Int64
+	totalReceived  atomic.Int64
+	totalAcked     atomic.Int64
+	totalNacked    atomic.Int64
+	ackCountWindow atomic.Int64 // acks in last second (approximate, updated by reaper)
+	startedAt      time.Time
+}
 
+var metricsStore sync.Map
 
 func snapshotMax(counter *atomic.Int64, val int64) {
 	for {
@@ -117,29 +115,24 @@ func snapshotMax(counter *atomic.Int64, val int64) {
 func (m *queueMetrics) recordAck() {
 	m.totalAcked.Add(1)
 	m.inFlightCount.Add(-1)
-	m.ackMu.Lock()
-	m.ackWindow = append(m.ackWindow, time.Now())
-	m.ackMu.Unlock()
-}
-
-func (m *queueMetrics) trimAckWindow() {
-	m.ackMu.Lock()
-	defer m.ackMu.Unlock()
-	windowStart := time.Now().Add(-60 * time.Second)
-	i := 0
-	for i < len(m.ackWindow) && m.ackWindow[i].Before(windowStart) {
-		i++
-	}
-	m.ackWindow = m.ackWindow[i:]
+	m.ackCountWindow.Add(1)
 }
 
 func (m *queueMetrics) ackRatePerSec() float64 {
-	m.ackMu.Lock()
-	defer m.ackMu.Unlock()
-	if len(m.ackWindow) == 0 {
+	uptime := time.Since(m.startedAt).Seconds()
+	if uptime <= 0 {
 		return 0
 	}
-	return float64(len(m.ackWindow)) / math.Min(60.0, time.Since(m.startedAt).Seconds())
+	// Use sliding window count if available, else total/uptime
+	windowCount := m.ackCountWindow.Load()
+	if windowCount > 0 && uptime < 60 {
+		return float64(windowCount) / math.Min(60.0, uptime)
+	}
+	return float64(m.totalAcked.Load()) / uptime
+}
+
+func (m *queueMetrics) resetAckWindow() {
+	m.ackCountWindow.Store(0)
 }
 
 func getOrCreateMetrics(queueID string) *queueMetrics {
@@ -1084,7 +1077,7 @@ func reaper() {
 			}
 
 			metricsStore.Range(func(_, value any) bool {
-				value.(*queueMetrics).trimAckWindow()
+				value.(*queueMetrics).resetAckWindow()
 				return true
 			})
 		}
@@ -1122,7 +1115,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error reconciling metrics: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	m.trimAckWindow()
+	m.resetAckWindow()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
