@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sync"
@@ -118,7 +119,7 @@ func (m *queueMetrics) ackRatePerSec() float64 {
 	if len(m.ackWindow) == 0 {
 		return 0
 	}
-	return float64(len(m.ackWindow)) / 60.0
+	return float64(len(m.ackWindow)) / math.Min(60.0, time.Since(m.startedAt).Seconds())
 }
 
 func getOrCreateMetrics(queueID string) *queueMetrics {
