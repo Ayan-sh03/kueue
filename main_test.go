@@ -127,6 +127,7 @@ type receiveResponse struct {
 	Body          []byte       `json:"body"`
 	State         MessageState `json:"state"`
 	DeliveryToken string       `json:"deliveryToken"`
+	ReceiptHandle string       `json:"receiptHandle"`
 }
 
 func receiveTestMessage(t *testing.T, queueID string) receiveResponse {
@@ -209,9 +210,12 @@ func TestPublishReceiveAck(t *testing.T) {
 	if resp.DeliveryToken == "" {
 		t.Fatal("expected non-empty delivery token")
 	}
+	if resp.ReceiptHandle == "" {
+		t.Fatal("expected non-empty receipt handle")
+	}
 
 	storedKey := storedMessageKey(t, queueID, messageID)
-	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: resp.DeliveryToken})
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal ack request: %v", err)
 	}
@@ -241,7 +245,7 @@ func TestNackMakesMessageReceivableAgain(t *testing.T) {
 
 	firstResp := receiveTestMessage(t, queueID)
 
-	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: firstResp.DeliveryToken})
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: firstResp.ReceiptHandle, DeliveryToken: firstResp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal nack request: %v", err)
 	}
@@ -288,7 +292,7 @@ func TestReceiveReturnsMessagesInEnqueueOrder(t *testing.T) {
 			t.Fatalf("expected body %s, got %q", expected.body, string(resp.Body))
 		}
 
-		ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: resp.ID, DeliveryToken: resp.DeliveryToken})
+		ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
 		if err != nil {
 			t.Fatalf("marshal ack request: %v", err)
 		}
@@ -393,6 +397,7 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 
 	firstResp := receiveTestMessage(t, queueID)
 	firstToken := firstResp.DeliveryToken
+	firstReceiptHandle := firstResp.ReceiptHandle
 
 	storedKey := storedMessageKey(t, queueID, messageID)
 	err := Db.Update(func(txn *badger.Txn) error {
@@ -407,6 +412,9 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 				return err
 			}
 
+			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
+				return err
+			}
 			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
 
 			updated, err := json.Marshal(msg)
@@ -414,7 +422,10 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 				return err
 			}
 
-			return txn.Set(storedKey, updated)
+			if err := txn.Set(storedKey, updated); err != nil {
+				return err
+			}
+			return setInflightIndex(txn, queueID, msg, storedKey)
 		})
 	})
 	if err != nil {
@@ -442,7 +453,7 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 	}
 
 	// Stale delivery token should be rejected
-	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: firstToken})
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: firstReceiptHandle, DeliveryToken: firstToken})
 	if err != nil {
 		t.Fatalf("marshal ack request: %v", err)
 	}
@@ -458,11 +469,11 @@ func TestAckRejectsWrongDeliveryToken(t *testing.T) {
 	setupTestDB(t)
 
 	queueID := createTestQueue(t, "token-queue")
-	messageID := publishTestMessage(t, queueID, []byte("secret"))
+	_ = publishTestMessage(t, queueID, []byte("secret"))
 
-	_ = receiveTestMessage(t, queueID)
+	resp := receiveTestMessage(t, queueID)
 
-	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: "wrong-token"})
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: "wrong-token"})
 	if err != nil {
 		t.Fatalf("marshal ack request: %v", err)
 	}
@@ -480,11 +491,11 @@ func TestNackRejectsWrongDeliveryToken(t *testing.T) {
 	setupTestDB(t)
 
 	queueID := createTestQueue(t, "nack-token-queue")
-	messageID := publishTestMessage(t, queueID, []byte("secret"))
+	_ = publishTestMessage(t, queueID, []byte("secret"))
 
-	_ = receiveTestMessage(t, queueID)
+	resp := receiveTestMessage(t, queueID)
 
-	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: "wrong-token"})
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: "wrong-token"})
 	if err != nil {
 		t.Fatalf("marshal nack request: %v", err)
 	}
@@ -495,6 +506,104 @@ func TestNackRejectsWrongDeliveryToken(t *testing.T) {
 
 	if nackRecorder.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for wrong delivery token, got %d: %s", nackRecorder.Code, nackRecorder.Body.String())
+	}
+}
+
+func TestAckRejectsMalformedReceiptHandle(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "bad-handle-queue")
+
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: "not-base64!", DeliveryToken: "token"})
+	if err != nil {
+		t.Fatalf("marshal ack request: %v", err)
+	}
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+
+	if ackRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed receipt handle, got %d: %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+}
+
+func TestAckRejectsWrongQueueReceiptHandle(t *testing.T) {
+	setupTestDB(t)
+
+	queueAID := createTestQueue(t, "queue-a")
+	queueBID := createTestQueue(t, "queue-b")
+	publishTestMessage(t, queueAID, []byte("secret"))
+
+	resp := receiveTestMessage(t, queueAID)
+
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueBID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
+	if err != nil {
+		t.Fatalf("marshal ack request: %v", err)
+	}
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+
+	if ackRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for wrong queue receipt handle, got %d: %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+}
+
+func TestAckDeletesInflightIndex(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "ack-index-queue")
+	publishTestMessage(t, queueID, []byte("indexed"))
+
+	resp := receiveTestMessage(t, queueID)
+
+	err := Db.View(func(txn *badger.Txn) error {
+		key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
+		if err != nil {
+			return err
+		}
+		item, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+			_, err = txn.Get(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatalf("expected in-flight index after receive: %v", err)
+	}
+
+	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
+	if err != nil {
+		t.Fatalf("marshal ack request: %v", err)
+	}
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+	if ackRecorder.Code != http.StatusAccepted {
+		t.Fatalf("ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+
+	err = Db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = inflightPrefix()
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			t.Fatalf("expected no in-flight index keys, found %q", it.Item().Key())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan in-flight index: %v", err)
 	}
 }
 
@@ -531,12 +640,18 @@ func TestReapDeadLettersAfterMaxDeliveries(t *testing.T) {
 			if err := json.Unmarshal(v, &msg); err != nil {
 				return err
 			}
+			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
+				return err
+			}
 			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
 			updated, err := json.Marshal(msg)
 			if err != nil {
 				return err
 			}
-			return txn.Set(storedKey, updated)
+			if err := txn.Set(storedKey, updated); err != nil {
+				return err
+			}
+			return setInflightIndex(txn, queueID, msg, storedKey)
 		})
 	})
 	if err != nil {
@@ -563,6 +678,60 @@ func TestReapDeadLettersAfterMaxDeliveries(t *testing.T) {
 	}
 }
 
+func TestReaperUsesInflightIndexWithReadyBacklog(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "indexed-reaper-queue")
+	messageID := publishTestMessage(t, queueID, []byte("expired"))
+	resp := receiveTestMessage(t, queueID)
+	if resp.ID != messageID {
+		t.Fatalf("expected received message %s, got %s", messageID, resp.ID)
+	}
+	for i := 0; i < 50; i++ {
+		publishTestMessage(t, queueID, []byte("ready-backlog"))
+	}
+
+	storedKey := storedMessageKey(t, queueID, messageID)
+	err := Db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(storedKey)
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			var msg Message
+			if err := json.Unmarshal(v, &msg); err != nil {
+				return err
+			}
+			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
+				return err
+			}
+			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+			if err := txn.Set(storedKey, updated); err != nil {
+				return err
+			}
+			return setInflightIndex(txn, queueID, msg, storedKey)
+		})
+	})
+	if err != nil {
+		t.Fatalf("prepare expired in-flight message: %v", err)
+	}
+
+	transitions, err := reapExpiredMessages(time.Now())
+	if err != nil {
+		t.Fatalf("reap expired messages: %v", err)
+	}
+	if len(transitions) != 1 {
+		t.Fatalf("expected one indexed reaper transition, got %d", len(transitions))
+	}
+	if transitions[0].QueueID != queueID || transitions[0].ToState != StateReady {
+		t.Fatalf("unexpected transition: %+v", transitions[0])
+	}
+}
+
 func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
 	setupTestDB(t)
 
@@ -585,7 +754,7 @@ func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
 
 	resp := receiveTestMessage(t, queueID)
 
-	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, MessageId: messageID, DeliveryToken: resp.DeliveryToken})
+	nackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal nack request: %v", err)
 	}
@@ -755,19 +924,195 @@ func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
 	return resp
 }
 
+func ackClaimedMessagesBench(b testing.TB, queueID string, msgs []claimedMessage) {
+	b.Helper()
+
+	acks := make([]AckEntry, 0, len(msgs))
+	for _, msg := range msgs {
+		acks = append(acks, AckEntry{
+			ReceiptHandle: msg.ReceiptHandle,
+			DeliveryToken: msg.DeliveryAttemptID,
+		})
+	}
+
+	body, err := json.Marshal(BatchAckRequest{QueueId: queueID, Acks: acks})
+	if err != nil {
+		b.Fatalf("marshal batch ack: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	ack(rec, req)
+	if rec.Code != http.StatusAccepted {
+		b.Fatalf("ack status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func setupDepthBenchmarkDB(b *testing.B) string {
+	b.Helper()
+
+	db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLogger(nil))
+	if err != nil {
+		b.Fatalf("open bench db: %v", err)
+	}
+
+	Db = db
+	Queues = nil
+	DeadLetterQueue = nil
+	receiveChannel = make(chan struct{}, 1)
+	queueReadyChans = map[string]chan struct{}{}
+	metricsStore = sync.Map{}
+
+	b.Cleanup(func() {
+		_ = db.Close()
+		Db = nil
+	})
+
+	return createBenchQueue(b, "depth-bench-queue")
+}
+
+func BenchmarkBatchReceiveOnly(b *testing.B) {
+	const batchSize = 10
+	for _, depth := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("depth_%d", depth), func(b *testing.B) {
+			queueID := setupDepthBenchmarkDB(b)
+			for i := 0; i < depth+b.N*batchSize; i++ {
+				publishBenchMessage(b, queueID, []byte("fill"))
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				msgs, err := claimReadyMessages(queueID, batchSize)
+				if err != nil {
+					b.Fatalf("claim batch: %v", err)
+				}
+				if len(msgs) != batchSize {
+					b.Fatalf("claimed %d messages, want %d", len(msgs), batchSize)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkBatchAckOnly(b *testing.B) {
+	const batchSize = 10
+	for _, depth := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("depth_%d", depth), func(b *testing.B) {
+			queueID := setupDepthBenchmarkDB(b)
+			for i := 0; i < depth+b.N*batchSize; i++ {
+				publishBenchMessage(b, queueID, []byte("fill"))
+			}
+
+			batches := make([][]claimedMessage, 0, b.N)
+			for i := 0; i < b.N; i++ {
+				msgs, err := claimReadyMessages(queueID, batchSize)
+				if err != nil {
+					b.Fatalf("claim batch: %v", err)
+				}
+				batches = append(batches, msgs)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ackClaimedMessagesBench(b, queueID, batches[i])
+			}
+		})
+	}
+}
+
+func BenchmarkBatchReceiveAndAck(b *testing.B) {
+	const batchSize = 10
+	for _, depth := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("depth_%d", depth), func(b *testing.B) {
+			queueID := setupDepthBenchmarkDB(b)
+			for i := 0; i < depth+b.N*batchSize; i++ {
+				publishBenchMessage(b, queueID, []byte("fill"))
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				msgs, err := claimReadyMessages(queueID, batchSize)
+				if err != nil {
+					b.Fatalf("claim batch: %v", err)
+				}
+				ackClaimedMessagesBench(b, queueID, msgs)
+			}
+		})
+	}
+}
+
+func BenchmarkReaperDueInflightIndex(b *testing.B) {
+	for _, readyDepth := range []int{100, 1000, 10000} {
+		b.Run(fmt.Sprintf("ready_depth_%d", readyDepth), func(b *testing.B) {
+			queueID := setupDepthBenchmarkDB(b)
+			for i := 0; i < readyDepth; i++ {
+				publishBenchMessage(b, queueID, []byte("ready"))
+			}
+
+			for i := 0; i < b.N; i++ {
+				publishBenchMessage(b, queueID, []byte("expired"))
+				resp := receiveBenchMessage(b, queueID)
+				key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
+				if err != nil {
+					b.Fatalf("decode receipt handle: %v", err)
+				}
+				err = Db.Update(func(txn *badger.Txn) error {
+					item, err := txn.Get(key)
+					if err != nil {
+						return err
+					}
+					return item.Value(func(v []byte) error {
+						var msg Message
+						if err := json.Unmarshal(v, &msg); err != nil {
+							return err
+						}
+						if err := deleteInflightIndex(txn, queueID, msg); err != nil {
+							return err
+						}
+						msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+						updated, err := json.Marshal(msg)
+						if err != nil {
+							return err
+						}
+						if err := txn.Set(key, updated); err != nil {
+							return err
+						}
+						return setInflightIndex(txn, queueID, msg, key)
+					})
+				})
+				if err != nil {
+					b.Fatalf("prepare expired message: %v", err)
+				}
+			}
+
+			b.ResetTimer()
+			transitions, err := reapExpiredMessages(time.Now())
+			b.StopTimer()
+			if err != nil {
+				b.Fatalf("reap expired messages: %v", err)
+			}
+			if len(transitions) != b.N {
+				b.Fatalf("reaped %d messages, want %d", len(transitions), b.N)
+			}
+		})
+	}
+}
+
 type batchReceiveResponse struct {
 	Messages []struct {
 		ID            string       `json:"id"`
 		Body          []byte       `json:"body"`
 		State         MessageState `json:"state"`
 		DeliveryToken string       `json:"deliveryToken"`
+		ReceiptHandle string       `json:"receiptHandle"`
 	} `json:"messages"`
 }
 
 type batchAckResult struct {
-	MessageId string `json:"messageId"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
+	MessageId     string `json:"messageId"`
+	ReceiptHandle string `json:"receiptHandle"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
 }
 
 type batchAckResponse struct {
@@ -810,6 +1155,9 @@ func TestBatchReceiveReturnsMultipleMessages(t *testing.T) {
 		}
 		if m.DeliveryToken == "" {
 			t.Fatalf("message %s has empty delivery token", m.ID)
+		}
+		if m.ReceiptHandle == "" {
+			t.Fatalf("message %s has empty receipt handle", m.ID)
 		}
 	}
 }
@@ -886,9 +1234,9 @@ func TestBatchAckMultipleMessages(t *testing.T) {
 	ackBody, _ := json.Marshal(BatchAckRequest{
 		QueueId: queueID,
 		Acks: []AckEntry{
-			{MessageId: msg1ID, DeliveryToken: batchResp.Messages[0].DeliveryToken},
-			{MessageId: msg2ID, DeliveryToken: batchResp.Messages[1].DeliveryToken},
-			{MessageId: msg3ID, DeliveryToken: batchResp.Messages[2].DeliveryToken},
+			{ReceiptHandle: batchResp.Messages[0].ReceiptHandle, DeliveryToken: batchResp.Messages[0].DeliveryToken},
+			{ReceiptHandle: batchResp.Messages[1].ReceiptHandle, DeliveryToken: batchResp.Messages[1].DeliveryToken},
+			{ReceiptHandle: batchResp.Messages[2].ReceiptHandle, DeliveryToken: batchResp.Messages[2].DeliveryToken},
 		},
 	})
 
@@ -931,7 +1279,7 @@ func TestBatchAckReportsPartialErrors(t *testing.T) {
 
 	queueID := createTestQueue(t, "batch-ack-err-queue")
 
-	msg1ID := publishTestMessage(t, queueID, []byte("one"))
+	_ = publishTestMessage(t, queueID, []byte("one"))
 	msg2ID := publishTestMessage(t, queueID, []byte("two"))
 
 	batchResp := func() batchReceiveResponse {
@@ -949,8 +1297,8 @@ func TestBatchAckReportsPartialErrors(t *testing.T) {
 	ackBody, _ := json.Marshal(BatchAckRequest{
 		QueueId: queueID,
 		Acks: []AckEntry{
-			{MessageId: msg1ID, DeliveryToken: batchResp.Messages[0].DeliveryToken},
-			{MessageId: msg2ID, DeliveryToken: "wrong-token"},
+			{ReceiptHandle: batchResp.Messages[0].ReceiptHandle, DeliveryToken: batchResp.Messages[0].DeliveryToken},
+			{ReceiptHandle: batchResp.Messages[1].ReceiptHandle, DeliveryToken: "wrong-token"},
 		},
 	})
 
