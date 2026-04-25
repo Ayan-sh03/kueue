@@ -21,6 +21,14 @@ import (
 
 var errNoMessage = errors.New("no message available")
 
+var debugLog bool
+
+func debugf(format string, args ...any) {
+	if debugLog {
+		fmt.Fprintf(os.Stderr, "[bench] "+format+"\n", args...)
+	}
+}
+
 type workloadConfig struct {
 	Messages       int      `json:"messages"`
 	Warmup         int      `json:"warmup"`
@@ -106,7 +114,10 @@ func main() {
 	)
 	flag.Parse()
 
+	debugLog = os.Getenv("DEBUG") == "true"
+
 	targetList := parseTargets(*targets)
+	debugf("targets: %v, messages: %d, runs: %d", targetList, *messages, *runs)
 
 	// --- Section 1: End-to-end (default client config) ---
 	e2eCfg := workloadConfig{
@@ -166,12 +177,15 @@ func runSection(label string, targetList []string, cfg workloadConfig, kueueURL,
 		os.Exit(1)
 	}
 
+	debugf("--- section: %s (batch=%d, prefetch=%d) ---", label, cfg.KueueBatchSize, cfg.Prefetch)
+
 	report := benchmarkReport{
 		GeneratedAt: time.Now().UTC(),
 		Workload:    cfg,
 	}
 
 	for _, name := range targetList {
+		debugf("target: %s", name)
 		target, err := newTarget(name, kueueURL, rabbitMQURI)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%s: target %q: %v\n", label, name, err)
@@ -256,19 +270,23 @@ func runTarget(ctx context.Context, target benchmarkTarget, cfg workloadConfig) 
 	fmt.Printf("\n== %s ==\n", strings.ToUpper(target.Name()))
 
 	for run := 1; run <= cfg.Runs; run++ {
+		debugf("setup run %d/%d", run, cfg.Runs)
 		runLabel := fmt.Sprintf("%s-%d-%d", target.Name(), run, time.Now().UnixNano())
 		if err := target.Setup(ctx, cfg, runLabel); err != nil {
 			return summary, err
 		}
 
 		if cfg.Warmup > 0 {
+			debugf("warmup: %d messages...", cfg.Warmup)
 			if _, err := executeWorkload(ctx, target, cfg, cfg.Warmup); err != nil {
 				_ = target.Cleanup(context.Background())
 				return summary, fmt.Errorf("warmup run %d: %w", run, err)
 			}
 		}
 
+		debugf("measured run %d: %d messages...", run, cfg.Messages)
 		result, err := executeWorkload(ctx, target, cfg, cfg.Messages)
+		debugf("cleanup...")
 		cleanupErr := target.Cleanup(context.Background())
 		if err != nil {
 			return summary, fmt.Errorf("measured run %d: %w", run, err)
@@ -330,6 +348,21 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 		seqCh <- seq
 	}
 	close(seqCh)
+
+	doneCh := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				debugf("progress: produced=%d/%d consumed=%d/%d", produced.Load(), messages, consumed.Load(), messages)
+			case <-doneCh:
+				return
+			}
+		}
+	}()
+	defer close(doneCh)
 
 	consumeStarted := time.Now()
 	var consumerWG sync.WaitGroup
@@ -603,8 +636,8 @@ type receivedMsg struct {
 }
 
 type ackEntryBench struct {
-	MessageID     string
-	DeliveryToken string
+	MessageID     string `json:"messageId"`
+	DeliveryToken string `json:"deliveryToken"`
 }
 
 type kueueTarget struct {
