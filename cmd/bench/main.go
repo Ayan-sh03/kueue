@@ -804,15 +804,40 @@ func (t *kueueTarget) flushAcks(ctx context.Context, acks []ackEntryBench) error
 		Acks    []ackEntryBench `json:"acks"`
 	}
 
+	type ackResult struct {
+		MessageId string `json:"messageId"`
+		Status    string `json:"status"`
+		Error     string `json:"error,omitempty"`
+	}
+	type batchAckResponse struct {
+		Results []ackResult `json:"results"`
+	}
+
 	req := batchReqBody{
 		QueueId: t.queueID,
 		Acks:    acks,
 	}
 
-	if err := t.postJSON(ctx, "/ack", req, nil); err != nil {
+	var resp batchAckResponse
+	if err := t.postJSON(ctx, "/ack", req, &resp); err != nil {
 		return err
 	}
-	return nil
+
+	// Check per-entry results
+	var firstErr error
+	for _, r := range resp.Results {
+		if r.Status != "ok" {
+			err := fmt.Errorf("ack %s failed: %s", r.MessageId, r.Error)
+			if firstErr == nil {
+				firstErr = err
+			}
+			if debugLog {
+				debugf("batch ack error: %v", err)
+			}
+		}
+	}
+
+	return firstErr
 }
 
 func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
