@@ -694,12 +694,12 @@ func (t *kueueTarget) NewPublisher(int) (publisher, error) {
 }
 
 func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
+	// Fast path: return buffered message without I/O
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if len(t.msgBuf) > 0 {
 		m := t.msgBuf[0]
 		t.msgBuf = t.msgBuf[1:]
+		t.mu.Unlock()
 		return &delivery{
 			ID:   m.ID,
 			Body: m.Body,
@@ -707,10 +707,22 @@ func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
 		}, nil
 	}
 
-	if err := t.flushAcksLocked(ctx); err != nil {
-		return nil, err
+	// Steal pending acks and clear them under lock
+	var acksToFlush []ackEntryBench
+	if len(t.pendingAcks) > 0 {
+		acksToFlush = t.pendingAcks
+		t.pendingAcks = nil
+	}
+	t.mu.Unlock()
+
+	// Flush acks without holding lock
+	if len(acksToFlush) > 0 {
+		if err := t.flushAcks(ctx, acksToFlush); err != nil {
+			return nil, err
+		}
 	}
 
+	// Receive batch without holding lock
 	msgs, err := t.receiveBatch(ctx)
 	if err != nil {
 		if errors.Is(err, errNoMessage) {
@@ -722,7 +734,24 @@ func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
 		return nil, errNoMessage
 	}
 
-	t.msgBuf = msgs[1:]
+	// Push to buffer and return one message
+	t.mu.Lock()
+	// Reconcile any pendingAcks added while we were waiting for network I/O
+	if len(t.pendingAcks) > 0 && len(msgs) > 1 {
+		// We have concurrent acks, might as well flush them now
+		t.mu.Unlock()
+		if err := t.flushAcks(ctx, t.pendingAcks); err != nil {
+			return nil, err
+		}
+		t.mu.Lock()
+		t.pendingAcks = nil
+	}
+
+	if len(msgs) > 1 {
+		t.msgBuf = append(t.msgBuf, msgs[1:]...)
+	}
+	t.mu.Unlock()
+
 	m := msgs[0]
 	return &delivery{
 		ID:   m.ID,
@@ -736,32 +765,49 @@ func (t *kueueTarget) makeAckFunc(msgID, deliveryToken string) func(context.Cont
 		t.mu.Lock()
 		t.pendingAcks = append(t.pendingAcks, ackEntryBench{MessageID: msgID, DeliveryToken: deliveryToken})
 		shouldFlush := len(t.pendingAcks) >= t.batchSize || len(t.msgBuf) == 0
+		var acksToFlush []ackEntryBench
+		if shouldFlush {
+			acksToFlush = t.pendingAcks
+			t.pendingAcks = nil
+		}
 		t.mu.Unlock()
 
 		if shouldFlush {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-			return t.flushAcksLocked(ctx)
+			return t.flushAcks(ctx, acksToFlush)
 		}
 		return nil
 	}
 }
 
+// flushAcksLocked flushes t.pendingAcks. Must be called with t.mu held.
 func (t *kueueTarget) flushAcksLocked(ctx context.Context) error {
 	if len(t.pendingAcks) == 0 {
 		return nil
 	}
+	acks := t.pendingAcks
+	t.pendingAcks = nil
+	// Release lock during I/O
+	t.mu.Unlock()
+	err := t.flushAcks(ctx, acks)
+	t.mu.Lock()
+	return err
+}
+
+// flushAcks posts the given acks. Does NOT require t.mu to be held.
+func (t *kueueTarget) flushAcks(ctx context.Context, acks []ackEntryBench) error {
+	if len(acks) == 0 {
+		return nil
+	}
 
 	type batchReqBody struct {
-		QueueId string        `json:"queueId"`
+		QueueId string          `json:"queueId"`
 		Acks    []ackEntryBench `json:"acks"`
 	}
 
 	req := batchReqBody{
 		QueueId: t.queueID,
-		Acks:    t.pendingAcks,
+		Acks:    acks,
 	}
-	t.pendingAcks = nil
 
 	if err := t.postJSON(ctx, "/ack", req, nil); err != nil {
 		return err
@@ -821,11 +867,7 @@ func (t *kueueTarget) Cleanup(ctx context.Context) error {
 
 	var err error
 	if len(pending) > 0 {
-		t.mu.Lock()
-		t.pendingAcks = pending
-		err = t.flushAcksLocked(ctx)
-		t.pendingAcks = nil
-		t.mu.Unlock()
+		err = t.flushAcks(ctx, pending)
 	}
 
 	t.queueID = ""
