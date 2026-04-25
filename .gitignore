@@ -1,2 +1,11 @@
 todo.md
 tmp
+# Generated artifacts
+*.prof
+*.env
+kueue-bench
+kueue-server
+bench-runner
+benchmark-regression-issue.md
+data/
+kueue.service

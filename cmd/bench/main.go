@@ -635,8 +635,9 @@ func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error)
 	switch resp.StatusCode {
 	case http.StatusAccepted:
 		var payload struct {
-			ID   string `json:"id"`
-			Body []byte `json:"body"`
+			ID             string `json:"id"`
+			Body           []byte `json:"body"`
+			DeliveryToken  string `json:"deliveryToken"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 			return nil, err
@@ -646,12 +647,14 @@ func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error)
 			Body: payload.Body,
 			Ack: func(ctx context.Context) error {
 				type ackRequest struct {
-					MessageID string `json:"messageId"`
-					QueueID   string `json:"queueId"`
+					MessageID     string `json:"messageId"`
+					QueueID       string `json:"queueId"`
+					DeliveryToken string `json:"deliveryToken"`
 				}
 				return t.postJSON(ctx, "/ack", ackRequest{
-					MessageID: payload.ID,
-					QueueID:   t.queueID,
+					MessageID:     payload.ID,
+					QueueID:       t.queueID,
+					DeliveryToken: payload.DeliveryToken,
 				}, nil)
 			},
 		}, nil
