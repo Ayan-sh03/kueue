@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/pprof"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,6 +222,27 @@ func nextMessageSequence(queueID string) (uint64, error) {
 	defer seq.Release()
 
 	return seq.Next()
+}
+
+func nextMessageSequenceN(queueID string, n int) ([]uint64, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	seq, err := Db.GetSequence(queueSequenceKey(queueID), uint64(n))
+	if err != nil {
+		return nil, err
+	}
+	defer seq.Release()
+
+	seqs := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		s, err := seq.Next()
+		if err != nil {
+			return nil, err
+		}
+		seqs[i] = s
+	}
+	return seqs, nil
 }
 
 const readyKeySep = "|"
@@ -548,12 +570,119 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 }
 
+type BatchPublishRequest struct {
+	Messages []Message `json:"messages"`
+	QueueId  string    `json:"queueId"`
+}
+
+type BatchPublishResponse struct {
+	IDs []string `json:"ids"`
+}
+
+func publishBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req BatchPublishRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Messages) == 0 {
+		http.Error(w, "messages array is required", http.StatusBadRequest)
+		return
+	}
+	if req.QueueId == "" {
+		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+
+	var queueConfig QueueConfig
+	err := Db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(req.QueueId))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			return json.Unmarshal(val, &queueConfig)
+		})
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+req.QueueId, http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	ids := make([]string, len(req.Messages))
+	now := time.Now()
+
+	seqs, err := nextMessageSequenceN(req.QueueId, len(req.Messages))
+	if err != nil {
+		http.Error(w, "Error Allocating Message Sequences: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	err = Db.Update(func(txn *badger.Txn) error {
+		for i, msg := range req.Messages {
+			msg.ID = uuid.NewString()
+			msg.State = StateReady
+			msg.EnqueuedAt = now
+			msg.MaxDeliveryCount = queueConfig.MaxRetries
+
+			msgJson, err := json.Marshal(msg)
+			if err != nil {
+				return err
+			}
+
+			msgKey := messageKey(req.QueueId, seqs[i], msg.ID)
+			if err := txn.Set(msgKey, msgJson); err != nil {
+				return err
+			}
+			cacheMessageKey(req.QueueId, msg.ID, msgKey)
+			if err := txn.Set(readyKey(req.QueueId, seqs[i], msg.ID), readyValue(msgKey)); err != nil {
+				return err
+			}
+			ids[i] = msg.ID
+		}
+		return nil
+	})
+	if err != nil {
+		http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	signalQueueReady(req.QueueId)
+
+	m := getOrCreateMetrics(req.QueueId)
+	m.totalPublished.Add(int64(len(ids)))
+	m.readyCount.Add(int64(len(ids)))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(BatchPublishResponse{IDs: ids})
+}
+
 // claimNextReadyMessage seeks the first ready pointer for the queue,
 // reads the corresponding message, atomically transitions it to StateInFlight,
 // and deletes the ready pointer — all in a single Db.Update transaction.
 // Returns ErrNoReadyMessages if no ready messages are available.
 func claimNextReadyMessage(queueId string) (*Message, error) {
-	var claimed *Message
+	msgs, err := claimNextReadyMessages(queueId, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(msgs) == 0 {
+		return nil, ErrNoReadyMessages
+	}
+	return &msgs[0], nil
+}
+
+func claimNextReadyMessages(queueId string, max int) ([]Message, error) {
+	var claimed []Message
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
@@ -561,7 +690,7 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		for it.Rewind(); it.Valid(); it.Next() {
+		for it.Rewind(); it.Valid() && len(claimed) < max; it.Next() {
 			item := it.Item()
 			rKey := item.KeyCopy(nil)
 			_, _, err := parseReadyKey(rKey)
@@ -616,18 +745,17 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 				return fmt.Errorf("set claimed message: %w", err)
 			}
 
-			claimed = &msg
-			return nil
+			claimed = append(claimed, msg)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if claimed == nil {
-		return nil, ErrNoReadyMessages
+	for _, m := range claimed {
+		log.Printf("CLAIM: %s/%s token=%s", queueId, m.ID, m.DeliveryAttemptID)
 	}
-return claimed, nil
+	return claimed, nil
 }
 
 func receive(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +847,119 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type batchReceiveResponse struct {
+	Messages []batchReceiveMessage `json:"messages"`
+}
+
+type batchReceiveMessage struct {
+	ID            string `json:"id"`
+	Body          []byte `json:"body"`
+	State         string `json:"state"`
+	DeliveryToken string `json:"deliveryToken"`
+}
+
+func receiveBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	params := r.URL.Query()
+	id := params.Get("id")
+	if id == "" {
+		http.Error(w, "id is required in the url", http.StatusBadRequest)
+		return
+	}
+
+	max := 1
+	if m := params.Get("max"); m != "" {
+		if v, err := strconv.Atoi(m); err == nil && v > 0 {
+			max = v
+		}
+	}
+
+	err := Db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get([]byte(id))
+		return err
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
+			return
+		}
+		log.Println(err)
+		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var msgs []Message
+	var claimErr error
+
+	if wait := params.Get("wait"); wait == "true" {
+		msgs, claimErr = claimNextReadyMessages(id, max)
+		if claimErr != nil && claimErr != ErrNoReadyMessages {
+			http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		if claimErr == ErrNoReadyMessages || len(msgs) == 0 {
+			readyCh := queueReadyChan(id)
+			timer := time.NewTimer(30 * time.Second)
+			defer timer.Stop()
+		waitLoop:
+			for {
+				msgs, claimErr = claimNextReadyMessages(id, max)
+				if claimErr == nil && len(msgs) > 0 {
+					break
+				}
+				if claimErr != nil && claimErr != ErrNoReadyMessages {
+					http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
+					return
+				}
+				select {
+				case <-readyCh:
+					readyCh = queueReadyChan(id)
+					continue
+				case <-timer.C:
+					break waitLoop
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}
+	} else {
+		msgs, claimErr = claimNextReadyMessages(id, max)
+	}
+
+	if claimErr != nil && claimErr != ErrNoReadyMessages {
+		http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	if claimErr == ErrNoReadyMessages || len(msgs) == 0 {
+		http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
+		return
+	}
+
+	m := getOrCreateMetrics(id)
+	for range msgs {
+		m.totalReceived.Add(1)
+		m.readyCount.Add(-1)
+		m.inFlightCount.Add(1)
+	}
+
+	resp := batchReceiveResponse{Messages: make([]batchReceiveMessage, len(msgs))}
+	for i, msg := range msgs {
+		resp.Messages[i] = batchReceiveMessage{
+			ID:            msg.ID,
+			Body:          msg.Body,
+			State:         string(msg.State),
+			DeliveryToken: msg.DeliveryAttemptID,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(resp)
+}
+
 func ack(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -790,6 +1031,105 @@ func ack(w http.ResponseWriter, r *http.Request) {
 	m := getOrCreateMetrics(ackReq.QueueId)
 	m.recordAck()
 
+}
+
+type BatchAckRequest struct {
+	Messages []AckRequest `json:"messages"`
+}
+
+func ackBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req BatchAckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.Messages) == 0 {
+		http.Error(w, "messages array is required", http.StatusBadRequest)
+		return
+	}
+
+	queueID := req.Messages[0].QueueId
+	if queueID == "" {
+		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+	for _, m := range req.Messages {
+		if m.QueueId != queueID {
+			http.Error(w, "all messages must belong to the same queue", http.StatusBadRequest)
+			return
+		}
+		if m.MessageId == "" {
+			http.Error(w, "messageId is required for all messages", http.StatusBadRequest)
+			return
+		}
+		if m.DeliveryToken == "" {
+			http.Error(w, "deliveryToken is required for all messages", http.StatusBadRequest)
+			return
+		}
+	}
+
+	var ackedCount int64
+	err := Db.Update(func(txn *badger.Txn) error {
+		if _, err := txn.Get([]byte(queueID)); err != nil {
+			return err
+		}
+		for _, ackReq := range req.Messages {
+			msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
+			if !ok {
+				log.Printf("ack-batch: cache miss for %s/%s", ackReq.QueueId, ackReq.MessageId)
+				return badger.ErrKeyNotFound
+			}
+			item, err := txn.Get(msgKey)
+			if err != nil {
+				log.Printf("ack-batch: key not found for %s/%s: %v", ackReq.QueueId, ackReq.MessageId, err)
+				return err
+			}
+			var msg Message
+			if err := item.Value(func(v []byte) error {
+				return json.Unmarshal(v, &msg)
+			}); err != nil {
+				return err
+			}
+			if msg.DeliveryAttemptID != ackReq.DeliveryToken {
+				log.Printf("ack-batch: token mismatch for %s/%s: db=%q client=%q state=%s", ackReq.QueueId, ackReq.MessageId, msg.DeliveryAttemptID, ackReq.DeliveryToken, msg.State)
+				return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
+			}
+			deleteCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
+			if err := txn.Delete(msgKey); err != nil {
+				return err
+			}
+			ackedCount++
+		}
+		return nil
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
+		}
+		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, "Failed to acknowledge messages: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"message":       "Messages acknowledged",
+		"ackedCount":    ackedCount,
+	})
+
+	m := getOrCreateMetrics(queueID)
+	for i := int64(0); i < ackedCount; i++ {
+		m.recordAck()
+	}
 }
 
 func nack(w http.ResponseWriter, r *http.Request) {
@@ -958,6 +1298,7 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 			}
 			msg.VisibilityDeadline = time.Time{}
 			msg.DeliveryAttemptID = ""
+			log.Printf("REAPER: resetting %s/%s to %s (deadline=%v now=%v)", queueID, msg.ID, msg.State, msg.VisibilityDeadline, now)
 
 			updated, err := json.Marshal(msg)
 			if err != nil {
@@ -1094,9 +1435,12 @@ func main() {
 	http.HandleFunc("/create", create)
 	http.HandleFunc("/get", getQueue)
 	http.HandleFunc("/publish", publish)
+	http.HandleFunc("/publish-batch", publishBatch)
 	http.HandleFunc("/ack", ack)
+	http.HandleFunc("/ack-batch", ackBatch)
 	http.HandleFunc("/nack", nack)
 	http.HandleFunc("/receive", receive)
+	http.HandleFunc("/receive-batch", receiveBatch)
 	http.HandleFunc("/metrics", metricsHandler)
 
 	reaper()
