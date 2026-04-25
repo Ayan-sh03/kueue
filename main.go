@@ -584,7 +584,9 @@ func claimNextReadyMessage(queueId string) (*Message, error) {
 					msgKey = messageKeyBytes(queueId, originalSeq, msgID)
 					msgItem, err = txn.Get(msgKey)
 					if err == badger.ErrKeyNotFound {
-						txn.Delete(rKey)
+						if err := txn.Delete(rKey); err != nil {
+							return fmt.Errorf("delete stale ready pointer %x: %w", rKey, err)
+						}
 						continue
 					}
 				}
