@@ -9,13 +9,16 @@ import (
 )
 
 func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
-	type ackRequest struct {
+	type batchAckEntry struct {
 		MessageID     string `json:"messageId"`
-		QueueID       string `json:"queueId"`
 		DeliveryToken string `json:"deliveryToken"`
 	}
+	type batchAckRequest struct {
+		QueueID string          `json:"queueId"`
+		Acks    []batchAckEntry `json:"acks"`
+	}
 
-	ackRequests := make(chan ackRequest, 1)
+	ackRequests := make(chan batchAckRequest, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -26,14 +29,18 @@ func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusAccepted)
 			if err := json.NewEncoder(w).Encode(map[string]any{
-				"id":            "message-1",
-				"body":          []byte("payload"),
-				"deliveryToken": "token-1",
+				"messages": []any{
+					map[string]any{
+						"id":            "message-1",
+						"body":          []byte("payload"),
+						"deliveryToken": "token-1",
+					},
+				},
 			}); err != nil {
 				t.Errorf("encode receive response: %v", err)
 			}
 		case "/ack":
-			var req ackRequest
+			var req batchAckRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				http.Error(w, "bad ack request", http.StatusBadRequest)
 				return
@@ -51,6 +58,7 @@ func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 
 	target := newKueueTarget(server.URL)
 	target.queueID = "queue-1"
+	target.batchSize = 1
 
 	msg, err := target.Consume(context.Background())
 	if err != nil {
@@ -62,14 +70,17 @@ func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 
 	select {
 	case req := <-ackRequests:
-		if req.MessageID != "message-1" {
-			t.Fatalf("ack message id = %q, want message-1", req.MessageID)
-		}
 		if req.QueueID != "queue-1" {
 			t.Fatalf("ack queue id = %q, want queue-1", req.QueueID)
 		}
-		if req.DeliveryToken != "token-1" {
-			t.Fatalf("ack delivery token = %q, want token-1", req.DeliveryToken)
+		if len(req.Acks) != 1 {
+			t.Fatalf("expected 1 ack entry, got %d", len(req.Acks))
+		}
+		if req.Acks[0].MessageID != "message-1" {
+			t.Fatalf("ack message id = %q, want message-1", req.Acks[0].MessageID)
+		}
+		if req.Acks[0].DeliveryToken != "token-1" {
+			t.Fatalf("ack delivery token = %q, want token-1", req.Acks[0].DeliveryToken)
 		}
 	default:
 		t.Fatal("ack endpoint was not called")

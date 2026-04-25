@@ -22,14 +22,15 @@ import (
 var errNoMessage = errors.New("no message available")
 
 type workloadConfig struct {
-	Messages     int      `json:"messages"`
-	Warmup       int      `json:"warmup"`
-	Runs         int      `json:"runs"`
-	PayloadBytes int      `json:"payloadBytes"`
-	Producers    int      `json:"producers"`
-	Consumers    int      `json:"consumers"`
-	Prefetch     int      `json:"prefetch"`
-	Targets      []string `json:"targets"`
+	Messages       int      `json:"messages"`
+	Warmup         int      `json:"warmup"`
+	Runs           int      `json:"runs"`
+	PayloadBytes   int      `json:"payloadBytes"`
+	Producers      int      `json:"producers"`
+	Consumers      int      `json:"consumers"`
+	Prefetch       int      `json:"prefetch"`
+	Targets        []string `json:"targets"`
+	KueueBatchSize int      `json:"kueueBatchSize"`
 }
 
 type benchmarkPayload struct {
@@ -105,19 +106,63 @@ func main() {
 	)
 	flag.Parse()
 
-	cfg := workloadConfig{
-		Messages:     *messages,
-		Warmup:       *warmup,
-		Runs:         *runs,
-		PayloadBytes: *payloadBytes,
-		Producers:    *producers,
-		Consumers:    *consumers,
-		Prefetch:     *prefetch,
-		Targets:      parseTargets(*targets),
-	}
+	targetList := parseTargets(*targets)
 
+	// --- Section 1: End-to-end (default client config) ---
+	e2eCfg := workloadConfig{
+		Messages:       *messages,
+		Warmup:         *warmup,
+		Runs:           *runs,
+		PayloadBytes:   *payloadBytes,
+		Producers:      *producers,
+		Consumers:      *consumers,
+		Prefetch:       *prefetch,
+		Targets:        targetList,
+		KueueBatchSize: 10,
+	}
+	e2eReport := runSection("End-to-end (default client config)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, "Note: measures protocol + broker together.")
+	printSection(e2eReport)
+
+	// --- Section 2: Apples-to-apples (one message per round-trip) ---
+	applesCfg := e2eCfg
+	applesCfg.Prefetch = 1
+	applesCfg.KueueBatchSize = 1
+	applesReport := runSection("Apples-to-apples (one message per round-trip)", targetList, applesCfg, *kueueURL, *rabbitMQURI, "Note: isolates broker behavior; not a realistic config for either.")
+	printSection(applesReport)
+
+	// Combined JSON output
+	if *jsonOut != "" {
+		sectionOutput := func(sr sectionReport) map[string]any {
+			return map[string]any{
+				"label":  sr.Label,
+				"note":   sr.Note,
+				"report": sr.Report,
+			}
+		}
+		data, err := json.MarshalIndent(map[string]any{
+			"generatedAt": time.Now().UTC(),
+			"sections":    []any{sectionOutput(e2eReport), sectionOutput(applesReport)},
+		}, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "marshal report: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+type sectionReport struct {
+	Label  string
+	Note   string
+	Report benchmarkReport
+}
+
+func runSection(label string, targetList []string, cfg workloadConfig, kueueURL, rabbitMQURI, note string) sectionReport {
 	if err := validateConfig(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s: invalid config: %v\n", label, err)
 		os.Exit(1)
 	}
 
@@ -126,30 +171,29 @@ func main() {
 		Workload:    cfg,
 	}
 
-	for _, name := range cfg.Targets {
-		target, err := newTarget(name, *kueueURL, *rabbitMQURI)
+	for _, name := range targetList {
+		target, err := newTarget(name, kueueURL, rabbitMQURI)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "target %q: %v\n", name, err)
+			fmt.Fprintf(os.Stderr, "%s: target %q: %v\n", label, name, err)
 			os.Exit(1)
 		}
 
 		summary, err := runTarget(context.Background(), target, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s benchmark failed: %v\n", target.Name(), err)
+			fmt.Fprintf(os.Stderr, "%s: %s benchmark failed: %v\n", label, target.Name(), err)
 			os.Exit(1)
 		}
 
 		report.Summaries = append(report.Summaries, summary)
 	}
 
-	printReport(report)
+	return sectionReport{Label: label, Note: note, Report: report}
+}
 
-	if *jsonOut != "" {
-		if err := writeReport(*jsonOut, report); err != nil {
-			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
-			os.Exit(1)
-		}
-	}
+func printSection(s sectionReport) {
+	fmt.Printf("\n=== %s ===\n", s.Label)
+	printReport(s.Report)
+	fmt.Printf("--- %s ---\n", s.Note)
 }
 
 func parseTargets(raw string) []string {
@@ -552,10 +596,26 @@ func filepathDir(path string) string {
 	return path[:lastSlash]
 }
 
+type receivedMsg struct {
+	ID            string
+	Body          []byte
+	DeliveryToken string
+}
+
+type ackEntryBench struct {
+	MessageID     string
+	DeliveryToken string
+}
+
 type kueueTarget struct {
-	baseURL string
-	client  *http.Client
-	queueID string
+	baseURL    string
+	client     *http.Client
+	queueID    string
+	batchSize  int
+
+	mu          sync.Mutex
+	msgBuf      []receivedMsg
+	pendingAcks []ackEntryBench
 }
 
 func newKueueTarget(baseURL string) *kueueTarget {
@@ -564,6 +624,7 @@ func newKueueTarget(baseURL string) *kueueTarget {
 		client: &http.Client{
 			Timeout: 40 * time.Second,
 		},
+		batchSize: 10,
 	}
 }
 
@@ -589,6 +650,9 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 	}
 
 	t.queueID = resp.ID
+	if cfg.KueueBatchSize > 0 {
+		t.batchSize = cfg.KueueBatchSize
+	}
 	return nil
 }
 
@@ -597,26 +661,83 @@ func (t *kueueTarget) NewPublisher(int) (publisher, error) {
 }
 
 func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
-	msg, err := t.receive(ctx, false)
-	if err == nil {
-		return msg, nil
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(t.msgBuf) > 0 {
+		m := t.msgBuf[0]
+		t.msgBuf = t.msgBuf[1:]
+		return &delivery{
+			ID:   m.ID,
+			Body: m.Body,
+			Ack:  t.makeAckFunc(m.ID, m.DeliveryToken),
+		}, nil
 	}
-	if !errors.Is(err, errNoMessage) {
+
+	if err := t.flushAcksLocked(ctx); err != nil {
 		return nil, err
 	}
-	return t.receive(ctx, true)
+
+	msgs, err := t.receiveBatch(ctx)
+	if err != nil {
+		if errors.Is(err, errNoMessage) {
+			return nil, errNoMessage
+		}
+		return nil, err
+	}
+	if len(msgs) == 0 {
+		return nil, errNoMessage
+	}
+
+	t.msgBuf = msgs[1:]
+	m := msgs[0]
+	return &delivery{
+		ID:   m.ID,
+		Body: m.Body,
+		Ack:  t.makeAckFunc(m.ID, m.DeliveryToken),
+	}, nil
 }
 
-func (t *kueueTarget) Cleanup(context.Context) error {
-	t.queueID = ""
+func (t *kueueTarget) makeAckFunc(msgID, deliveryToken string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		t.mu.Lock()
+		t.pendingAcks = append(t.pendingAcks, ackEntryBench{MessageID: msgID, DeliveryToken: deliveryToken})
+		shouldFlush := len(t.pendingAcks) >= t.batchSize || len(t.msgBuf) == 0
+		t.mu.Unlock()
+
+		if shouldFlush {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			return t.flushAcksLocked(ctx)
+		}
+		return nil
+	}
+}
+
+func (t *kueueTarget) flushAcksLocked(ctx context.Context) error {
+	if len(t.pendingAcks) == 0 {
+		return nil
+	}
+
+	type batchReqBody struct {
+		QueueId string        `json:"queueId"`
+		Acks    []ackEntryBench `json:"acks"`
+	}
+
+	req := batchReqBody{
+		QueueId: t.queueID,
+		Acks:    t.pendingAcks,
+	}
+	t.pendingAcks = nil
+
+	if err := t.postJSON(ctx, "/ack", req, nil); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error) {
-	url := fmt.Sprintf("%s/receive?id=%s", t.baseURL, t.queueID)
-	if wait {
-		url += "&wait=true"
-	}
+func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
+	url := fmt.Sprintf("%s/receive?id=%s&max=%d", t.baseURL, t.queueID, t.batchSize)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -635,29 +756,20 @@ func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error)
 	switch resp.StatusCode {
 	case http.StatusAccepted:
 		var payload struct {
-			ID            string `json:"id"`
-			Body          []byte `json:"body"`
-			DeliveryToken string `json:"deliveryToken"`
+			Messages []struct {
+				ID            string `json:"id"`
+				Body          []byte `json:"body"`
+				DeliveryToken string `json:"deliveryToken"`
+			} `json:"messages"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 			return nil, err
 		}
-		return &delivery{
-			ID:   payload.ID,
-			Body: payload.Body,
-			Ack: func(ctx context.Context) error {
-				type ackRequest struct {
-					MessageID     string `json:"messageId"`
-					QueueID       string `json:"queueId"`
-					DeliveryToken string `json:"deliveryToken"`
-				}
-				return t.postJSON(ctx, "/ack", ackRequest{
-					MessageID:     payload.ID,
-					QueueID:       t.queueID,
-					DeliveryToken: payload.DeliveryToken,
-				}, nil)
-			},
-		}, nil
+		msgs := make([]receivedMsg, 0, len(payload.Messages))
+		for _, m := range payload.Messages {
+			msgs = append(msgs, receivedMsg{ID: m.ID, Body: m.Body, DeliveryToken: m.DeliveryToken})
+		}
+		return msgs, nil
 	case http.StatusNotFound:
 		io.Copy(io.Discard, resp.Body)
 		return nil, errNoMessage
@@ -665,6 +777,26 @@ func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error)
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("kueue receive returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+}
+
+func (t *kueueTarget) Cleanup(ctx context.Context) error {
+	t.mu.Lock()
+	pending := t.pendingAcks
+	t.pendingAcks = nil
+	t.msgBuf = nil
+	t.mu.Unlock()
+
+	var err error
+	if len(pending) > 0 {
+		t.mu.Lock()
+		t.pendingAcks = pending
+		err = t.flushAcksLocked(ctx)
+		t.pendingAcks = nil
+		t.mu.Unlock()
+	}
+
+	t.queueID = ""
+	return err
 }
 
 func (t *kueueTarget) postJSON(ctx context.Context, path string, requestBody any, out any) error {

@@ -754,3 +754,314 @@ func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
 	json.NewDecoder(rec.Body).Decode(&resp)
 	return resp
 }
+
+type batchReceiveResponse struct {
+	Messages []struct {
+		ID            string       `json:"id"`
+		Body          []byte       `json:"body"`
+		State         MessageState `json:"state"`
+		DeliveryToken string       `json:"deliveryToken"`
+	} `json:"messages"`
+}
+
+type batchAckResult struct {
+	MessageId string `json:"messageId"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type batchAckResponse struct {
+	Results []batchAckResult `json:"results"`
+}
+
+func TestBatchReceiveReturnsMultipleMessages(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "batch-queue")
+
+	publishTestMessage(t, queueID, []byte("first"))
+	publishTestMessage(t, queueID, []byte("second"))
+	publishTestMessage(t, queueID, []byte("third"))
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=5", nil)
+	recorder := httptest.NewRecorder()
+	receive(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("batch receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	resp := decodeResponse[batchReceiveResponse](t, recorder)
+	if len(resp.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(resp.Messages))
+	}
+	if string(resp.Messages[0].Body) != "first" {
+		t.Fatalf("first body = %q, want first", string(resp.Messages[0].Body))
+	}
+	if string(resp.Messages[1].Body) != "second" {
+		t.Fatalf("second body = %q, want second", string(resp.Messages[1].Body))
+	}
+	if string(resp.Messages[2].Body) != "third" {
+		t.Fatalf("third body = %q, want third", string(resp.Messages[2].Body))
+	}
+	for _, m := range resp.Messages {
+		if m.State != StateInFlight {
+			t.Fatalf("message %s state = %s, want in_flight", m.ID, m.State)
+		}
+		if m.DeliveryToken == "" {
+			t.Fatalf("message %s has empty delivery token", m.ID)
+		}
+	}
+}
+
+func TestBatchReceiveRespectsMaxLimit(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "max-limit-queue")
+
+	for i := 0; i < 10; i++ {
+		publishTestMessage(t, queueID, []byte("msg"))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=3", nil)
+	recorder := httptest.NewRecorder()
+	receive(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("batch receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	resp := decodeResponse[batchReceiveResponse](t, recorder)
+	if len(resp.Messages) != 3 {
+		t.Fatalf("expected 3 messages (max=3), got %d", len(resp.Messages))
+	}
+}
+
+func TestBatchReceiveMaxParamValidation(t *testing.T) {
+	tests := []struct {
+		max  string
+		code int
+	}{
+		{max: "0", code: http.StatusBadRequest},
+		{max: "-1", code: http.StatusBadRequest},
+		{max: "101", code: http.StatusBadRequest},
+		{max: "abc", code: http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run("max="+tt.max, func(t *testing.T) {
+			setupTestDB(t)
+			queueID := createTestQueue(t, "validation-queue")
+			req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max="+tt.max, nil)
+			recorder := httptest.NewRecorder()
+			receive(recorder, req)
+			if recorder.Code != tt.code {
+				t.Fatalf("expected status %d, got %d: %s", tt.code, recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestBatchAckMultipleMessages(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "batch-ack-queue")
+
+	msg1ID := publishTestMessage(t, queueID, []byte("one"))
+	msg2ID := publishTestMessage(t, queueID, []byte("two"))
+	msg3ID := publishTestMessage(t, queueID, []byte("three"))
+
+	batchResp := func() batchReceiveResponse {
+		req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=10", nil)
+		rec := httptest.NewRecorder()
+		receive(rec, req)
+		return decodeResponse[batchReceiveResponse](t, rec)
+	}()
+
+	if len(batchResp.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(batchResp.Messages))
+	}
+
+	// Batch ack all three
+	ackBody, _ := json.Marshal(BatchAckRequest{
+		QueueId: queueID,
+		Acks: []AckEntry{
+			{MessageId: msg1ID, DeliveryToken: batchResp.Messages[0].DeliveryToken},
+			{MessageId: msg2ID, DeliveryToken: batchResp.Messages[1].DeliveryToken},
+			{MessageId: msg3ID, DeliveryToken: batchResp.Messages[2].DeliveryToken},
+		},
+	})
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+
+	if ackRecorder.Code != http.StatusAccepted {
+		t.Fatalf("batch ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+
+	ackResp := decodeResponse[batchAckResponse](t, ackRecorder)
+	if len(ackResp.Results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(ackResp.Results))
+	}
+	for i, res := range ackResp.Results {
+		if res.Status != "ok" {
+			t.Fatalf("ack[%d] status = %s, error = %s", i, res.Status, res.Error)
+		}
+	}
+
+	// Verify all messages are deleted
+	for _, msgID := range []string{msg1ID, msg2ID, msg3ID} {
+		err := Db.View(func(txn *badger.Txn) error {
+			key, _, err := findMessageRecord(txn, queueID, msgID)
+			if err != nil {
+				return err
+			}
+			t.Fatalf("expected message %s to be deleted, found at %x", msgID, key)
+			return nil
+		})
+		if err == nil {
+			t.Fatalf("message %s was not deleted", msgID)
+		}
+	}
+}
+
+func TestBatchAckReportsPartialErrors(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "batch-ack-err-queue")
+
+	msg1ID := publishTestMessage(t, queueID, []byte("one"))
+	msg2ID := publishTestMessage(t, queueID, []byte("two"))
+
+	batchResp := func() batchReceiveResponse {
+		req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=10", nil)
+		rec := httptest.NewRecorder()
+		receive(rec, req)
+		return decodeResponse[batchReceiveResponse](t, rec)
+	}()
+
+	if len(batchResp.Messages) < 2 {
+		t.Fatalf("expected at least 2 messages, got %d", len(batchResp.Messages))
+	}
+
+	// Ack: msg1 with correct token, msg2 with wrong token
+	ackBody, _ := json.Marshal(BatchAckRequest{
+		QueueId: queueID,
+		Acks: []AckEntry{
+			{MessageId: msg1ID, DeliveryToken: batchResp.Messages[0].DeliveryToken},
+			{MessageId: msg2ID, DeliveryToken: "wrong-token"},
+		},
+	})
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRecorder := httptest.NewRecorder()
+	ack(ackRecorder, ackReq)
+
+	if ackRecorder.Code != http.StatusAccepted {
+		t.Fatalf("batch ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
+	}
+
+	ackResp := decodeResponse[batchAckResponse](t, ackRecorder)
+	if len(ackResp.Results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(ackResp.Results))
+	}
+
+	if r0 := ackResp.Results[0]; r0.Status != "ok" {
+		t.Fatalf("ack[0] expected ok, got %s: %s", r0.Status, r0.Error)
+	}
+	if r1 := ackResp.Results[1]; r1.Status != "error" {
+		t.Fatalf("ack[1] expected error, got %s", r1.Status)
+	}
+
+	// msg1 should be deleted, msg2 should still exist
+	var msg2Exists bool
+	err := Db.View(func(txn *badger.Txn) error {
+		_, _, err := findMessageRecord(txn, queueID, msg2ID)
+		if err == badger.ErrKeyNotFound {
+			msg2Exists = false
+			return nil
+		}
+		msg2Exists = true
+		return err
+	})
+	if err != nil {
+		t.Fatalf("check msg2: %v", err)
+	}
+	if !msg2Exists {
+		t.Fatal("msg2 should not have been deleted")
+	}
+}
+
+func TestBatchReceiveFollowsFIFOOrder(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "batch-fifo-queue")
+
+	count := 20
+	for i := 0; i < count; i++ {
+		publishTestMessage(t, queueID, []byte(fmt.Sprintf("msg-%d", i)))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=10", nil)
+	recorder := httptest.NewRecorder()
+	receive(recorder, req)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("batch receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	resp := decodeResponse[batchReceiveResponse](t, recorder)
+	if len(resp.Messages) != 10 {
+		t.Fatalf("expected 10 messages, got %d", len(resp.Messages))
+	}
+
+	for i, m := range resp.Messages {
+		expected := fmt.Sprintf("msg-%d", i)
+		if string(m.Body) != expected {
+			t.Fatalf("message[%d] body = %q, want %q", i, string(m.Body), expected)
+		}
+	}
+}
+
+func TestBatchReceiveLongPollWithWait(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "batch-longpoll")
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=5&wait=true", nil)
+	recorder := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		receive(recorder, req)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		publishTestMessage(t, queueID, []byte(fmt.Sprintf("batch-%d", i)))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch long-poll receive did not complete")
+	}
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("receive status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	resp := decodeResponse[batchReceiveResponse](t, recorder)
+	if len(resp.Messages) == 0 {
+		t.Fatal("expected at least 1 message from long poll")
+	}
+	if len(resp.Messages) > 3 {
+		t.Fatalf("expected at most 3 messages, got %d", len(resp.Messages))
+	}
+	// FIFO: first published should be first received
+	if string(resp.Messages[0].Body) != "batch-0" {
+		t.Fatalf("first message body = %q, want batch-0", string(resp.Messages[0].Body))
+	}
+}
