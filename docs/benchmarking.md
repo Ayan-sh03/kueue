@@ -37,6 +37,8 @@ The wrapper starts:
 - Console summary table
 - Raw JSON report at `benchmark-results/latest.json`
 
+For the queue-depth complexity model and focused hot-path benchmark commands, see `docs/performance-model.md`.
+
 ## Direct runner
 
 If `kueue` is already running and RabbitMQ is already running:

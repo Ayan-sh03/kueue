@@ -10,7 +10,7 @@ import (
 
 func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 	type batchAckEntry struct {
-		MessageID     string `json:"messageId"`
+		ReceiptHandle string `json:"receiptHandle"`
 		DeliveryToken string `json:"deliveryToken"`
 	}
 	type batchAckRequest struct {
@@ -33,6 +33,7 @@ func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 					map[string]any{
 						"id":            "message-1",
 						"body":          []byte("payload"),
+						"receiptHandle": "handle-1",
 						"deliveryToken": "token-1",
 					},
 				},
@@ -76,8 +77,8 @@ func TestKueueTargetAckIncludesDeliveryToken(t *testing.T) {
 		if len(req.Acks) != 1 {
 			t.Fatalf("expected 1 ack entry, got %d", len(req.Acks))
 		}
-		if req.Acks[0].MessageID != "message-1" {
-			t.Fatalf("ack message id = %q, want message-1", req.Acks[0].MessageID)
+		if req.Acks[0].ReceiptHandle != "handle-1" {
+			t.Fatalf("ack receipt handle = %q, want handle-1", req.Acks[0].ReceiptHandle)
 		}
 		if req.Acks[0].DeliveryToken != "token-1" {
 			t.Fatalf("ack delivery token = %q, want token-1", req.Acks[0].DeliveryToken)

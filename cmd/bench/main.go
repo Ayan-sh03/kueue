@@ -632,19 +632,20 @@ func filepathDir(path string) string {
 type receivedMsg struct {
 	ID            string
 	Body          []byte
+	ReceiptHandle string
 	DeliveryToken string
 }
 
 type ackEntryBench struct {
-	MessageID     string `json:"messageId"`
+	ReceiptHandle string `json:"receiptHandle"`
 	DeliveryToken string `json:"deliveryToken"`
 }
 
 type kueueTarget struct {
-	baseURL    string
-	client     *http.Client
-	queueID    string
-	batchSize  int
+	baseURL   string
+	client    *http.Client
+	queueID   string
+	batchSize int
 
 	mu          sync.Mutex
 	msgBuf      []receivedMsg
@@ -703,7 +704,7 @@ func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
 		return &delivery{
 			ID:   m.ID,
 			Body: m.Body,
-			Ack:  t.makeAckFunc(m.ID, m.DeliveryToken),
+			Ack:  t.makeAckFunc(m.ReceiptHandle, m.DeliveryToken),
 		}, nil
 	}
 
@@ -756,14 +757,14 @@ func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
 	return &delivery{
 		ID:   m.ID,
 		Body: m.Body,
-		Ack:  t.makeAckFunc(m.ID, m.DeliveryToken),
+		Ack:  t.makeAckFunc(m.ReceiptHandle, m.DeliveryToken),
 	}, nil
 }
 
-func (t *kueueTarget) makeAckFunc(msgID, deliveryToken string) func(context.Context) error {
+func (t *kueueTarget) makeAckFunc(receiptHandle, deliveryToken string) func(context.Context) error {
 	return func(ctx context.Context) error {
 		t.mu.Lock()
-		t.pendingAcks = append(t.pendingAcks, ackEntryBench{MessageID: msgID, DeliveryToken: deliveryToken})
+		t.pendingAcks = append(t.pendingAcks, ackEntryBench{ReceiptHandle: receiptHandle, DeliveryToken: deliveryToken})
 		shouldFlush := len(t.pendingAcks) >= t.batchSize || len(t.msgBuf) == 0
 		var acksToFlush []ackEntryBench
 		if shouldFlush {
@@ -805,9 +806,10 @@ func (t *kueueTarget) flushAcks(ctx context.Context, acks []ackEntryBench) error
 	}
 
 	type ackResult struct {
-		MessageId string `json:"messageId"`
-		Status    string `json:"status"`
-		Error     string `json:"error,omitempty"`
+		MessageId     string `json:"messageId"`
+		ReceiptHandle string `json:"receiptHandle"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
 	}
 	type batchAckResponse struct {
 		Results []ackResult `json:"results"`
@@ -827,7 +829,11 @@ func (t *kueueTarget) flushAcks(ctx context.Context, acks []ackEntryBench) error
 	var firstErr error
 	for _, r := range resp.Results {
 		if r.Status != "ok" {
-			err := fmt.Errorf("ack %s failed: %s", r.MessageId, r.Error)
+			ackID := r.MessageId
+			if ackID == "" {
+				ackID = r.ReceiptHandle
+			}
+			err := fmt.Errorf("ack %s failed: %s", ackID, r.Error)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -863,6 +869,7 @@ func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
 			Messages []struct {
 				ID            string `json:"id"`
 				Body          []byte `json:"body"`
+				ReceiptHandle string `json:"receiptHandle"`
 				DeliveryToken string `json:"deliveryToken"`
 			} `json:"messages"`
 		}
@@ -871,7 +878,7 @@ func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
 		}
 		msgs := make([]receivedMsg, 0, len(payload.Messages))
 		for _, m := range payload.Messages {
-			msgs = append(msgs, receivedMsg{ID: m.ID, Body: m.Body, DeliveryToken: m.DeliveryToken})
+			msgs = append(msgs, receivedMsg{ID: m.ID, Body: m.Body, ReceiptHandle: m.ReceiptHandle, DeliveryToken: m.DeliveryToken})
 		}
 		return msgs, nil
 	case http.StatusNotFound:
