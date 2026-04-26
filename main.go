@@ -198,6 +198,35 @@ var receiveChannel = make(chan struct{}, 1)
 var queueReadyChans = map[string]chan struct{}{}
 var queueReadyChansMu sync.Mutex
 
+// claimMu serializes claim transactions per-queue to eliminate BadgerDB
+// optimistic concurrency conflicts when multiple consumers compete.
+var claimMu sync.Map // map[string]*sync.Mutex
+
+func claimLock(queueID string) func() {
+	muI, _ := claimMu.LoadOrStore(queueID, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// runUpdate wraps Db.Update with retry on ErrConflict.
+func runUpdate(fn func(txn *badger.Txn) error) error {
+	const maxRetries = 10
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Millisecond)
+		}
+		err := Db.Update(fn)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, badger.ErrConflict) {
+			return err
+		}
+	}
+	return Db.Update(fn) // last attempt, return raw error
+}
+
 func queueMessagePrefix(queueID string) []byte {
 	return []byte(queueID + "|")
 }
@@ -235,13 +264,43 @@ func queueSequenceKey(queueID string) []byte {
 }
 
 func nextMessageSequence(queueID string) (uint64, error) {
-	seq, err := Db.GetSequence(queueSequenceKey(queueID), 1)
-	if err != nil {
-		return 0, err
-	}
-	defer seq.Release()
+	const maxRetries = 10
 
-	return seq.Next()
+	seqKey := queueSequenceKey(queueID)
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Millisecond)
+		}
+		var seq uint64
+		err := Db.Update(func(txn *badger.Txn) error {
+			item, err := txn.Get(seqKey)
+			if err == badger.ErrKeyNotFound {
+				seq = 1
+				var buf [8]byte
+				binary.BigEndian.PutUint64(buf[:], seq)
+				return txn.Set(seqKey, buf[:])
+			}
+			if err != nil {
+				return err
+			}
+			return item.Value(func(v []byte) error {
+				seq = binary.BigEndian.Uint64(v) + 1
+				var buf [8]byte
+				binary.BigEndian.PutUint64(buf[:], seq)
+				return txn.Set(seqKey, buf[:])
+			})
+		})
+		if err == nil {
+			return seq, nil
+		}
+		if !errors.Is(err, badger.ErrConflict) {
+			return 0, err
+		}
+		lastErr = err
+	}
+	return 0, fmt.Errorf("after %d retries: %w", maxRetries, lastErr)
 }
 
 const readyKeySep = "|"
@@ -682,6 +741,9 @@ func publish(w http.ResponseWriter, r *http.Request) {
 // and deletes the ready pointer — all in a single Db.Update transaction.
 // Returns ErrNoReadyMessages if no ready messages are available.
 func claimNextReadyMessage(queueId string) (*claimedMessage, error) {
+	unlock := claimLock(queueId)
+	defer unlock()
+
 	var claimed *claimedMessage
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -779,6 +841,9 @@ func claimNextReadyMessage(queueId string) (*claimedMessage, error) {
 }
 
 func claimReadyMessages(queueId string, max int) ([]claimedMessage, error) {
+	unlock := claimLock(queueId)
+	defer unlock()
+
 	var claimed []claimedMessage
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -1089,7 +1154,7 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = Db.Update(func(txn *badger.Txn) error {
+	err = runUpdate(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
@@ -1150,7 +1215,7 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 
 	results := make([]batchAckResult, len(batchReq.Acks))
 
-	err := Db.Update(func(txn *badger.Txn) error {
+	err := runUpdate(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(batchReq.QueueId)); err != nil {
 			return err
 		}
@@ -1241,7 +1306,7 @@ func nack(w http.ResponseWriter, r *http.Request) {
 	var nackResultState MessageState
 	var needReadyPointer bool
 
-	err = Db.Update(func(txn *badger.Txn) error {
+	err = runUpdate(func(txn *badger.Txn) error {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
