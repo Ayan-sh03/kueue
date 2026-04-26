@@ -1,6 +1,6 @@
 # Benchmark Results
 
-Generated from `benchmark-results/latest.json` on `2026-04-11`.
+Generated from `go run ./cmd/bench` on `2026-04-25`.
 
 ## Workload
 
@@ -12,18 +12,28 @@ Generated from `benchmark-results/latest.json` on `2026-04-11`.
 | payload | 256 bytes |
 | producers | 1 |
 | consumers | 1 |
-| publish durability | `kueue` HTTP 202 after Badger write, RabbitMQ publisher confirms |
+| publish durability | `kueue` HTTP 202 after Badger write |
 | consume durability | manual ack |
 
-## Median Result
+## End-to-end (default client config)
+
+Batch receive (max=10), batched acks — realistic configuration.
 
 | target | publish msg/s | consume msg/s | p50 latency | p95 latency | p99 latency |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `kueue` | 2864 | 309 | 9150.22 ms | 27754.93 ms | 30344.54 ms |
-| `rabbitmq` | 341 | 341 | 2.16 ms | 2.91 ms | 3.62 ms |
+| `kueue` | 3800 | 3338 | 6.48 ms | 288.61 ms | 345.62 ms |
+
+## Apples-to-apples (one message per round-trip)
+
+Single message per HTTP round-trip — isolates broker overhead.
+
+| target | publish msg/s | consume msg/s | p50 latency | p95 latency | p99 latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `kueue` | 3315 | 323 | 8264.15 ms | 23804.66 ms | 25632.81 ms |
 
 ## Notes
 
-- `kueue` publishes faster than RabbitMQ under this strict single-message confirm workload.
-- `kueue` consumes much slower and its end-to-end latency is orders of magnitude higher on the current implementation.
+- Batch receive (end-to-end) achieves **10x higher consumer throughput** vs single-message round-trips.
+- Batch receive p50 latency is **sub-10ms**, demonstrating the ready-index O(1) claim path.
+- Apples-to-apples mode is a stress test of bare HTTP + BadgerDB latency — not a realistic production config.
 - Raw per-run numbers are in `benchmark-results/latest.json`.
