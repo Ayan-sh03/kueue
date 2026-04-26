@@ -1379,85 +1379,97 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 		return nil, err
 	}
 
+	const reapBatch = 1024
 	transitions := make([]reapTransition, 0, len(expired))
 
-	err = Db.Update(func(txn *badger.Txn) error {
-		for _, exp := range expired {
-			item, err := txn.Get(exp.msgKey)
-			if err != nil {
-				if err == badger.ErrKeyNotFound {
-					if delErr := txn.Delete(exp.indexKey); delErr != nil && delErr != badger.ErrKeyNotFound {
-						return delErr
+	for i := 0; i < len(expired); i += reapBatch {
+		end := i + reapBatch
+		if end > len(expired) {
+			end = len(expired)
+		}
+		chunk := expired[i:end]
+
+		err = Db.Update(func(txn *badger.Txn) error {
+			for _, exp := range chunk {
+				item, err := txn.Get(exp.msgKey)
+				if err != nil {
+					if err == badger.ErrKeyNotFound {
+						if delErr := txn.Delete(exp.indexKey); delErr != nil && delErr != badger.ErrKeyNotFound {
+							return delErr
+						}
+						continue
+					}
+					return err
+				}
+
+				var msg Message
+				if err := item.Value(func(v []byte) error {
+					return json.Unmarshal(v, &msg)
+				}); err != nil {
+					return err
+				}
+
+				if msg.State != StateInFlight {
+					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+						return err
 					}
 					continue
 				}
-				return err
-			}
-
-			var msg Message
-			if err := item.Value(func(v []byte) error {
-				return json.Unmarshal(v, &msg)
-			}); err != nil {
-				return err
-			}
-
-			if msg.State != StateInFlight {
-				if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-					return err
+				if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
+					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+						return err
+					}
+					continue
 				}
-				continue
-			}
-			if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
-				if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-					return err
-				}
-				continue
-			}
 
-			queueID, err := parseMessageKeyQueueID(exp.msgKey)
-			if err != nil {
-				return err
-			}
-			originalSeq, err := parseMessageKeySeq(exp.msgKey)
-			if err != nil {
-				return err
-			}
-
-			if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
-				msg.State = StateDead
-			} else {
-				msg.State = StateReady
-			}
-			msg.VisibilityDeadline = time.Time{}
-			msg.DeliveryAttemptID = ""
-
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(exp.msgKey, updated); err != nil {
-				return err
-			}
-			if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-				return err
-			}
-
-			if msg.State == StateReady {
-				newSeq, err := nextMessageSequence(queueID)
+				queueID, err := parseMessageKeyQueueID(exp.msgKey)
 				if err != nil {
-					return fmt.Errorf("allocate reaper sequence: %w", err)
-				}
-				if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(originalSeq)); err != nil {
 					return err
 				}
+				originalSeq, err := parseMessageKeySeq(exp.msgKey)
+				if err != nil {
+					return err
+				}
+
+				if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+					msg.State = StateDead
+				} else {
+					msg.State = StateReady
+				}
+				msg.VisibilityDeadline = time.Time{}
+				msg.DeliveryAttemptID = ""
+
+				updated, err := json.Marshal(msg)
+				if err != nil {
+					return err
+				}
+				if err := txn.Set(exp.msgKey, updated); err != nil {
+					return err
+				}
+				if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+					return err
+				}
+
+				if msg.State == StateReady {
+					newSeq, err := nextMessageSequence(queueID)
+					if err != nil {
+						return fmt.Errorf("allocate reaper sequence: %w", err)
+					}
+					if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(originalSeq)); err != nil {
+						return err
+					}
+				}
+
+				transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
 			}
-
-			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
+			return nil
+		})
+		if err != nil {
+			return transitions, err
 		}
-		return nil
-	})
+	}
 
-	return transitions, err
+	return transitions, nil
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.
