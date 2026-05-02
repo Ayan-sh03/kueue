@@ -21,15 +21,24 @@ import (
 
 var errNoMessage = errors.New("no message available")
 
+var debugLog bool
+
+func debugf(format string, args ...any) {
+	if debugLog {
+		fmt.Fprintf(os.Stderr, "[bench] "+format+"\n", args...)
+	}
+}
+
 type workloadConfig struct {
-	Messages     int      `json:"messages"`
-	Warmup       int      `json:"warmup"`
-	Runs         int      `json:"runs"`
-	PayloadBytes int      `json:"payloadBytes"`
-	Producers    int      `json:"producers"`
-	Consumers    int      `json:"consumers"`
-	Prefetch     int      `json:"prefetch"`
-	Targets      []string `json:"targets"`
+	Messages       int      `json:"messages"`
+	Warmup         int      `json:"warmup"`
+	Runs           int      `json:"runs"`
+	PayloadBytes   int      `json:"payloadBytes"`
+	Producers      int      `json:"producers"`
+	Consumers      int      `json:"consumers"`
+	Prefetch       int      `json:"prefetch"`
+	Targets        []string `json:"targets"`
+	KueueBatchSize int      `json:"kueueBatchSize"`
 }
 
 type benchmarkPayload struct {
@@ -105,51 +114,100 @@ func main() {
 	)
 	flag.Parse()
 
-	cfg := workloadConfig{
-		Messages:     *messages,
-		Warmup:       *warmup,
-		Runs:         *runs,
-		PayloadBytes: *payloadBytes,
-		Producers:    *producers,
-		Consumers:    *consumers,
-		Prefetch:     *prefetch,
-		Targets:      parseTargets(*targets),
-	}
+	debugLog = os.Getenv("DEBUG") == "true"
 
+	targetList := parseTargets(*targets)
+	debugf("targets: %v, messages: %d, runs: %d", targetList, *messages, *runs)
+
+	// --- Section 1: End-to-end (default client config) ---
+	e2eCfg := workloadConfig{
+		Messages:       *messages,
+		Warmup:         *warmup,
+		Runs:           *runs,
+		PayloadBytes:   *payloadBytes,
+		Producers:      *producers,
+		Consumers:      *consumers,
+		Prefetch:       *prefetch,
+		Targets:        targetList,
+		KueueBatchSize: 10,
+	}
+	e2eReport := runSection("End-to-end (default client config)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, "Note: measures protocol + broker together.")
+	printSection(e2eReport)
+
+	// --- Section 2: Apples-to-apples (one message per round-trip) ---
+	applesCfg := e2eCfg
+	applesCfg.Prefetch = 1
+	applesCfg.KueueBatchSize = 1
+	applesReport := runSection("Apples-to-apples (one message per round-trip)", targetList, applesCfg, *kueueURL, *rabbitMQURI, "Note: isolates broker behavior; not a realistic config for either.")
+	printSection(applesReport)
+
+	// Combined JSON output
+	if *jsonOut != "" {
+		sectionOutput := func(sr sectionReport) map[string]any {
+			return map[string]any{
+				"label":  sr.Label,
+				"note":   sr.Note,
+				"report": sr.Report,
+			}
+		}
+		data, err := json.MarshalIndent(map[string]any{
+			"generatedAt": time.Now().UTC(),
+			"sections":    []any{sectionOutput(e2eReport), sectionOutput(applesReport)},
+		}, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "marshal report: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+type sectionReport struct {
+	Label  string
+	Note   string
+	Report benchmarkReport
+}
+
+func runSection(label string, targetList []string, cfg workloadConfig, kueueURL, rabbitMQURI, note string) sectionReport {
 	if err := validateConfig(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "invalid config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s: invalid config: %v\n", label, err)
 		os.Exit(1)
 	}
+
+	debugf("--- section: %s (batch=%d, prefetch=%d) ---", label, cfg.KueueBatchSize, cfg.Prefetch)
 
 	report := benchmarkReport{
 		GeneratedAt: time.Now().UTC(),
 		Workload:    cfg,
 	}
 
-	for _, name := range cfg.Targets {
-		target, err := newTarget(name, *kueueURL, *rabbitMQURI)
+	for _, name := range targetList {
+		debugf("target: %s", name)
+		target, err := newTarget(name, kueueURL, rabbitMQURI)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "target %q: %v\n", name, err)
+			fmt.Fprintf(os.Stderr, "%s: target %q: %v\n", label, name, err)
 			os.Exit(1)
 		}
 
 		summary, err := runTarget(context.Background(), target, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s benchmark failed: %v\n", target.Name(), err)
+			fmt.Fprintf(os.Stderr, "%s: %s benchmark failed: %v\n", label, target.Name(), err)
 			os.Exit(1)
 		}
 
 		report.Summaries = append(report.Summaries, summary)
 	}
 
-	printReport(report)
+	return sectionReport{Label: label, Note: note, Report: report}
+}
 
-	if *jsonOut != "" {
-		if err := writeReport(*jsonOut, report); err != nil {
-			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
-			os.Exit(1)
-		}
-	}
+func printSection(s sectionReport) {
+	fmt.Printf("\n=== %s ===\n", s.Label)
+	printReport(s.Report)
+	fmt.Printf("--- %s ---\n", s.Note)
 }
 
 func parseTargets(raw string) []string {
@@ -212,19 +270,23 @@ func runTarget(ctx context.Context, target benchmarkTarget, cfg workloadConfig) 
 	fmt.Printf("\n== %s ==\n", strings.ToUpper(target.Name()))
 
 	for run := 1; run <= cfg.Runs; run++ {
+		debugf("setup run %d/%d", run, cfg.Runs)
 		runLabel := fmt.Sprintf("%s-%d-%d", target.Name(), run, time.Now().UnixNano())
 		if err := target.Setup(ctx, cfg, runLabel); err != nil {
 			return summary, err
 		}
 
 		if cfg.Warmup > 0 {
+			debugf("warmup: %d messages...", cfg.Warmup)
 			if _, err := executeWorkload(ctx, target, cfg, cfg.Warmup); err != nil {
 				_ = target.Cleanup(context.Background())
 				return summary, fmt.Errorf("warmup run %d: %w", run, err)
 			}
 		}
 
+		debugf("measured run %d: %d messages...", run, cfg.Messages)
 		result, err := executeWorkload(ctx, target, cfg, cfg.Messages)
+		debugf("cleanup...")
 		cleanupErr := target.Cleanup(context.Background())
 		if err != nil {
 			return summary, fmt.Errorf("measured run %d: %w", run, err)
@@ -286,6 +348,21 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 		seqCh <- seq
 	}
 	close(seqCh)
+
+	doneCh := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				debugf("progress: produced=%d/%d consumed=%d/%d", produced.Load(), messages, consumed.Load(), messages)
+			case <-doneCh:
+				return
+			}
+		}
+	}()
+	defer close(doneCh)
 
 	consumeStarted := time.Now()
 	var consumerWG sync.WaitGroup
@@ -552,24 +629,30 @@ func filepathDir(path string) string {
 	return path[:lastSlash]
 }
 
-type kueueTarget struct {
-	baseURL       string
-	client        *http.Client
-	queueID       string
-	prefetch      int
-	deliveries    chan *delivery
-	ackBatch      []ackEntry
-	ackMu         sync.Mutex
-	ackFlushSize  int
-	ackFlushTick  *time.Ticker
-	ackFlushStop  chan struct{}
-	ackFlushErr   atomic.Pointer[error]
+type receivedMsg struct {
+	ID            string
+	Body          []byte
+	ReceiptHandle string
+	DeliveryToken string
 }
 
-type ackEntry struct {
-	MessageID     string `json:"messageId"`
-	QueueID       string `json:"queueId"`
+type ackEntryBench struct {
+	ReceiptHandle string `json:"receiptHandle"`
 	DeliveryToken string `json:"deliveryToken"`
+}
+
+type kueueTarget struct {
+	baseURL      string
+	client       *http.Client
+	queueID      string
+	prefetch     int
+	deliveries   chan *delivery
+	ackBatch     []ackEntryBench
+	ackMu        sync.Mutex
+	ackFlushSize int
+	ackFlushTick *time.Ticker
+	ackFlushStop chan struct{}
+	ackFlushErr  atomic.Pointer[error]
 }
 
 func newKueueTarget(baseURL string) *kueueTarget {
@@ -611,12 +694,20 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 
 	t.queueID = resp.ID
 	t.prefetch = cfg.Prefetch
+	if cfg.KueueBatchSize > 0 {
+		t.prefetch = cfg.KueueBatchSize
+	}
+	if t.prefetch <= 0 {
+		t.prefetch = 1
+	}
 	t.deliveries = make(chan *delivery, cfg.Prefetch*cfg.Consumers)
-	t.ackBatch = make([]ackEntry, 0, t.ackFlushSize)
+	if cap(t.deliveries) == 0 {
+		t.deliveries = make(chan *delivery, t.prefetch)
+	}
+	t.ackBatch = make([]ackEntryBench, 0, t.ackFlushSize)
 	t.ackFlushStop = make(chan struct{})
 	out := t.deliveries
 
-	// async ack flusher
 	t.ackFlushTick = time.NewTicker(5 * time.Millisecond)
 	go func() {
 		for {
@@ -626,7 +717,7 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 				return
 			}
 			t.ackMu.Lock()
-	hasBatch := len(t.ackBatch) > 0
+			hasBatch := len(t.ackBatch) > 0
 			t.ackMu.Unlock()
 			if hasBatch {
 				if err := t.flushAcks(context.Background()); err != nil {
@@ -636,7 +727,11 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 		}
 	}()
 
-	for i := 0; i < cfg.Consumers; i++ {
+	consumerCount := cfg.Consumers
+	if consumerCount <= 0 {
+		consumerCount = 1
+	}
+	for i := 0; i < consumerCount; i++ {
 		go func() {
 			for {
 				msgs, err := t.receiveBatch(ctx, t.prefetch)
@@ -677,6 +772,9 @@ func (t *kueueTarget) NewPublisher(int) (publisher, error) {
 }
 
 func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
+	if errPtr := t.ackFlushErr.Load(); errPtr != nil {
+		return nil, *errPtr
+	}
 	select {
 	case msg, ok := <-t.deliveries:
 		if !ok {
@@ -726,6 +824,7 @@ func (t *kueueTarget) receiveBatch(ctx context.Context, max int) ([]*delivery, e
 			Messages []struct {
 				ID            string `json:"id"`
 				Body          []byte `json:"body"`
+				ReceiptHandle string `json:"receiptHandle"`
 				DeliveryToken string `json:"deliveryToken"`
 			} `json:"messages"`
 		}
@@ -742,9 +841,8 @@ func (t *kueueTarget) receiveBatch(ctx context.Context, max int) ([]*delivery, e
 				ID:   msgCopy.ID,
 				Body: msgCopy.Body,
 				Ack: func(ctx context.Context) error {
-					return t.queueAck(ctx, ackEntry{
-						MessageID:     msgCopy.ID,
-						QueueID:       t.queueID,
+					return t.queueAck(ctx, ackEntryBench{
+						ReceiptHandle: msgCopy.ReceiptHandle,
 						DeliveryToken: msgCopy.DeliveryToken,
 					})
 				},
@@ -760,7 +858,7 @@ func (t *kueueTarget) receiveBatch(ctx context.Context, max int) ([]*delivery, e
 	}
 }
 
-func (t *kueueTarget) queueAck(ctx context.Context, entry ackEntry) error {
+func (t *kueueTarget) queueAck(ctx context.Context, entry ackEntryBench) error {
 	t.ackMu.Lock()
 	t.ackBatch = append(t.ackBatch, entry)
 	shouldFlush := len(t.ackBatch) >= t.ackFlushSize
@@ -779,15 +877,47 @@ func (t *kueueTarget) flushAcks(ctx context.Context) error {
 		t.ackMu.Unlock()
 		return nil
 	}
-	batch := make([]ackEntry, len(t.ackBatch))
+	batch := make([]ackEntryBench, len(t.ackBatch))
 	copy(batch, t.ackBatch)
 	t.ackBatch = t.ackBatch[:0]
 	t.ackMu.Unlock()
 
 	type ackBatchReq struct {
-		Messages []ackEntry `json:"messages"`
+		QueueId string          `json:"queueId"`
+		Acks    []ackEntryBench `json:"acks"`
 	}
-	return t.postJSON(ctx, "/ack-batch", ackBatchReq{Messages: batch}, nil)
+	type ackResult struct {
+		MessageId     string `json:"messageId"`
+		ReceiptHandle string `json:"receiptHandle"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
+	}
+	type batchAckResponse struct {
+		Results []ackResult `json:"results"`
+	}
+	var resp batchAckResponse
+	if err := t.postJSON(ctx, "/ack", ackBatchReq{QueueId: t.queueID, Acks: batch}, &resp); err != nil {
+		return err
+	}
+
+	var firstErr error
+	for _, r := range resp.Results {
+		if r.Status == "ok" {
+			continue
+		}
+		ackID := r.MessageId
+		if ackID == "" {
+			ackID = r.ReceiptHandle
+		}
+		err := fmt.Errorf("ack %s failed: %s", ackID, r.Error)
+		if firstErr == nil {
+			firstErr = err
+		}
+		if debugLog {
+			debugf("batch ack error: %v", err)
+		}
+	}
+	return firstErr
 }
 
 func (t *kueueTarget) postJSON(ctx context.Context, path string, requestBody any, out any) error {

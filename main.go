@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -31,7 +33,19 @@ func (e *ErrDeliveryTokenMismatch) Error() string {
 	return fmt.Sprintf("delivery token mismatch: expected %q, got %q", e.Expected, e.Got)
 }
 
+type ErrInvalidReceiptHandle struct {
+	Reason string
+}
+
+func (e *ErrInvalidReceiptHandle) Error() string {
+	if e.Reason == "" {
+		return "invalid receipt handle"
+	}
+	return "invalid receipt handle: " + e.Reason
+}
+
 var ErrNoReadyMessages = errors.New("no ready messages")
+var ErrMessageNotInFlight = errors.New("message is not in flight")
 
 type MessageState string
 
@@ -50,6 +64,11 @@ type Message struct {
 	MaxDeliveryCount   int          `json:"maxDeliveryCount"`
 	VisibilityDeadline time.Time    `json:"visibilityDeadline"`
 	DeliveryAttemptID  string       `json:"deliveryAttemptId"`
+}
+
+type claimedMessage struct {
+	Message
+	ReceiptHandle string `json:"receiptHandle"`
 }
 
 type QueueConfig struct {
@@ -210,6 +229,20 @@ func messageKey(queueID string, seq uint64, messageID string) []byte {
 	return key
 }
 
+func messageKeyBytes(queueID string, seq uint64, messageID []byte) []byte {
+	prefix := queueMessagePrefix(queueID)
+	key := make([]byte, 0, len(prefix)+8+1+len(messageID))
+	key = append(key, prefix...)
+
+	var seqBytes [8]byte
+	binary.BigEndian.PutUint64(seqBytes[:], seq)
+	key = append(key, seqBytes[:]...)
+	key = append(key, '|')
+	key = append(key, messageID...)
+
+	return key
+}
+
 func queueSequenceKey(queueID string) []byte {
 	return []byte("seq:" + queueID)
 }
@@ -271,7 +304,77 @@ func parseReadyValue(val []byte) ([]byte, error) {
 	if len(val) == 0 {
 		return nil, fmt.Errorf("invalid ready value: empty")
 	}
-	return val, nil
+	return append([]byte(nil), val...), nil
+}
+
+func receiptHandleForMessageKey(key []byte) string {
+	return base64.RawURLEncoding.EncodeToString(key)
+}
+
+func messageKeyFromReceiptHandle(queueID, receiptHandle string) ([]byte, error) {
+	if receiptHandle == "" {
+		return nil, &ErrInvalidReceiptHandle{Reason: "receiptHandle is required"}
+	}
+
+	key, err := base64.RawURLEncoding.DecodeString(receiptHandle)
+	if err != nil {
+		return nil, &ErrInvalidReceiptHandle{Reason: "base64 decode failed"}
+	}
+	if !bytes.HasPrefix(key, queueMessagePrefix(queueID)) {
+		return nil, &ErrInvalidReceiptHandle{Reason: "queue mismatch"}
+	}
+	if _, err := parseMessageKeySeq(key); err != nil {
+		return nil, &ErrInvalidReceiptHandle{Reason: err.Error()}
+	}
+	return key, nil
+}
+
+func inflightPrefix() []byte {
+	return []byte("inflight|")
+}
+
+func inflightKey(queueID string, deadline time.Time, messageID string) []byte {
+	prefix := inflightPrefix()
+	key := make([]byte, 0, len(prefix)+8+1+len(queueID)+1+len(messageID))
+	key = append(key, prefix...)
+
+	var deadlineBytes [8]byte
+	binary.BigEndian.PutUint64(deadlineBytes[:], uint64(deadline.UnixNano()))
+	key = append(key, deadlineBytes[:]...)
+	key = append(key, '|')
+	key = append(key, queueID...)
+	key = append(key, '|')
+	key = append(key, messageID...)
+	return key
+}
+
+func inflightScanUpperBound(now time.Time) []byte {
+	prefix := inflightPrefix()
+	key := make([]byte, 0, len(prefix)+8)
+	key = append(key, prefix...)
+
+	var deadlineBytes [8]byte
+	binary.BigEndian.PutUint64(deadlineBytes[:], uint64(now.UnixNano()))
+	key = append(key, deadlineBytes[:]...)
+	return key
+}
+
+func setInflightIndex(txn *badger.Txn, queueID string, msg Message, msgKey []byte) error {
+	if msg.VisibilityDeadline.IsZero() {
+		return nil
+	}
+	return txn.Set(inflightKey(queueID, msg.VisibilityDeadline, msg.ID), msgKey)
+}
+
+func deleteInflightIndex(txn *badger.Txn, queueID string, msg Message) error {
+	if msg.VisibilityDeadline.IsZero() || msg.ID == "" {
+		return nil
+	}
+	err := txn.Delete(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
+	if err == badger.ErrKeyNotFound {
+		return nil
+	}
+	return err
 }
 
 func parseMessageKeySeq(key []byte) (uint64, error) {
@@ -287,27 +390,32 @@ func parseMessageKeySeq(key []byte) (uint64, error) {
 	return binary.BigEndian.Uint64(key[seqStart:seqEnd]), nil
 }
 
-func parseReadyKey(key []byte) (seq uint64, messageID string, err error) {
-	// Key format: ready|<queueID>|<8-byte-seq>|<messageID>
-	// Find the start of the seq by locating the second '|' after "ready|"
-	firstPipe := bytes.IndexByte(key, '|')
-	if firstPipe == -1 {
-		return 0, "", fmt.Errorf("invalid ready key: no pipes: %s", string(key))
+func parseMessageKeyQueueID(key []byte) (string, error) {
+	idx := bytes.IndexByte(key, '|')
+	if idx == -1 {
+		return "", fmt.Errorf("invalid message key format: no delimiter")
 	}
-	secondPipe := bytes.IndexByte(key[firstPipe+1:], '|')
-	if secondPipe == -1 {
-		return 0, "", fmt.Errorf("invalid ready key: missing queueID delimiter: %s", string(key))
+	if idx == 0 {
+		return "", fmt.Errorf("invalid message key format: empty queue id")
 	}
-	seqStart := firstPipe + 1 + secondPipe + 1
-	if seqStart+8 > len(key) {
-		return 0, "", fmt.Errorf("invalid ready key: too short: %s", string(key))
+	return string(key[:idx]), nil
+}
+
+func readyPartsFromKey(key, prefix []byte) (uint64, []byte, error) {
+	if !bytes.HasPrefix(key, prefix) {
+		return 0, nil, fmt.Errorf("ready key does not match prefix")
 	}
-	seq = binary.BigEndian.Uint64(key[seqStart : seqStart+8])
-	if key[seqStart+8] != '|' {
-		return 0, "", fmt.Errorf("invalid ready key: missing delimiter after seq: %s", string(key))
+	rest := key[len(prefix):]
+	if len(rest) < 9 {
+		return 0, nil, fmt.Errorf("invalid ready key: too short")
 	}
-	messageID = string(key[seqStart+8+1:])
-	return seq, messageID, nil
+	if rest[8] != '|' {
+		return 0, nil, fmt.Errorf("invalid ready key: missing delimiter after seq")
+	}
+	if len(rest[9:]) == 0 {
+		return 0, nil, fmt.Errorf("invalid ready key: missing message id")
+	}
+	return binary.BigEndian.Uint64(rest[:8]), rest[9:], nil
 }
 
 func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Message, error) {
@@ -342,6 +450,27 @@ func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Mes
 	}
 
 	return nil, nil, badger.ErrKeyNotFound
+}
+
+func messageByReceiptHandle(txn *badger.Txn, queueID, receiptHandle string) ([]byte, *Message, error) {
+	key, err := messageKeyFromReceiptHandle(queueID, receiptHandle)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	item, err := txn.Get(key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var msg Message
+	if err := item.Value(func(v []byte) error {
+		return json.Unmarshal(v, &msg)
+	}); err != nil {
+		return nil, nil, err
+	}
+
+	return key, &msg, nil
 }
 
 func queueReadyChan(queueID string) chan struct{} {
@@ -394,9 +523,21 @@ type CreateRequest struct {
 }
 
 type AckRequest struct {
-	MessageId     string `json:"messageId"`
+	MessageId     string `json:"messageId,omitempty"`
 	QueueId       string `json:"queueId"`
+	ReceiptHandle string `json:"receiptHandle"`
 	DeliveryToken string `json:"deliveryToken"`
+}
+
+type AckEntry struct {
+	MessageId     string `json:"messageId,omitempty"`
+	ReceiptHandle string `json:"receiptHandle"`
+	DeliveryToken string `json:"deliveryToken"`
+}
+
+type BatchAckRequest struct {
+	QueueId string     `json:"queueId"`
+	Acks    []AckEntry `json:"acks"`
 }
 
 func create(w http.ResponseWriter, r *http.Request) {
@@ -670,30 +811,28 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 // reads the corresponding message, atomically transitions it to StateInFlight,
 // and deletes the ready pointer — all in a single Db.Update transaction.
 // Returns ErrNoReadyMessages if no ready messages are available.
-func claimNextReadyMessage(queueId string) (*Message, error) {
-	msgs, err := claimNextReadyMessages(queueId, 1)
+func claimNextReadyMessage(queueId string) (*claimedMessage, error) {
+	msgs, err := claimReadyMessages(queueId, 1)
 	if err != nil {
 		return nil, err
-	}
-	if len(msgs) == 0 {
-		return nil, ErrNoReadyMessages
 	}
 	return &msgs[0], nil
 }
 
-func claimNextReadyMessages(queueId string, max int) ([]Message, error) {
-	var claimed []Message
+func claimReadyMessages(queueId string, max int) ([]claimedMessage, error) {
+	var claimed []claimedMessage
 	err := Db.Update(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
-		opts.Prefix = readyPrefix(queueId)
+		opts.PrefetchValues = false
+		prefix := readyPrefix(queueId)
+		opts.Prefix = prefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Rewind(); it.Valid() && len(claimed) < max; it.Next() {
 			item := it.Item()
 			rKey := item.KeyCopy(nil)
-			_, _, err := parseReadyKey(rKey)
+			_, msgID, err := readyPartsFromKey(rKey, prefix)
 			if err != nil {
 				return fmt.Errorf("parse ready key: %w", err)
 			}
@@ -706,14 +845,25 @@ func claimNextReadyMessages(queueId string, max int) ([]Message, error) {
 			}); err != nil {
 				return fmt.Errorf("parse ready value: %w", err)
 			}
-
 			msgItem, err := txn.Get(msgKey)
 			if err != nil {
 				if err == badger.ErrKeyNotFound {
-					txn.Delete(rKey)
-					continue
+					readySeq, _, parseErr := readyPartsFromKey(rKey, prefix)
+					if parseErr != nil {
+						return fmt.Errorf("parse ready key fallback: %w", parseErr)
+					}
+					msgKey = messageKeyBytes(queueId, readySeq, msgID)
+					msgItem, err = txn.Get(msgKey)
+					if err == badger.ErrKeyNotFound {
+						if err := txn.Delete(rKey); err != nil {
+							return fmt.Errorf("delete stale ready pointer %x: %w", rKey, err)
+						}
+						continue
+					}
 				}
-				return fmt.Errorf("get message for ready key: %w", err)
+				if err != nil {
+					return fmt.Errorf("get message for ready key: %w", err)
+				}
 			}
 
 			var msg Message
@@ -744,16 +894,22 @@ func claimNextReadyMessages(queueId string, max int) ([]Message, error) {
 			if err := txn.Set(msgKey, updated); err != nil {
 				return fmt.Errorf("set claimed message: %w", err)
 			}
+			if err := setInflightIndex(txn, queueId, msg, msgKey); err != nil {
+				return fmt.Errorf("set in-flight index: %w", err)
+			}
 
-			claimed = append(claimed, msg)
+			claimed = append(claimed, claimedMessage{
+				Message:       msg,
+				ReceiptHandle: receiptHandleForMessageKey(msgKey),
+			})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	for _, m := range claimed {
-		log.Printf("CLAIM: %s/%s token=%s", queueId, m.ID, m.DeliveryAttemptID)
+	if len(claimed) == 0 {
+		return nil, ErrNoReadyMessages
 	}
 	return claimed, nil
 }
@@ -785,65 +941,152 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var msg *Message
-	var claimErr error
+	max := 1
+	maxSpecified := false
+	if maxStr := params.Get("max"); maxStr != "" {
+		parsed, parseErr := strconv.Atoi(maxStr)
+		if parseErr != nil || parsed < 1 || parsed > 100 {
+			http.Error(w, "max must be an integer between 1 and 100", http.StatusBadRequest)
+			return
+		}
+		max = parsed
+		maxSpecified = true
+	}
 
-	if wait := params.Get("wait"); wait == "true" {
-		msg, claimErr = claimNextReadyMessage(id)
+	if max == 1 && !maxSpecified {
+		var msg *claimedMessage
+		var claimErr error
+
+		if wait := params.Get("wait"); wait == "true" {
+			msg, claimErr = claimNextReadyMessage(id)
+			if claimErr != nil && claimErr != ErrNoReadyMessages {
+				http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
+				return
+			}
+			if claimErr == ErrNoReadyMessages {
+				readyCh := queueReadyChan(id)
+				timer := time.NewTimer(30 * time.Second)
+				defer timer.Stop()
+			waitLoop:
+				for {
+					msg, claimErr = claimNextReadyMessage(id)
+					if claimErr == nil {
+						break
+					}
+					if claimErr != nil && claimErr != ErrNoReadyMessages {
+						http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
+						return
+					}
+					select {
+					case <-readyCh:
+						readyCh = queueReadyChan(id)
+						continue
+					case <-timer.C:
+						break waitLoop
+					case <-r.Context().Done():
+						return
+					}
+				}
+			}
+		} else {
+			msg, claimErr = claimNextReadyMessage(id)
+		}
+
 		if claimErr != nil && claimErr != ErrNoReadyMessages {
 			http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
 			return
 		}
-		if claimErr == ErrNoReadyMessages {
+		if claimErr == ErrNoReadyMessages || msg == nil {
+			http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
+			return
+		}
+
+		m := getOrCreateMetrics(id)
+		m.totalReceived.Add(1)
+		m.readyCount.Add(-1)
+		m.inFlightCount.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":            msg.ID,
+			"body":          msg.Body,
+			"state":         StateInFlight,
+			"deliveryToken": msg.DeliveryAttemptID,
+			"receiptHandle": msg.ReceiptHandle,
+		})
+		return
+	}
+
+	// batch receive (max > 1)
+	msgs, claimErr := claimReadyMessages(id, max)
+	if claimErr != nil && claimErr != ErrNoReadyMessages {
+		http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if wait := params.Get("wait"); wait == "true" {
+		if len(msgs) == 0 {
 			readyCh := queueReadyChan(id)
 			timer := time.NewTimer(30 * time.Second)
 			defer timer.Stop()
-		waitLoop:
+		waitLoopBatch:
 			for {
-				msg, claimErr = claimNextReadyMessage(id)
-				if claimErr == nil {
-					break
-				}
+				msgs, claimErr = claimReadyMessages(id, max)
 				if claimErr != nil && claimErr != ErrNoReadyMessages {
-					http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
+					http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
 					return
+				}
+				if len(msgs) > 0 {
+					break
 				}
 				select {
 				case <-readyCh:
 					readyCh = queueReadyChan(id)
 					continue
 				case <-timer.C:
-					break waitLoop
+					break waitLoopBatch
 				case <-r.Context().Done():
 					return
 				}
 			}
 		}
-	} else {
-		msg, claimErr = claimNextReadyMessage(id)
 	}
 
-	if claimErr != nil && claimErr != ErrNoReadyMessages {
-		http.Error(w, "Error retrieving message: "+claimErr.Error(), http.StatusInternalServerError)
-		return
-	}
-	if claimErr == ErrNoReadyMessages || msg == nil {
+	if len(msgs) == 0 {
 		http.Error(w, "No Ready Messages in Queue: "+id, http.StatusNotFound)
 		return
 	}
 
+	type batchMessage struct {
+		ID            string       `json:"id"`
+		Body          []byte       `json:"body"`
+		State         MessageState `json:"state"`
+		DeliveryToken string       `json:"deliveryToken"`
+		ReceiptHandle string       `json:"receiptHandle"`
+	}
+	batch := make([]batchMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		batch = append(batch, batchMessage{
+			ID:            msg.ID,
+			Body:          msg.Body,
+			State:         StateInFlight,
+			DeliveryToken: msg.DeliveryAttemptID,
+			ReceiptHandle: msg.ReceiptHandle,
+		})
+	}
+
 	m := getOrCreateMetrics(id)
-	m.totalReceived.Add(1)
-	m.readyCount.Add(-1)
-	m.inFlightCount.Add(1)
+	for range msgs {
+		m.totalReceived.Add(1)
+		m.readyCount.Add(-1)
+		m.inFlightCount.Add(1)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":            msg.ID,
-		"body":          msg.Body,
-		"state":         StateInFlight,
-		"deliveryToken": msg.DeliveryAttemptID,
+		"messages": batch,
 	})
 }
 
@@ -852,10 +1095,11 @@ type batchReceiveResponse struct {
 }
 
 type batchReceiveMessage struct {
-	ID            string `json:"id"`
-	Body          []byte `json:"body"`
-	State         string `json:"state"`
-	DeliveryToken string `json:"deliveryToken"`
+	ID            string       `json:"id"`
+	Body          []byte       `json:"body"`
+	State         MessageState `json:"state"`
+	DeliveryToken string       `json:"deliveryToken"`
+	ReceiptHandle string       `json:"receiptHandle"`
 }
 
 func receiveBatch(w http.ResponseWriter, r *http.Request) {
@@ -891,11 +1135,11 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var msgs []Message
+	var msgs []claimedMessage
 	var claimErr error
 
 	if wait := params.Get("wait"); wait == "true" {
-		msgs, claimErr = claimNextReadyMessages(id, max)
+		msgs, claimErr = claimReadyMessages(id, max)
 		if claimErr != nil && claimErr != ErrNoReadyMessages {
 			http.Error(w, "Error retrieving messages: "+claimErr.Error(), http.StatusInternalServerError)
 			return
@@ -906,7 +1150,7 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 			defer timer.Stop()
 		waitLoop:
 			for {
-				msgs, claimErr = claimNextReadyMessages(id, max)
+				msgs, claimErr = claimReadyMessages(id, max)
 				if claimErr == nil && len(msgs) > 0 {
 					break
 				}
@@ -926,7 +1170,7 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		msgs, claimErr = claimNextReadyMessages(id, max)
+		msgs, claimErr = claimReadyMessages(id, max)
 	}
 
 	if claimErr != nil && claimErr != ErrNoReadyMessages {
@@ -950,8 +1194,9 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		resp.Messages[i] = batchReceiveMessage{
 			ID:            msg.ID,
 			Body:          msg.Body,
-			State:         string(msg.State),
+			State:         msg.State,
 			DeliveryToken: msg.DeliveryAttemptID,
+			ReceiptHandle: msg.ReceiptHandle,
 		}
 	}
 
@@ -965,19 +1210,33 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var ackReq AckRequest
-	err := json.NewDecoder(r.Body).Decode(&ackReq)
+
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	// Try batch ack first
+	var batchReq BatchAckRequest
+	if json.Unmarshal(body, &batchReq) == nil && len(batchReq.Acks) > 0 {
+		handleBatchAck(w, batchReq)
+		return
+	}
+
+	// Fall back to single ack
+	var ackReq AckRequest
+	if err := json.Unmarshal(body, &ackReq); err != nil {
 		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if ackReq.MessageId == "" {
-		http.Error(w, "messageId is required", http.StatusBadRequest)
-		return
-	}
 	if ackReq.QueueId == "" {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+	if ackReq.ReceiptHandle == "" {
+		http.Error(w, "receiptHandle is required", http.StatusBadRequest)
 		return
 	}
 	if ackReq.DeliveryToken == "" {
@@ -989,32 +1248,32 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
 			return err
 		}
-		msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
-		if !ok {
-			return badger.ErrKeyNotFound
-		}
-		item, err := txn.Get(msgKey)
+		key, msg, err := messageByReceiptHandle(txn, ackReq.QueueId, ackReq.ReceiptHandle)
 		if err != nil {
 			return err
 		}
-		var msg Message
-		if err := item.Value(func(v []byte) error {
-			return json.Unmarshal(v, &msg)
-		}); err != nil {
-			return err
+		if msg.State != StateInFlight {
+			return ErrMessageNotInFlight
 		}
 		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
 			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
 		}
-		deleteCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
-		return txn.Delete(msgKey)
+		if err := deleteInflightIndex(txn, ackReq.QueueId, *msg); err != nil {
+			return err
+		}
+		deleteCachedMessageKey(ackReq.QueueId, msg.ID)
+		return txn.Delete(key)
 	})
 	if err != nil {
+		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err == badger.ErrKeyNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
 			return
 		}
-		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
+		if _, ok := err.(*ErrDeliveryTokenMismatch); ok || err == ErrMessageNotInFlight {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -1030,11 +1289,84 @@ func ack(w http.ResponseWriter, r *http.Request) {
 
 	m := getOrCreateMetrics(ackReq.QueueId)
 	m.recordAck()
-
 }
 
-type BatchAckRequest struct {
-	Messages []AckRequest `json:"messages"`
+func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
+	if batchReq.QueueId == "" {
+		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+
+	type batchAckResult struct {
+		MessageId     string `json:"messageId,omitempty"`
+		ReceiptHandle string `json:"receiptHandle,omitempty"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
+	}
+
+	results := make([]batchAckResult, len(batchReq.Acks))
+
+	err := Db.Update(func(txn *badger.Txn) error {
+		if _, err := txn.Get([]byte(batchReq.QueueId)); err != nil {
+			return err
+		}
+
+		for i, entry := range batchReq.Acks {
+			results[i].MessageId = entry.MessageId
+			results[i].ReceiptHandle = entry.ReceiptHandle
+
+			key, msg, err := messageByReceiptHandle(txn, batchReq.QueueId, entry.ReceiptHandle)
+			if err != nil {
+				results[i].Status = "error"
+				results[i].Error = fmt.Sprintf("message not found: %v", err)
+				continue
+			}
+			results[i].MessageId = msg.ID
+			if msg.State != StateInFlight {
+				results[i].Status = "error"
+				results[i].Error = ErrMessageNotInFlight.Error()
+				continue
+			}
+			if msg.DeliveryAttemptID != entry.DeliveryToken {
+				results[i].Status = "error"
+				results[i].Error = fmt.Sprintf("delivery token mismatch: expected %q, got %q", msg.DeliveryAttemptID, entry.DeliveryToken)
+				continue
+			}
+			if err := deleteInflightIndex(txn, batchReq.QueueId, *msg); err != nil {
+				results[i].Status = "error"
+				results[i].Error = fmt.Sprintf("delete in-flight index failed: %v", err)
+				continue
+			}
+			if err := txn.Delete(key); err != nil {
+				results[i].Status = "error"
+				results[i].Error = fmt.Sprintf("delete failed: %v", err)
+				continue
+			}
+			results[i].Status = "ok"
+		}
+		return nil
+	})
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			http.Error(w, "Queue not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	m := getOrCreateMetrics(batchReq.QueueId)
+	for _, res := range results {
+		if res.Status == "ok" {
+			m.recordAck()
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"results": results,
+	})
 }
 
 func ackBatch(w http.ResponseWriter, r *http.Request) {
@@ -1047,89 +1379,25 @@ func ackBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(req.Messages) == 0 {
-		http.Error(w, "messages array is required", http.StatusBadRequest)
+	if len(req.Acks) == 0 {
+		http.Error(w, "acks array is required", http.StatusBadRequest)
 		return
 	}
-
-	queueID := req.Messages[0].QueueId
-	if queueID == "" {
+	if req.QueueId == "" {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
 		return
 	}
-	for _, m := range req.Messages {
-		if m.QueueId != queueID {
-			http.Error(w, "all messages must belong to the same queue", http.StatusBadRequest)
+	for _, ack := range req.Acks {
+		if ack.ReceiptHandle == "" {
+			http.Error(w, "receiptHandle is required for all acks", http.StatusBadRequest)
 			return
 		}
-		if m.MessageId == "" {
-			http.Error(w, "messageId is required for all messages", http.StatusBadRequest)
-			return
-		}
-		if m.DeliveryToken == "" {
-			http.Error(w, "deliveryToken is required for all messages", http.StatusBadRequest)
+		if ack.DeliveryToken == "" {
+			http.Error(w, "deliveryToken is required for all acks", http.StatusBadRequest)
 			return
 		}
 	}
-
-	var ackedCount int64
-	err := Db.Update(func(txn *badger.Txn) error {
-		if _, err := txn.Get([]byte(queueID)); err != nil {
-			return err
-		}
-		for _, ackReq := range req.Messages {
-			msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
-			if !ok {
-				log.Printf("ack-batch: cache miss for %s/%s", ackReq.QueueId, ackReq.MessageId)
-				return badger.ErrKeyNotFound
-			}
-			item, err := txn.Get(msgKey)
-			if err != nil {
-				log.Printf("ack-batch: key not found for %s/%s: %v", ackReq.QueueId, ackReq.MessageId, err)
-				return err
-			}
-			var msg Message
-			if err := item.Value(func(v []byte) error {
-				return json.Unmarshal(v, &msg)
-			}); err != nil {
-				return err
-			}
-			if msg.DeliveryAttemptID != ackReq.DeliveryToken {
-				log.Printf("ack-batch: token mismatch for %s/%s: db=%q client=%q state=%s", ackReq.QueueId, ackReq.MessageId, msg.DeliveryAttemptID, ackReq.DeliveryToken, msg.State)
-				return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
-			}
-			deleteCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
-			if err := txn.Delete(msgKey); err != nil {
-				return err
-			}
-			ackedCount++
-		}
-		return nil
-	})
-	if err != nil {
-		if err == badger.ErrKeyNotFound {
-			http.Error(w, "Queue or message not found", http.StatusNotFound)
-			return
-		}
-		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
-		http.Error(w, "Failed to acknowledge messages: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{
-		"message":       "Messages acknowledged",
-		"ackedCount":    ackedCount,
-	})
-
-	m := getOrCreateMetrics(queueID)
-	for i := int64(0); i < ackedCount; i++ {
-		m.recordAck()
-	}
+	handleBatchAck(w, req)
 }
 
 func nack(w http.ResponseWriter, r *http.Request) {
@@ -1144,12 +1412,12 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ackReq.MessageId == "" {
-		http.Error(w, "messageId is required", http.StatusBadRequest)
-		return
-	}
 	if ackReq.QueueId == "" {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
+		return
+	}
+	if ackReq.ReceiptHandle == "" {
+		http.Error(w, "receiptHandle is required", http.StatusBadRequest)
 		return
 	}
 	if ackReq.DeliveryToken == "" {
@@ -1157,7 +1425,7 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-var nackResultState MessageState
+	var nackResultState MessageState
 	var needReadyPointer bool
 
 	err = Db.Update(func(txn *badger.Txn) error {
@@ -1165,23 +1433,19 @@ var nackResultState MessageState
 			return err
 		}
 
-		msgKey, ok := getCachedMessageKey(ackReq.QueueId, ackReq.MessageId)
-		if !ok {
-			return badger.ErrKeyNotFound
-		}
-		item, err := txn.Get(msgKey)
+		key, msg, err := messageByReceiptHandle(txn, ackReq.QueueId, ackReq.ReceiptHandle)
 		if err != nil {
 			return err
 		}
-		var msg Message
-		if err := item.Value(func(v []byte) error {
-			return json.Unmarshal(v, &msg)
-		}); err != nil {
-			return err
-		}
 
+		if msg.State != StateInFlight {
+			return ErrMessageNotInFlight
+		}
 		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
 			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
+		}
+		if err := deleteInflightIndex(txn, ackReq.QueueId, *msg); err != nil {
+			return err
 		}
 
 		if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
@@ -1200,7 +1464,7 @@ var nackResultState MessageState
 			return err
 		}
 
-		if err := txn.Set(msgKey, updated); err != nil {
+		if err := txn.Set(key, updated); err != nil {
 			return err
 		}
 
@@ -1209,7 +1473,7 @@ var nackResultState MessageState
 			if err != nil {
 				return fmt.Errorf("allocate nack sequence: %w", err)
 			}
-			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, ackReq.MessageId), readyValue(msgKey)); err != nil {
+			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, msg.ID), readyValue(key)); err != nil {
 				return err
 			}
 		}
@@ -1217,11 +1481,15 @@ var nackResultState MessageState
 		return nil
 	})
 	if err != nil {
+		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if err == badger.ErrKeyNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
 			return
 		}
-		if _, ok := err.(*ErrDeliveryTokenMismatch); ok {
+		if _, ok := err.(*ErrDeliveryTokenMismatch); ok || err == ErrMessageNotInFlight {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -1256,74 +1524,130 @@ type reapTransition struct {
 }
 
 func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
-	var transitions []reapTransition
+	type expiredMsg struct {
+		indexKey []byte
+		msgKey   []byte
+	}
+	var expired []expiredMsg
 
-	err := Db.Update(func(txn *badger.Txn) error {
+	err := Db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
+		opts.Prefix = inflightPrefix()
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
+		upper := inflightScanUpperBound(now)
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			key := item.KeyCopy(nil)
-			if bytes.HasPrefix(key, []byte("ready|")) || bytes.HasPrefix(key, []byte("seq:")) {
-				continue
+			if len(key) >= len(upper) && bytes.Compare(key[:len(upper)], upper) > 0 {
+				break
 			}
-			pipeIndex := bytes.IndexByte(key, '|')
-			if pipeIndex == -1 {
-				continue
-			}
-			queueID := string(key[:pipeIndex])
 
-			var msg Message
 			if err := item.Value(func(v []byte) error {
-				return json.Unmarshal(v, &msg)
+				expired = append(expired, expiredMsg{
+					indexKey: key,
+					msgKey:   append([]byte(nil), v...),
+				})
+				return nil
 			}); err != nil {
 				return err
 			}
-
-			if msg.State != StateInFlight {
-				continue
-			}
-			if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
-				continue
-			}
-
-			toDead := msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount
-			if toDead {
-				msg.State = StateDead
-			} else {
-				msg.State = StateReady
-			}
-			msg.VisibilityDeadline = time.Time{}
-			msg.DeliveryAttemptID = ""
-			log.Printf("REAPER: resetting %s/%s to %s (deadline=%v now=%v)", queueID, msg.ID, msg.State, msg.VisibilityDeadline, now)
-
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(key, updated); err != nil {
-				return err
-			}
-
-			if msg.State == StateReady {
-				newSeq, err := nextMessageSequence(queueID)
-				if err != nil {
-					return fmt.Errorf("allocate reaper sequence: %w", err)
-				}
-				if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(key)); err != nil {
-					return err
-				}
-			}
-
-			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return transitions, err
+	const reapBatch = 1024
+	transitions := make([]reapTransition, 0, len(expired))
+
+	for i := 0; i < len(expired); i += reapBatch {
+		end := i + reapBatch
+		if end > len(expired) {
+			end = len(expired)
+		}
+		chunk := expired[i:end]
+
+		err = Db.Update(func(txn *badger.Txn) error {
+			for _, exp := range chunk {
+				item, err := txn.Get(exp.msgKey)
+				if err != nil {
+					if err == badger.ErrKeyNotFound {
+						if delErr := txn.Delete(exp.indexKey); delErr != nil && delErr != badger.ErrKeyNotFound {
+							return delErr
+						}
+						continue
+					}
+					return err
+				}
+
+				var msg Message
+				if err := item.Value(func(v []byte) error {
+					return json.Unmarshal(v, &msg)
+				}); err != nil {
+					return err
+				}
+
+				if msg.State != StateInFlight {
+					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+						return err
+					}
+					continue
+				}
+				if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
+					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+						return err
+					}
+					continue
+				}
+
+				queueID, err := parseMessageKeyQueueID(exp.msgKey)
+				if err != nil {
+					return err
+				}
+
+				if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+					msg.State = StateDead
+				} else {
+					msg.State = StateReady
+				}
+				msg.VisibilityDeadline = time.Time{}
+				msg.DeliveryAttemptID = ""
+
+				updated, err := json.Marshal(msg)
+				if err != nil {
+					return err
+				}
+				if err := txn.Set(exp.msgKey, updated); err != nil {
+					return err
+				}
+				if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
+					return err
+				}
+
+				if msg.State == StateReady {
+					newSeq, err := nextMessageSequence(queueID)
+					if err != nil {
+						return fmt.Errorf("allocate reaper sequence: %w", err)
+					}
+					if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(exp.msgKey)); err != nil {
+						return err
+					}
+				}
+
+				transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
+			}
+			return nil
+		})
+		if err != nil {
+			return transitions, err
+		}
+	}
+
+	return transitions, nil
 }
 
 // runs every second and resets expired in-flight messages back to ready in Badger.
