@@ -642,14 +642,18 @@ type ackEntryBench struct {
 }
 
 type kueueTarget struct {
-	baseURL   string
-	client    *http.Client
-	queueID   string
-	batchSize int
-
-	mu          sync.Mutex
-	msgBuf      []receivedMsg
-	pendingAcks []ackEntryBench
+	baseURL      string
+	client       *http.Client
+	queueID      string
+	prefetch     int
+	deliveries   chan *delivery
+	ackBatch     []ackEntryBench
+	ackMu        sync.Mutex
+	ackFlushSize int
+	ackFlushTick *time.Ticker
+	ackFlushStop chan struct{}
+	ackFlushErr  atomic.Pointer[error]
+	cancelCtx    context.CancelFunc
 }
 
 func newKueueTarget(baseURL string) *kueueTarget {
@@ -657,8 +661,14 @@ func newKueueTarget(baseURL string) *kueueTarget {
 		baseURL: strings.TrimRight(baseURL, "/"),
 		client: &http.Client{
 			Timeout: 40 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
-		batchSize: 10,
+		ackFlushSize: 100,
+		ackFlushStop: make(chan struct{}),
 	}
 }
 
@@ -684,170 +694,122 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 	}
 
 	t.queueID = resp.ID
+	consumerCtx, cancelConsumerCtx := context.WithCancel(ctx)
+	t.cancelCtx = cancelConsumerCtx
+	t.prefetch = cfg.Prefetch
 	if cfg.KueueBatchSize > 0 {
-		t.batchSize = cfg.KueueBatchSize
+		t.prefetch = cfg.KueueBatchSize
+	}
+	if t.prefetch <= 0 {
+		t.prefetch = 1
+	}
+	t.deliveries = make(chan *delivery, cfg.Prefetch*cfg.Consumers)
+	if cap(t.deliveries) == 0 {
+		t.deliveries = make(chan *delivery, t.prefetch)
+	}
+	t.ackBatch = make([]ackEntryBench, 0, t.ackFlushSize)
+	t.ackFlushStop = make(chan struct{})
+	out := t.deliveries
+
+	t.ackFlushTick = time.NewTicker(5 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-t.ackFlushTick.C:
+			case <-t.ackFlushStop:
+				return
+			}
+			t.ackMu.Lock()
+			hasBatch := len(t.ackBatch) > 0
+			t.ackMu.Unlock()
+			if hasBatch {
+				if err := t.flushAcks(context.Background()); err != nil {
+					t.ackFlushErr.Store(&err)
+				}
+			}
+		}
+	}()
+
+	consumerCount := cfg.Consumers
+	if consumerCount <= 0 {
+		consumerCount = 1
+	}
+	for i := 0; i < consumerCount; i++ {
+		go func() {
+			for {
+				msgs, err := t.receiveBatch(consumerCtx, t.prefetch)
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+					select {
+					case <-time.After(100 * time.Millisecond):
+						continue
+					case <-consumerCtx.Done():
+						return
+					}
+				}
+				if len(msgs) == 0 {
+					select {
+					case <-time.After(10 * time.Millisecond):
+						continue
+					case <-consumerCtx.Done():
+						return
+					}
+				}
+				for _, d := range msgs {
+					select {
+					case out <- d:
+					case <-consumerCtx.Done():
+						return
+					}
+				}
+			}
+		}()
 	}
 	return nil
 }
 
 func (t *kueueTarget) NewPublisher(int) (publisher, error) {
-	return &kueuePublisher{target: t}, nil
+	return &kueuePublisher{target: t, flushSize: 50}, nil
 }
 
 func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
-	// Fast path: return buffered message without I/O
-	t.mu.Lock()
-	if len(t.msgBuf) > 0 {
-		m := t.msgBuf[0]
-		t.msgBuf = t.msgBuf[1:]
-		t.mu.Unlock()
-		return &delivery{
-			ID:   m.ID,
-			Body: m.Body,
-			Ack:  t.makeAckFunc(m.ReceiptHandle, m.DeliveryToken),
-		}, nil
+	if errPtr := t.ackFlushErr.Load(); errPtr != nil {
+		return nil, *errPtr
 	}
-
-	// Steal pending acks and clear them under lock
-	var acksToFlush []ackEntryBench
-	if len(t.pendingAcks) > 0 {
-		acksToFlush = t.pendingAcks
-		t.pendingAcks = nil
-	}
-	t.mu.Unlock()
-
-	// Flush acks without holding lock
-	if len(acksToFlush) > 0 {
-		if err := t.flushAcks(ctx, acksToFlush); err != nil {
-			return nil, err
-		}
-	}
-
-	// Receive batch without holding lock
-	msgs, err := t.receiveBatch(ctx)
-	if err != nil {
-		if errors.Is(err, errNoMessage) {
-			return nil, errNoMessage
-		}
-		return nil, err
-	}
-	if len(msgs) == 0 {
-		return nil, errNoMessage
-	}
-
-	// Push to buffer and return one message
-	t.mu.Lock()
-	// Reconcile any pendingAcks added while we were waiting for network I/O
-	if len(t.pendingAcks) > 0 && len(msgs) > 1 {
-		// We have concurrent acks, might as well flush them now
-		t.mu.Unlock()
-		if err := t.flushAcks(ctx, t.pendingAcks); err != nil {
-			return nil, err
-		}
-		t.mu.Lock()
-		t.pendingAcks = nil
-	}
-
-	if len(msgs) > 1 {
-		t.msgBuf = append(t.msgBuf, msgs[1:]...)
-	}
-	t.mu.Unlock()
-
-	m := msgs[0]
-	return &delivery{
-		ID:   m.ID,
-		Body: m.Body,
-		Ack:  t.makeAckFunc(m.ReceiptHandle, m.DeliveryToken),
-	}, nil
-}
-
-func (t *kueueTarget) makeAckFunc(receiptHandle, deliveryToken string) func(context.Context) error {
-	return func(ctx context.Context) error {
-		t.mu.Lock()
-		t.pendingAcks = append(t.pendingAcks, ackEntryBench{ReceiptHandle: receiptHandle, DeliveryToken: deliveryToken})
-		shouldFlush := len(t.pendingAcks) >= t.batchSize || len(t.msgBuf) == 0
-		var acksToFlush []ackEntryBench
-		if shouldFlush {
-			acksToFlush = t.pendingAcks
-			t.pendingAcks = nil
-		}
-		t.mu.Unlock()
-
-		if shouldFlush {
-			return t.flushAcks(ctx, acksToFlush)
-		}
-		return nil
-	}
-}
-
-// flushAcksLocked flushes t.pendingAcks. Must be called with t.mu held.
-func (t *kueueTarget) flushAcksLocked(ctx context.Context) error {
-	if len(t.pendingAcks) == 0 {
-		return nil
-	}
-	acks := t.pendingAcks
-	t.pendingAcks = nil
-	// Release lock during I/O
-	t.mu.Unlock()
-	err := t.flushAcks(ctx, acks)
-	t.mu.Lock()
-	return err
-}
-
-// flushAcks posts the given acks. Does NOT require t.mu to be held.
-func (t *kueueTarget) flushAcks(ctx context.Context, acks []ackEntryBench) error {
-	if len(acks) == 0 {
-		return nil
-	}
-
-	type batchReqBody struct {
-		QueueId string          `json:"queueId"`
-		Acks    []ackEntryBench `json:"acks"`
-	}
-
-	type ackResult struct {
-		MessageId     string `json:"messageId"`
-		ReceiptHandle string `json:"receiptHandle"`
-		Status        string `json:"status"`
-		Error         string `json:"error,omitempty"`
-	}
-	type batchAckResponse struct {
-		Results []ackResult `json:"results"`
-	}
-
-	req := batchReqBody{
-		QueueId: t.queueID,
-		Acks:    acks,
-	}
-
-	var resp batchAckResponse
-	if err := t.postJSON(ctx, "/ack", req, &resp); err != nil {
-		return err
-	}
-
-	// Check per-entry results
-	var firstErr error
-	for _, r := range resp.Results {
-		if r.Status != "ok" {
-			ackID := r.MessageId
-			if ackID == "" {
-				ackID = r.ReceiptHandle
+	select {
+	case msg, ok := <-t.deliveries:
+		if !ok {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
-			err := fmt.Errorf("ack %s failed: %s", ackID, r.Error)
-			if firstErr == nil {
-				firstErr = err
-			}
-			if debugLog {
-				debugf("batch ack error: %v", err)
-			}
+			return nil, io.EOF
 		}
+		return msg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-
-	return firstErr
 }
 
-func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
-	url := fmt.Sprintf("%s/receive?id=%s&max=%d", t.baseURL, t.queueID, t.batchSize)
+func (t *kueueTarget) Cleanup(ctx context.Context) error {
+	if t.cancelCtx != nil {
+		t.cancelCtx()
+		t.cancelCtx = nil
+	}
+	close(t.ackFlushStop)
+	if t.ackFlushTick != nil {
+		t.ackFlushTick.Stop()
+	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = t.flushAcks(flushCtx)
+	t.queueID = ""
+	return nil
+}
+
+func (t *kueueTarget) receiveBatch(ctx context.Context, max int) ([]*delivery, error) {
+	url := fmt.Sprintf("%s/receive-batch?id=%s&max=%d&wait=true", t.baseURL, t.queueID, max)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -876,34 +838,93 @@ func (t *kueueTarget) receiveBatch(ctx context.Context) ([]receivedMsg, error) {
 		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 			return nil, err
 		}
-		msgs := make([]receivedMsg, 0, len(payload.Messages))
-		for _, m := range payload.Messages {
-			msgs = append(msgs, receivedMsg{ID: m.ID, Body: m.Body, ReceiptHandle: m.ReceiptHandle, DeliveryToken: m.DeliveryToken})
+		if len(payload.Messages) == 0 {
+			return nil, errNoMessage
 		}
-		return msgs, nil
+		deliveries := make([]*delivery, len(payload.Messages))
+		for i, msg := range payload.Messages {
+			msgCopy := msg
+			deliveries[i] = &delivery{
+				ID:   msgCopy.ID,
+				Body: msgCopy.Body,
+				Ack: func(ctx context.Context) error {
+					return t.queueAck(ctx, ackEntryBench{
+						ReceiptHandle: msgCopy.ReceiptHandle,
+						DeliveryToken: msgCopy.DeliveryToken,
+					})
+				},
+			}
+		}
+		return deliveries, nil
 	case http.StatusNotFound:
 		io.Copy(io.Discard, resp.Body)
 		return nil, errNoMessage
 	default:
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("kueue receive returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("kueue receive-batch returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 }
 
-func (t *kueueTarget) Cleanup(ctx context.Context) error {
-	t.mu.Lock()
-	pending := t.pendingAcks
-	t.pendingAcks = nil
-	t.msgBuf = nil
-	t.mu.Unlock()
+func (t *kueueTarget) queueAck(ctx context.Context, entry ackEntryBench) error {
+	t.ackMu.Lock()
+	t.ackBatch = append(t.ackBatch, entry)
+	shouldFlush := len(t.ackBatch) >= t.ackFlushSize
+	t.ackMu.Unlock()
 
-	var err error
-	if len(pending) > 0 {
-		err = t.flushAcks(ctx, pending)
+	if shouldFlush {
+		// flush synchronously only if batch is full; ticker handles the rest
+		return t.flushAcks(ctx)
+	}
+	return nil
+}
+
+func (t *kueueTarget) flushAcks(ctx context.Context) error {
+	t.ackMu.Lock()
+	if len(t.ackBatch) == 0 {
+		t.ackMu.Unlock()
+		return nil
+	}
+	batch := make([]ackEntryBench, len(t.ackBatch))
+	copy(batch, t.ackBatch)
+	t.ackBatch = t.ackBatch[:0]
+	t.ackMu.Unlock()
+
+	type ackBatchReq struct {
+		QueueId string          `json:"queueId"`
+		Acks    []ackEntryBench `json:"acks"`
+	}
+	type ackResult struct {
+		MessageId     string `json:"messageId"`
+		ReceiptHandle string `json:"receiptHandle"`
+		Status        string `json:"status"`
+		Error         string `json:"error,omitempty"`
+	}
+	type batchAckResponse struct {
+		Results []ackResult `json:"results"`
+	}
+	var resp batchAckResponse
+	if err := t.postJSON(ctx, "/ack", ackBatchReq{QueueId: t.queueID, Acks: batch}, &resp); err != nil {
+		return err
 	}
 
-	t.queueID = ""
-	return err
+	var firstErr error
+	for _, r := range resp.Results {
+		if r.Status == "ok" {
+			continue
+		}
+		ackID := r.MessageId
+		if ackID == "" {
+			ackID = r.ReceiptHandle
+		}
+		err := fmt.Errorf("ack %s failed: %s", ackID, r.Error)
+		if firstErr == nil {
+			firstErr = err
+		}
+		if debugLog {
+			debugf("batch ack error: %v", err)
+		}
+	}
+	return firstErr
 }
 
 func (t *kueueTarget) postJSON(ctx context.Context, path string, requestBody any, out any) error {
@@ -941,24 +962,109 @@ func (t *kueueTarget) postJSON(ctx context.Context, path string, requestBody any
 }
 
 type kueuePublisher struct {
-	target *kueueTarget
+	target    *kueueTarget
+	mu        sync.Mutex
+	batch     []kueuePubMsg
+	flushSize int
+}
+
+type kueuePubMsg struct {
+	Body []byte `json:"body"`
 }
 
 func (p *kueuePublisher) Publish(ctx context.Context, body []byte) error {
-	type publishRequest struct {
-		Message struct {
-			Body []byte `json:"body"`
-		} `json:"message"`
-		QueueID string `json:"queueId"`
-	}
+	p.mu.Lock()
+	p.batch = append(p.batch, kueuePubMsg{Body: body})
+	shouldFlush := len(p.batch) >= p.flushSize
+	p.mu.Unlock()
 
-	req := publishRequest{QueueID: p.target.queueID}
-	req.Message.Body = body
-	return p.target.postJSON(ctx, "/publish", req, nil)
+	if shouldFlush {
+		return p.Flush(ctx)
+	}
+	return nil
+}
+
+func (p *kueuePublisher) Flush(ctx context.Context) error {
+	p.mu.Lock()
+	if len(p.batch) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	msgs := make([]kueuePubMsg, len(p.batch))
+	copy(msgs, p.batch)
+	p.batch = p.batch[:0]
+	p.mu.Unlock()
+
+	type publishBatchReq struct {
+		Messages []kueuePubMsg `json:"messages"`
+		QueueId  string        `json:"queueId"`
+	}
+	return p.target.postJSON(ctx, "/publish-batch", publishBatchReq{
+		Messages: msgs,
+		QueueId:  p.target.queueID,
+	}, nil)
 }
 
 func (p *kueuePublisher) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = p.Flush(ctx)
 	return nil
+}
+
+func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error) {
+	url := fmt.Sprintf("%s/receive?id=%s", t.baseURL, t.queueID)
+	if wait {
+		url += "&wait=true"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusAccepted:
+		var payload struct {
+			ID            string `json:"id"`
+			Body          []byte `json:"body"`
+			DeliveryToken string `json:"deliveryToken"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		return &delivery{
+			ID:   payload.ID,
+			Body: payload.Body,
+			Ack: func(ctx context.Context) error {
+				type ackRequest struct {
+					MessageID     string `json:"messageId"`
+					QueueID       string `json:"queueId"`
+					DeliveryToken string `json:"deliveryToken"`
+				}
+				return t.postJSON(ctx, "/ack", ackRequest{
+					MessageID:     payload.ID,
+					QueueID:       t.queueID,
+					DeliveryToken: payload.DeliveryToken,
+				}, nil)
+			},
+		}, nil
+	case http.StatusNotFound:
+		io.Copy(io.Discard, resp.Body)
+		return nil, errNoMessage
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("kueue receive returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 }
 
 type rabbitMQTarget struct {
