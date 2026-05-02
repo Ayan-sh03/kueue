@@ -653,6 +653,7 @@ type kueueTarget struct {
 	ackFlushTick *time.Ticker
 	ackFlushStop chan struct{}
 	ackFlushErr  atomic.Pointer[error]
+	cancelCtx    context.CancelFunc
 }
 
 func newKueueTarget(baseURL string) *kueueTarget {
@@ -693,6 +694,8 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 	}
 
 	t.queueID = resp.ID
+	consumerCtx, cancelConsumerCtx := context.WithCancel(ctx)
+	t.cancelCtx = cancelConsumerCtx
 	t.prefetch = cfg.Prefetch
 	if cfg.KueueBatchSize > 0 {
 		t.prefetch = cfg.KueueBatchSize
@@ -734,7 +737,7 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 	for i := 0; i < consumerCount; i++ {
 		go func() {
 			for {
-				msgs, err := t.receiveBatch(ctx, t.prefetch)
+				msgs, err := t.receiveBatch(consumerCtx, t.prefetch)
 				if err != nil {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 						return
@@ -742,7 +745,7 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 					select {
 					case <-time.After(100 * time.Millisecond):
 						continue
-					case <-ctx.Done():
+					case <-consumerCtx.Done():
 						return
 					}
 				}
@@ -750,14 +753,14 @@ func (t *kueueTarget) Setup(ctx context.Context, cfg workloadConfig, runLabel st
 					select {
 					case <-time.After(10 * time.Millisecond):
 						continue
-					case <-ctx.Done():
+					case <-consumerCtx.Done():
 						return
 					}
 				}
 				for _, d := range msgs {
 					select {
 					case out <- d:
-					case <-ctx.Done():
+					case <-consumerCtx.Done():
 						return
 					}
 				}
@@ -790,6 +793,10 @@ func (t *kueueTarget) Consume(ctx context.Context) (*delivery, error) {
 }
 
 func (t *kueueTarget) Cleanup(ctx context.Context) error {
+	if t.cancelCtx != nil {
+		t.cancelCtx()
+		t.cancelCtx = nil
+	}
 	close(t.ackFlushStop)
 	if t.ackFlushTick != nil {
 		t.ackFlushTick.Stop()
