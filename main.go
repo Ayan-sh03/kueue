@@ -88,22 +88,22 @@ var Db *badger.DB
 var Queues []Queue
 var DeadLetterQueue []Message
 
-var messageKeyCache sync.Map // key: "queueID\x00messageID" -> value: []byte (message key)
+var messageKeyCache sync.Map // key: receiptHandle -> value: []byte (message key)
 
-func cacheMessageKey(queueID, messageID string, key []byte) {
-	messageKeyCache.Store(queueID+"\x00"+messageID, key)
+func cacheMessageKey(receiptHandle string, key []byte) {
+	messageKeyCache.Store(receiptHandle, append([]byte(nil), key...))
 }
 
-func getCachedMessageKey(queueID, messageID string) ([]byte, bool) {
-	val, ok := messageKeyCache.Load(queueID + "\x00" + messageID)
+func getCachedMessageKey(receiptHandle string) ([]byte, bool) {
+	val, ok := messageKeyCache.Load(receiptHandle)
 	if !ok {
 		return nil, false
 	}
-	return val.([]byte), true
+	return append([]byte(nil), val.([]byte)...), true
 }
 
-func deleteCachedMessageKey(queueID, messageID string) {
-	messageKeyCache.Delete(queueID + "\x00" + messageID)
+func deleteCachedMessageKey(receiptHandle string) {
+	messageKeyCache.Delete(receiptHandle)
 }
 
 type queueMetrics struct {
@@ -316,6 +316,16 @@ func messageKeyFromReceiptHandle(queueID, receiptHandle string) ([]byte, error) 
 		return nil, &ErrInvalidReceiptHandle{Reason: "receiptHandle is required"}
 	}
 
+	if key, ok := getCachedMessageKey(receiptHandle); ok {
+		if !bytes.HasPrefix(key, queueMessagePrefix(queueID)) {
+			return nil, &ErrInvalidReceiptHandle{Reason: "queue mismatch"}
+		}
+		if _, err := parseMessageKeySeq(key); err != nil {
+			return nil, &ErrInvalidReceiptHandle{Reason: err.Error()}
+		}
+		return key, nil
+	}
+
 	key, err := base64.RawURLEncoding.DecodeString(receiptHandle)
 	if err != nil {
 		return nil, &ErrInvalidReceiptHandle{Reason: "base64 decode failed"}
@@ -326,6 +336,7 @@ func messageKeyFromReceiptHandle(queueID, receiptHandle string) ([]byte, error) 
 	if _, err := parseMessageKeySeq(key); err != nil {
 		return nil, &ErrInvalidReceiptHandle{Reason: err.Error()}
 	}
+	cacheMessageKey(receiptHandle, key)
 	return key, nil
 }
 
@@ -686,7 +697,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 		if err := txn.Set(msgKey, messageJson); err != nil {
 			return err
 		}
-		cacheMessageKey(queueId, message.Message.ID, msgKey)
+		cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
 		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(msgKey))
 	})
 	if err != nil {
@@ -783,7 +794,7 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 			if err := txn.Set(msgKey, msgJson); err != nil {
 				return err
 			}
-			cacheMessageKey(req.QueueId, msg.ID, msgKey)
+			cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
 			if err := txn.Set(readyKey(req.QueueId, seqs[i], msg.ID), readyValue(msgKey)); err != nil {
 				return err
 			}
@@ -898,9 +909,11 @@ func claimReadyMessages(queueId string, max int) ([]claimedMessage, error) {
 				return fmt.Errorf("set in-flight index: %w", err)
 			}
 
+			receiptHandle := receiptHandleForMessageKey(msgKey)
+			cacheMessageKey(receiptHandle, msgKey)
 			claimed = append(claimed, claimedMessage{
 				Message:       msg,
-				ReceiptHandle: receiptHandleForMessageKey(msgKey),
+				ReceiptHandle: receiptHandle,
 			})
 		}
 		return nil
@@ -1261,7 +1274,7 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		if err := deleteInflightIndex(txn, ackReq.QueueId, *msg); err != nil {
 			return err
 		}
-		deleteCachedMessageKey(ackReq.QueueId, msg.ID)
+		deleteCachedMessageKey(ackReq.ReceiptHandle)
 		return txn.Delete(key)
 	})
 	if err != nil {
@@ -1342,6 +1355,7 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 				results[i].Error = fmt.Sprintf("delete failed: %v", err)
 				continue
 			}
+			deleteCachedMessageKey(entry.ReceiptHandle)
 			results[i].Status = "ok"
 		}
 		return nil
@@ -1476,6 +1490,9 @@ func nack(w http.ResponseWriter, r *http.Request) {
 			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, msg.ID), readyValue(key)); err != nil {
 				return err
 			}
+			cacheMessageKey(ackReq.ReceiptHandle, key)
+		} else {
+			deleteCachedMessageKey(ackReq.ReceiptHandle)
 		}
 
 		return nil
