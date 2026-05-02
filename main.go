@@ -1764,7 +1764,12 @@ func main() {
 		port = "8080"
 	}
 
-	db, err := badger.Open(badger.DefaultOptions(dbPath))
+	opts := badger.DefaultOptions(dbPath)
+	if os.Getenv("KUEUE_SYNC_WRITES") == "false" {
+		opts = opts.WithSyncWrites(false)
+	}
+
+	db, err := badger.Open(opts)
 	if err != nil {
 		fmt.Println("Error opening BadgerDB:", err)
 		return
