@@ -1,0 +1,51 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Start kueue server
+        run: |
+          go build -o kueue .
+          PORT=8080 KUEUE_DB_PATH=$(mktemp -d) ./kueue &>/tmp/kueue.log &
+          echo "Server PID: $!"
+
+          # Wait until port 8080 is accepting connections
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:8080 > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start. Logs:"
+          cat /tmp/kueue.log
+          exit 1
+
+      - name: Run benchmark
+        run: |
+          go run ./cmd/bench \
+            -targets=kueue \
+            -messages=10000 \
+            -producers=1 \
+            -consumers=1 \
+            -runs=3 \
+            -warmup=500 \
+            -json-out=benchmark-results/latest.json
+          cat benchmark-results/latest.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results/latest.json
