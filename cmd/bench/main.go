@@ -290,6 +290,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "marshal report: %v\n", err)
 			os.Exit(1)
 		}
+		if err := os.MkdirAll(filepathDir(*jsonOut), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "create report dir: %v\n", err)
+			os.Exit(1)
+		}
 		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "write report: %v\n", err)
 			os.Exit(1)
