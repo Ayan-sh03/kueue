@@ -135,130 +135,87 @@ func main() {
 	targetList := parseTargets(*targets)
 	debugf("targets: %v, messages: %d, runs: %d, workload: %s", targetList, *messages, *runs, *workload)
 
+	base := workloadConfig{
+		Messages:       *messages,
+		Warmup:         *warmup,
+		Runs:           *runs,
+		PayloadBytes:   *payloadBytes,
+		Producers:      *producers,
+		Consumers:      *consumers,
+		Prefetch:       *prefetch,
+		Targets:        targetList,
+		KueueBatchSize: 10,
+		RateLimit:      *rateLimit,
+		ConsumerDelayMs: *consumerDelay,
+		VerifyOrder:    *verifyOrder,
+	}
+
 	var sections []sectionReport
 
 	switch *workload {
 	case "default":
-		e2eCfg := workloadConfig{
-			Messages:       *messages,
-			Warmup:         *warmup,
-			Runs:           *runs,
-			PayloadBytes:   *payloadBytes,
-			Producers:      *producers,
-			Consumers:      *consumers,
-			Prefetch:       *prefetch,
-			Targets:        targetList,
-			KueueBatchSize: 10,
-			RateLimit:      *rateLimit,
-			ConsumerDelayMs: *consumerDelay,
-			VerifyOrder:    *verifyOrder,
-			Label:          "End-to-end (default client config)",
-		}
+		e2eCfg := base
+		e2eCfg.Label = "End-to-end (default client config)"
 		sections = append(sections, runSection("End-to-end (default client config)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, "Note: measures protocol + broker together."))
 
-		applesCfg := e2eCfg
+		applesCfg := base
 		applesCfg.Prefetch = 1
 		applesCfg.KueueBatchSize = 1
 		applesCfg.Label = "Apples-to-apples (one message per round-trip)"
 		sections = append(sections, runSection("Apples-to-apples (one message per round-trip)", targetList, applesCfg, *kueueURL, *rabbitMQURI, "Note: isolates broker behavior; not a realistic config for either."))
 
 	case "competing-consumers":
-		cfg := workloadConfig{
-			Messages:       *messages,
-			Warmup:         *warmup,
-			Runs:           *runs,
-			PayloadBytes:   *payloadBytes,
-			Producers:      1,
-			Consumers:      10,
-			Prefetch:       *prefetch,
-			Targets:        targetList,
-			KueueBatchSize: 10,
-			VerifyOrder:    true,
-			Label:          "Competing consumers (1p/10c)",
-		}
+		cfg := base
+		cfg.Producers = 1
+		cfg.Consumers = 10
+		cfg.VerifyOrder = true
+		cfg.Label = "Competing consumers (1p/10c)"
 		sections = append(sections, runSection("Competing consumers (1p/10c)", targetList, cfg, *kueueURL, *rabbitMQURI, "Note: measures throughput scaling, FIFO ordering, and consumer fairness."))
 
 	case "backlog-drain":
-		cfg := workloadConfig{
-			Messages:       *messages,
-			Warmup:         0,
-			Runs:           *runs,
-			PayloadBytes:   *payloadBytes,
-			Producers:      *producers,
-			Consumers:      *consumers,
-			Prefetch:       *prefetch,
-			Targets:        targetList,
-			KueueBatchSize: 10,
-			PreFill:        *messages,
-			VerifyOrder:    *verifyOrder,
-			Label:          "Backlog drain",
-		}
+		cfg := base
+		cfg.Warmup = 0
+		cfg.PreFill = *messages
+		cfg.Label = "Backlog drain"
 		sections = append(sections, runSection("Backlog drain", targetList, cfg, *kueueURL, *rabbitMQURI, "Note: pre-fills queue then measures drain rate and latency under backlog."))
 
 	case "size-sweep":
 		sizes := []int{64, 256, 1024, 4096, 16384}
 		for _, sz := range sizes {
-			cfg := workloadConfig{
-				Messages:       *messages,
-				Warmup:         *warmup,
-				Runs:           *runs,
-				PayloadBytes:   sz,
-				Producers:      *producers,
-				Consumers:      *consumers,
-				Prefetch:       *prefetch,
-				Targets:        targetList,
-				KueueBatchSize: 10,
-				VerifyOrder:    *verifyOrder,
-				Label:          fmt.Sprintf("Size sweep %dB", sz),
-			}
+			cfg := base
+			cfg.PayloadBytes = sz
+			cfg.Label = fmt.Sprintf("Size sweep %dB", sz)
 			sections = append(sections, runSection(fmt.Sprintf("Payload %dB", sz), targetList, cfg, *kueueURL, *rabbitMQURI, ""))
 		}
 
 	case "full":
-		e2eCfg := workloadConfig{
-			Messages:       *messages,
-			Warmup:         *warmup,
-			Runs:           *runs,
-			PayloadBytes:   *payloadBytes,
-			Producers:      1,
-			Consumers:      1,
-			Prefetch:       *prefetch,
-			Targets:        targetList,
-			KueueBatchSize: 10,
-			VerifyOrder:    true,
-			Label:          "Single consumer (1p/1c)",
-		}
+		e2eCfg := base
+		e2eCfg.Producers = 1
+		e2eCfg.Consumers = 1
+		e2eCfg.VerifyOrder = true
+		e2eCfg.Label = "Single consumer (1p/1c)"
 		sections = append(sections, runSection("Single consumer (1p/1c)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, ""))
 
-		ccCfg := workloadConfig{
-			Messages:       *messages,
-			Warmup:         *warmup,
-			Runs:           *runs,
-			PayloadBytes:   *payloadBytes,
-			Producers:      1,
-			Consumers:      10,
-			Prefetch:       *prefetch,
-			Targets:        targetList,
-			KueueBatchSize: 10,
-			VerifyOrder:    true,
-			Label:          "Competing consumers (1p/10c)",
-		}
+		ccCfg := base
+		ccCfg.Producers = 1
+		ccCfg.Consumers = 10
+		ccCfg.VerifyOrder = true
+		ccCfg.Label = "Competing consumers (1p/10c)"
 		sections = append(sections, runSection("Competing consumers (1p/10c)", targetList, ccCfg, *kueueURL, *rabbitMQURI, ""))
 
-		for _, sz := range []int{64, 1024, 16384} {
-			cfg := workloadConfig{
-				Messages:       *messages,
-				Warmup:         *warmup,
-				Runs:           *runs,
-				PayloadBytes:   sz,
-				Producers:      1,
-				Consumers:      1,
-				Prefetch:       *prefetch,
-				Targets:        targetList,
-				KueueBatchSize: 10,
-				VerifyOrder:    true,
-				Label:          fmt.Sprintf("Payload %dB (1p/1c)", sz),
-			}
+		bdCfg := base
+		bdCfg.Warmup = 0
+		bdCfg.PreFill = *messages
+		bdCfg.Label = "Backlog drain"
+		sections = append(sections, runSection("Backlog drain", targetList, bdCfg, *kueueURL, *rabbitMQURI, "Note: pre-fills queue then measures drain rate and latency under backlog."))
+
+		for _, sz := range []int{64, 256, 1024, 4096, 16384} {
+			cfg := base
+			cfg.Producers = 1
+			cfg.Consumers = 1
+			cfg.PayloadBytes = sz
+			cfg.VerifyOrder = true
+			cfg.Label = fmt.Sprintf("Payload %dB (1p/1c)", sz)
 			sections = append(sections, runSection(fmt.Sprintf("Payload %dB", sz), targetList, cfg, *kueueURL, *rabbitMQURI, ""))
 		}
 
