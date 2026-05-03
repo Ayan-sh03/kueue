@@ -658,7 +658,8 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 
 				var rateLimiter *time.Ticker
 				if cfg.RateLimit > 0 {
-					interval := time.Duration(float64(time.Second) / float64(cfg.RateLimit))
+					perProducerRate := float64(cfg.RateLimit) / float64(cfg.Producers)
+					interval := time.Duration(float64(time.Second) / perProducerRate)
 					rateLimiter = time.NewTicker(interval)
 					defer rateLimiter.Stop()
 				}
