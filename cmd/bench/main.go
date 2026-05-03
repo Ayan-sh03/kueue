@@ -868,12 +868,12 @@ func medianResult(target string, runs []benchmarkResult) benchmarkResult {
 		LatencyP99Ms:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP99Ms })),
 		LatencyP999Ms:       medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP999Ms })),
 		LatencyMaxMs:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyMaxMs })),
-		PublishedMessages:   runs[0].PublishedMessages,
-		ConsumedMessages:    runs[0].ConsumedMessages,
-		FIFOViolations:      runs[len(runs)/2].FIFOViolations,
+		PublishedMessages:   int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.PublishedMessages) }))),
+		ConsumedMessages:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumedMessages) }))),
+		FIFOViolations:      int(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.FIFOViolations) }))),
 		ConsumerCountStdDev: medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumerCountStdDev })),
-		ConsumerCountMin:    runs[len(runs)/2].ConsumerCountMin,
-		ConsumerCountMax:    runs[len(runs)/2].ConsumerCountMax,
+		ConsumerCountMin:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumerCountMin) }))),
+		ConsumerCountMax:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumerCountMax) }))),
 	}
 }
 
