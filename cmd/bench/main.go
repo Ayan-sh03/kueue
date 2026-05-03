@@ -380,6 +380,10 @@ func validateConfig(cfg workloadConfig) error {
 		return errors.New("consumers must be > 0")
 	case cfg.Prefetch <= 0:
 		return errors.New("prefetch must be > 0")
+	case cfg.RateLimit < 0:
+		return errors.New("rate must be >= 0")
+	case cfg.ConsumerDelayMs < 0:
+		return errors.New("consumer-delay must be >= 0")
 	default:
 		return nil
 	}

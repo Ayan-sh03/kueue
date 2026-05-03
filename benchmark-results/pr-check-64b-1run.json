@@ -1,0 +1,135 @@
+{
+  "generatedAt": "2026-05-02T10:40:01.581259Z",
+  "sections": [
+    {
+      "label": "End-to-end (default client config)",
+      "note": "Note: measures protocol + broker together.",
+      "report": {
+        "generatedAt": "2026-05-02T10:40:00.9172572Z",
+        "workload": {
+          "messages": 1000,
+          "warmup": 500,
+          "runs": 1,
+          "payloadBytes": 64,
+          "producers": 1,
+          "consumers": 10,
+          "prefetch": 10,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 10
+        },
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 1000,
+                "payloadBytes": 64,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.0173842,
+                "consumeSeconds": 0.0639625,
+                "endToEndSeconds": 0.0639625,
+                "publishRate": 57523.4983490756,
+                "consumeRate": 15634.160641000584,
+                "latencyP50Ms": 24.9161,
+                "latencyP95Ms": 44.3926,
+                "latencyP99Ms": 46.6223,
+                "latencyMaxMs": 47.1488,
+                "publishedMessages": 1000,
+                "consumedMessages": 1000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 1000,
+              "payloadBytes": 64,
+              "producers": 1,
+              "consumers": 10,
+              "publishSeconds": 0.0173842,
+              "consumeSeconds": 0.0639625,
+              "endToEndSeconds": 0.0639625,
+              "publishRate": 57523.4983490756,
+              "consumeRate": 15634.160641000584,
+              "latencyP50Ms": 24.9161,
+              "latencyP95Ms": 44.3926,
+              "latencyP99Ms": 46.6223,
+              "latencyMaxMs": 47.1488,
+              "publishedMessages": 1000,
+              "consumedMessages": 1000
+            }
+          }
+        ]
+      }
+    },
+    {
+      "label": "Apples-to-apples (one message per round-trip)",
+      "note": "Note: isolates broker behavior; not a realistic config for either.",
+      "report": {
+        "generatedAt": "2026-05-02T10:40:01.0212964Z",
+        "workload": {
+          "messages": 1000,
+          "warmup": 500,
+          "runs": 1,
+          "payloadBytes": 64,
+          "producers": 1,
+          "consumers": 10,
+          "prefetch": 1,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 1
+        },
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 1000,
+                "payloadBytes": 64,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.017216,
+                "consumeSeconds": 0.3742529,
+                "endToEndSeconds": 0.3742529,
+                "publishRate": 58085.50185873606,
+                "consumeRate": 2671.989983243951,
+                "latencyP50Ms": 149.5543,
+                "latencyP95Ms": 336.3569,
+                "latencyP99Ms": 354.2545,
+                "latencyMaxMs": 358.1028,
+                "publishedMessages": 1000,
+                "consumedMessages": 1000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 1000,
+              "payloadBytes": 64,
+              "producers": 1,
+              "consumers": 10,
+              "publishSeconds": 0.017216,
+              "consumeSeconds": 0.3742529,
+              "endToEndSeconds": 0.3742529,
+              "publishRate": 58085.50185873606,
+              "consumeRate": 2671.989983243951,
+              "latencyP50Ms": 149.5543,
+              "latencyP95Ms": 336.3569,
+              "latencyP99Ms": 354.2545,
+              "latencyMaxMs": 358.1028,
+              "publishedMessages": 1000,
+              "consumedMessages": 1000
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
