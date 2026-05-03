@@ -540,7 +540,9 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 				}
 				produced.Add(1)
 			}
-			pub.Close()
+			if err := pub.Close(); err != nil {
+				recordErr(err)
+			}
 		}()
 		<-prefillDone
 		prefillCancel()
@@ -637,7 +639,11 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 			producerWG.Add(1)
 			go func(p publisher) {
 				defer producerWG.Done()
-				defer p.Close()
+				defer func() {
+				if err := p.Close(); err != nil {
+					recordErr(err)
+				}
+			}()
 
 				var rateLimiter *time.Ticker
 				if cfg.RateLimit > 0 {
@@ -1309,8 +1315,7 @@ func (p *kueuePublisher) Flush(ctx context.Context) error {
 func (p *kueuePublisher) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = p.Flush(ctx)
-	return nil
+	return p.Flush(ctx)
 }
 
 func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error) {
