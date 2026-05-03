@@ -179,7 +179,7 @@ func main() {
 
 	case "backlog-drain":
 		cfg := workloadConfig{
-			Messages:       5000,
+			Messages:       *messages,
 			Warmup:         0,
 			Runs:           *runs,
 			PayloadBytes:   *payloadBytes,
