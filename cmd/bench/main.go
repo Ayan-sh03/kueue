@@ -49,6 +49,7 @@ type workloadConfig struct {
 
 type benchmarkPayload struct {
 	Seq            int    `json:"seq"`
+	ProducerID     int    `json:"producerId"`
 	SentAtUnixNano int64  `json:"sentAtUnixNano"`
 	Padding        string `json:"padding,omitempty"`
 }
@@ -526,7 +527,7 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 				return
 			}
 			for seq := 0; seq < cfg.PreFill; seq++ {
-				body, err := makePayload(seq, cfg.PayloadBytes)
+				body, err := makePayload(seq, 0, cfg.PayloadBytes)
 				if err != nil {
 					recordErr(err)
 					return
@@ -570,6 +571,7 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 		go func() {
 			defer consumerWG.Done()
 			var lastSeq int = -1
+			lastSeqByProducer := make(map[int]int)
 			for {
 				if consumed.Load() >= int64(totalToConsume) {
 					return
@@ -609,10 +611,18 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 				if cfg.VerifyOrder {
 					var payload benchmarkPayload
 					if jsonErr := json.Unmarshal(msg.Body, &payload); jsonErr == nil {
-						if lastSeq >= 0 && payload.Seq < lastSeq {
-							fifoViolations.Add(1)
+						if cfg.Producers == 1 {
+							if lastSeq >= 0 && payload.Seq < lastSeq {
+								fifoViolations.Add(1)
+							}
+							lastSeq = payload.Seq
+						} else {
+							prev, ok := lastSeqByProducer[payload.ProducerID]
+							if ok && payload.Seq < prev {
+								fifoViolations.Add(1)
+							}
+							lastSeqByProducer[payload.ProducerID] = payload.Seq
 						}
-						lastSeq = payload.Seq
 					}
 				}
 
@@ -636,8 +646,9 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 				return result, err
 			}
 
+			producerID := i
 			producerWG.Add(1)
-			go func(p publisher) {
+			go func(p publisher, pid int) {
 				defer producerWG.Done()
 				defer func() {
 				if err := p.Close(); err != nil {
@@ -661,7 +672,7 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 						}
 					}
 
-					body, err := makePayload(seq, cfg.PayloadBytes)
+					body, err := makePayload(seq, pid, cfg.PayloadBytes)
 					if err != nil {
 						recordErr(err)
 						return
@@ -677,7 +688,7 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 
 					produced.Add(1)
 				}
-			}(pub)
+			}(pub, producerID)
 		}
 
 		producerWG.Wait()
@@ -737,9 +748,10 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 	return result, nil
 }
 
-func makePayload(seq, payloadBytes int) ([]byte, error) {
+func makePayload(seq, producerID, payloadBytes int) ([]byte, error) {
 	payload := benchmarkPayload{
 		Seq:            seq,
+		ProducerID:     producerID,
 		SentAtUnixNano: time.Now().UnixNano(),
 	}
 
