@@ -32,7 +32,7 @@ jobs:
           cat /tmp/kueue.log
           exit 1
 
-      - name: Run benchmark
+      - name: Run full benchmark suite
         run: |
           go run ./cmd/bench \
             -targets=kueue \
@@ -42,6 +42,8 @@ jobs:
             -prefetch=10 \
             -runs=3 \
             -warmup=500 \
+            -verify-order \
+            -workload=full \
             -json-out=benchmark-results/latest.json
           cat benchmark-results/latest.json
 

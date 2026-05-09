@@ -19,6 +19,44 @@ For benchmarks on Windows, use `scripts/run-benchmark.ps1`. It starts both kueue
 
 CPU profiling: set `KUEUE_CPU_PROFILE=<file>` env var when starting the server.
 
+### Benchmark workloads
+
+```bash
+# Default: e2e + apples-to-apples
+go run ./cmd/bench -targets=kueue -workload=default
+
+# Competing consumers: 1 producer, 10 consumers, FIFO verification + fairness
+go run ./cmd/bench -targets=kueue -workload=competing-consumers
+
+# Backlog drain: pre-fills queue then measures drain rate
+go run ./cmd/bench -targets=kueue -workload=backlog-drain
+
+# Size sweep: 64B, 256B, 1KB, 4KB, 16KB payloads
+go run ./cmd/bench -targets=kueue -workload=size-sweep
+
+# Full suite: single consumer, competing consumers, size sweep
+go run ./cmd/bench -targets=kueue -workload=full -verify-order
+
+# Rate-limited publishing (avoids coordinated omission)
+go run ./cmd/bench -targets=kueue -rate=1000 -workload=default
+
+# Slow consumer simulation
+go run ./cmd/bench -targets=kueue -consumer-delay=5 -workload=default
+```
+
+### Benchmark methodology
+
+Follows OpenMessaging Benchmark methodology: warmup → measured runs → median of runs.
+
+Metrics reported (per OpenMessaging standard):
+- **Throughput**: publish msg/s, consume msg/s
+- **End-to-end latency**: p50, p95, p99, p99.9, max (in ms)
+- **FIFO violations**: count of out-of-order deliveries per consumer (with `-verify-order`)
+- **Consumer fairness**: std dev and min/max of per-consumer message counts
+
+Workload presets align with OpenMessaging canonical patterns:
+- Max-rate (1p/1c), competing consumers (1p/Nc), backlog drain, message size sweep
+
 ## Architecture
 
 Everything lives in `main.go`. There is no package splitting.

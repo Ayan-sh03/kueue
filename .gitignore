@@ -6,6 +6,7 @@ tmp
 kueue-bench
 kueue-server
 bench-runner
+*.exe
 benchmark-regression-issue.md
 data/
 kueue.service

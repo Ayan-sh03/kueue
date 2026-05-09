@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -30,41 +31,52 @@ func debugf(format string, args ...any) {
 }
 
 type workloadConfig struct {
-	Messages       int      `json:"messages"`
-	Warmup         int      `json:"warmup"`
-	Runs           int      `json:"runs"`
-	PayloadBytes   int      `json:"payloadBytes"`
-	Producers      int      `json:"producers"`
-	Consumers      int      `json:"consumers"`
-	Prefetch       int      `json:"prefetch"`
-	Targets        []string `json:"targets"`
-	KueueBatchSize int      `json:"kueueBatchSize"`
+	Messages        int      `json:"messages"`
+	Warmup          int      `json:"warmup"`
+	Runs            int      `json:"runs"`
+	PayloadBytes    int      `json:"payloadBytes"`
+	Producers       int      `json:"producers"`
+	Consumers       int      `json:"consumers"`
+	Prefetch        int      `json:"prefetch"`
+	Targets         []string `json:"targets"`
+	KueueBatchSize  int      `json:"kueueBatchSize"`
+	RateLimit       int      `json:"rateLimit"`        // msg/s, 0 = unlimited
+	ConsumerDelayMs int      `json:"consumerDelayMs"`  // artificial per-msg delay, 0 = none
+	VerifyOrder     bool     `json:"verifyOrder"`       // verify FIFO within consumer
+	PreFill         int      `json:"preFill"`           // pre-fill N messages before consumers start
+	Label           string   `json:"label"`             // human-readable section label
 }
 
 type benchmarkPayload struct {
 	Seq            int    `json:"seq"`
+	ProducerID     int    `json:"producerId"`
 	SentAtUnixNano int64  `json:"sentAtUnixNano"`
 	Padding        string `json:"padding,omitempty"`
 }
 
 type benchmarkResult struct {
-	Target            string  `json:"target"`
-	Run               int     `json:"run"`
-	Messages          int     `json:"messages"`
-	PayloadBytes      int     `json:"payloadBytes"`
-	Producers         int     `json:"producers"`
-	Consumers         int     `json:"consumers"`
-	PublishSeconds    float64 `json:"publishSeconds"`
-	ConsumeSeconds    float64 `json:"consumeSeconds"`
-	EndToEndSeconds   float64 `json:"endToEndSeconds"`
-	PublishRate       float64 `json:"publishRate"`
-	ConsumeRate       float64 `json:"consumeRate"`
-	LatencyP50Ms      float64 `json:"latencyP50Ms"`
-	LatencyP95Ms      float64 `json:"latencyP95Ms"`
-	LatencyP99Ms      float64 `json:"latencyP99Ms"`
-	LatencyMaxMs      float64 `json:"latencyMaxMs"`
-	PublishedMessages int64   `json:"publishedMessages"`
-	ConsumedMessages  int64   `json:"consumedMessages"`
+	Target              string  `json:"target"`
+	Run                 int     `json:"run"`
+	Messages            int     `json:"messages"`
+	PayloadBytes        int     `json:"payloadBytes"`
+	Producers           int     `json:"producers"`
+	Consumers           int     `json:"consumers"`
+	PublishSeconds      float64 `json:"publishSeconds"`
+	ConsumeSeconds      float64 `json:"consumeSeconds"`
+	EndToEndSeconds     float64 `json:"endToEndSeconds"`
+	PublishRate         float64 `json:"publishRate"`
+	ConsumeRate         float64 `json:"consumeRate"`
+	LatencyP50Ms        float64 `json:"latencyP50Ms"`
+	LatencyP95Ms        float64 `json:"latencyP95Ms"`
+	LatencyP99Ms        float64 `json:"latencyP99Ms"`
+	LatencyP999Ms       float64 `json:"latencyP999Ms"`
+	LatencyMaxMs        float64 `json:"latencyMaxMs"`
+	PublishedMessages   int64   `json:"publishedMessages"`
+	ConsumedMessages    int64   `json:"consumedMessages"`
+	FIFOViolations      int     `json:"fifoViolations"`
+	ConsumerCountStdDev float64 `json:"consumerCountStdDev"`
+	ConsumerCountMin    int64   `json:"consumerCountMin"`
+	ConsumerCountMax    int64   `json:"consumerCountMax"`
 }
 
 type benchmarkSummary struct {
@@ -100,27 +112,30 @@ type benchmarkTarget interface {
 
 func main() {
 	var (
-		targets      = flag.String("targets", "kueue,rabbitmq", "comma-separated benchmark targets")
-		kueueURL     = flag.String("kueue-url", "http://127.0.0.1:8080", "base URL for the kueue HTTP server")
-		rabbitMQURI  = flag.String("rabbitmq-uri", "amqp://guest:guest@127.0.0.1:5672/", "AMQP URI for RabbitMQ")
-		messages     = flag.Int("messages", 10000, "messages per measured run")
-		warmup       = flag.Int("warmup", 500, "warmup messages before each measured run")
-		runs         = flag.Int("runs", 3, "measured runs per target")
-		payloadBytes = flag.Int("payload-bytes", 256, "message body size in bytes")
-		producers    = flag.Int("producers", 1, "concurrent publishers")
-		consumers    = flag.Int("consumers", 1, "concurrent consumers")
-		prefetch     = flag.Int("prefetch", 200, "RabbitMQ consumer prefetch per consumer")
-		jsonOut      = flag.String("json-out", "", "optional path for benchmark report JSON")
+		targets       = flag.String("targets", "kueue", "comma-separated benchmark targets")
+		kueueURL      = flag.String("kueue-url", "http://127.0.0.1:8080", "base URL for the kueue HTTP server")
+		rabbitMQURI   = flag.String("rabbitmq-uri", "amqp://guest:guest@127.0.0.1:5672/", "AMQP URI for RabbitMQ")
+		messages      = flag.Int("messages", 10000, "messages per measured run")
+		warmup        = flag.Int("warmup", 500, "warmup messages before each measured run")
+		runs          = flag.Int("runs", 3, "measured runs per target")
+		payloadBytes  = flag.Int("payload-bytes", 256, "message body size in bytes")
+		producers     = flag.Int("producers", 1, "concurrent publishers")
+		consumers     = flag.Int("consumers", 1, "concurrent consumers")
+		prefetch      = flag.Int("prefetch", 200, "RabbitMQ consumer prefetch per consumer")
+		rateLimit     = flag.Int("rate", 0, "max publish rate in msg/s (0=unlimited)")
+		consumerDelay = flag.Int("consumer-delay", 0, "artificial per-message consumer delay in ms (0=none)")
+		verifyOrder   = flag.Bool("verify-order", false, "verify FIFO ordering within each consumer")
+		workload      = flag.String("workload", "default", "workload preset: default, competing-consumers, backlog-drain, size-sweep, full")
+		jsonOut       = flag.String("json-out", "", "optional path for benchmark report JSON")
 	)
 	flag.Parse()
 
 	debugLog = os.Getenv("DEBUG") == "true"
 
 	targetList := parseTargets(*targets)
-	debugf("targets: %v, messages: %d, runs: %d", targetList, *messages, *runs)
+	debugf("targets: %v, messages: %d, runs: %d, workload: %s", targetList, *messages, *runs, *workload)
 
-	// --- Section 1: End-to-end (default client config) ---
-	e2eCfg := workloadConfig{
+	base := workloadConfig{
 		Messages:       *messages,
 		Warmup:         *warmup,
 		Runs:           *runs,
@@ -130,18 +145,89 @@ func main() {
 		Prefetch:       *prefetch,
 		Targets:        targetList,
 		KueueBatchSize: 10,
+		RateLimit:      *rateLimit,
+		ConsumerDelayMs: *consumerDelay,
+		VerifyOrder:    *verifyOrder,
 	}
-	e2eReport := runSection("End-to-end (default client config)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, "Note: measures protocol + broker together.")
-	printSection(e2eReport)
 
-	// --- Section 2: Apples-to-apples (one message per round-trip) ---
-	applesCfg := e2eCfg
-	applesCfg.Prefetch = 1
-	applesCfg.KueueBatchSize = 1
-	applesReport := runSection("Apples-to-apples (one message per round-trip)", targetList, applesCfg, *kueueURL, *rabbitMQURI, "Note: isolates broker behavior; not a realistic config for either.")
-	printSection(applesReport)
+	var sections []sectionReport
 
-	// Combined JSON output
+	switch *workload {
+	case "default":
+		e2eCfg := base
+		e2eCfg.Label = "End-to-end (default client config)"
+		sections = append(sections, runSection("End-to-end (default client config)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, "Note: measures protocol + broker together."))
+
+		applesCfg := base
+		applesCfg.Prefetch = 1
+		applesCfg.KueueBatchSize = 1
+		applesCfg.Label = "Apples-to-apples (one message per round-trip)"
+		sections = append(sections, runSection("Apples-to-apples (one message per round-trip)", targetList, applesCfg, *kueueURL, *rabbitMQURI, "Note: isolates broker behavior; not a realistic config for either."))
+
+	case "competing-consumers":
+		cfg := base
+		cfg.Producers = 1
+		cfg.Consumers = 10
+		cfg.VerifyOrder = true
+		cfg.Label = "Competing consumers (1p/10c)"
+		sections = append(sections, runSection("Competing consumers (1p/10c)", targetList, cfg, *kueueURL, *rabbitMQURI, "Note: measures throughput scaling, FIFO ordering, and consumer fairness."))
+
+	case "backlog-drain":
+		cfg := base
+		cfg.Warmup = 0
+		cfg.PreFill = *messages
+		cfg.Label = "Backlog drain"
+		sections = append(sections, runSection("Backlog drain", targetList, cfg, *kueueURL, *rabbitMQURI, "Note: pre-fills queue then measures drain rate and latency under backlog."))
+
+	case "size-sweep":
+		sizes := []int{64, 256, 1024, 4096, 16384}
+		for _, sz := range sizes {
+			cfg := base
+			cfg.PayloadBytes = sz
+			cfg.Label = fmt.Sprintf("Size sweep %dB", sz)
+			sections = append(sections, runSection(fmt.Sprintf("Payload %dB", sz), targetList, cfg, *kueueURL, *rabbitMQURI, ""))
+		}
+
+	case "full":
+		e2eCfg := base
+		e2eCfg.Producers = 1
+		e2eCfg.Consumers = 1
+		e2eCfg.VerifyOrder = true
+		e2eCfg.Label = "Single consumer (1p/1c)"
+		sections = append(sections, runSection("Single consumer (1p/1c)", targetList, e2eCfg, *kueueURL, *rabbitMQURI, ""))
+
+		ccCfg := base
+		ccCfg.Producers = 1
+		ccCfg.Consumers = 10
+		ccCfg.VerifyOrder = true
+		ccCfg.Label = "Competing consumers (1p/10c)"
+		sections = append(sections, runSection("Competing consumers (1p/10c)", targetList, ccCfg, *kueueURL, *rabbitMQURI, ""))
+
+		bdCfg := base
+		bdCfg.Warmup = 0
+		bdCfg.PreFill = *messages
+		bdCfg.Label = "Backlog drain"
+		sections = append(sections, runSection("Backlog drain", targetList, bdCfg, *kueueURL, *rabbitMQURI, "Note: pre-fills queue then measures drain rate and latency under backlog."))
+
+		for _, sz := range []int{64, 256, 1024, 4096, 16384} {
+			cfg := base
+			cfg.Producers = 1
+			cfg.Consumers = 1
+			cfg.PayloadBytes = sz
+			cfg.VerifyOrder = true
+			cfg.Label = fmt.Sprintf("Payload %dB (1p/1c)", sz)
+			sections = append(sections, runSection(fmt.Sprintf("Payload %dB", sz), targetList, cfg, *kueueURL, *rabbitMQURI, ""))
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown workload %q; use one of: default, competing-consumers, backlog-drain, size-sweep, full\n", *workload)
+		os.Exit(1)
+	}
+
+	for _, s := range sections {
+		printSection(s)
+	}
+
 	if *jsonOut != "" {
 		sectionOutput := func(sr sectionReport) map[string]any {
 			return map[string]any{
@@ -150,12 +236,20 @@ func main() {
 				"report": sr.Report,
 			}
 		}
+		outSections := make([]any, len(sections))
+		for i, s := range sections {
+			outSections[i] = sectionOutput(s)
+		}
 		data, err := json.MarshalIndent(map[string]any{
 			"generatedAt": time.Now().UTC(),
-			"sections":    []any{sectionOutput(e2eReport), sectionOutput(applesReport)},
+			"sections":    outSections,
 		}, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "marshal report: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.MkdirAll(filepathDir(*jsonOut), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "create report dir: %v\n", err)
 			os.Exit(1)
 		}
 		if err := os.WriteFile(*jsonOut, data, 0o644); err != nil {
@@ -248,6 +342,10 @@ func validateConfig(cfg workloadConfig) error {
 		return errors.New("consumers must be > 0")
 	case cfg.Prefetch <= 0:
 		return errors.New("prefetch must be > 0")
+	case cfg.RateLimit < 0:
+		return errors.New("rate must be >= 0")
+	case cfg.ConsumerDelayMs < 0:
+		return errors.New("consumer-delay must be >= 0")
 	default:
 		return nil
 	}
@@ -300,14 +398,22 @@ func runTarget(ctx context.Context, target benchmarkTarget, cfg workloadConfig) 
 		summary.Runs = append(summary.Runs, result)
 
 		fmt.Printf(
-			"run %d: publish %.0f msg/s, consume %.0f msg/s, latency p50 %.2f ms, p95 %.2f ms, p99 %.2f ms\n",
+			"run %d: publish %.0f msg/s, consume %.0f msg/s, latency p50 %.2f ms, p95 %.2f ms, p99 %.2f ms, p99.9 %.2f ms",
 			run,
 			result.PublishRate,
 			result.ConsumeRate,
 			result.LatencyP50Ms,
 			result.LatencyP95Ms,
 			result.LatencyP99Ms,
+			result.LatencyP999Ms,
 		)
+		if result.FIFOViolations > 0 {
+			fmt.Printf(", FIFO violations %d", result.FIFOViolations)
+		}
+		if result.Consumers > 1 {
+			fmt.Printf(", fairness std %.1f (%d-%d)", result.ConsumerCountStdDev, result.ConsumerCountMin, result.ConsumerCountMax)
+		}
+		fmt.Println()
 	}
 
 	summary.MedianResult = medianResult(summary.Target, summary.Runs)
@@ -328,14 +434,22 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 	}
 
 	var (
-		latencyMu sync.Mutex
-		latencies []time.Duration
-		seqCh     = make(chan int, messages)
-		produced  atomic.Int64
-		consumed  atomic.Int64
-		firstErr  error
-		errOnce   sync.Once
+		latencyMu      sync.Mutex
+		latencies      []time.Duration
+		produced       atomic.Int64
+		consumed       atomic.Int64
+		firstErr       error
+		errOnce        sync.Once
+		consumerCounts []atomic.Int64
+		fifoViolations atomic.Int64
+		seqCh          chan int
 	)
+
+	consumerCounts = make([]atomic.Int64, cfg.Consumers)
+
+	if cfg.PreFill == 0 {
+		seqCh = make(chan int, messages)
+	}
 
 	recordErr := func(err error) {
 		errOnce.Do(func() {
@@ -343,11 +457,6 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 			cancelRun()
 		})
 	}
-
-	for seq := 0; seq < messages; seq++ {
-		seqCh <- seq
-	}
-	close(seqCh)
 
 	doneCh := make(chan struct{})
 	go func() {
@@ -364,14 +473,64 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 	}()
 	defer close(doneCh)
 
+	if cfg.PreFill > 0 {
+		prefillCtx, prefillCancel := context.WithTimeout(runCtx, 5*time.Minute)
+		prefillDone := make(chan struct{})
+		go func() {
+			defer close(prefillDone)
+			pub, err := target.NewPublisher(0)
+			if err != nil {
+				recordErr(err)
+				return
+			}
+			for seq := 0; seq < cfg.PreFill; seq++ {
+				body, err := makePayload(seq, 0, cfg.PayloadBytes)
+				if err != nil {
+					recordErr(err)
+					return
+				}
+				if err := pub.Publish(prefillCtx, body); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+					recordErr(err)
+					return
+				}
+				produced.Add(1)
+			}
+			if err := pub.Close(); err != nil {
+				recordErr(err)
+			}
+		}()
+		<-prefillDone
+		prefillCancel()
+		if firstErr != nil {
+			return result, firstErr
+		}
+		debugf("pre-filled %d messages, starting consumers", cfg.PreFill)
+	} else {
+		for seq := 0; seq < messages; seq++ {
+			seqCh <- seq
+		}
+		close(seqCh)
+	}
+
+	totalToConsume := messages
+	if cfg.PreFill > 0 {
+		totalToConsume = cfg.PreFill
+	}
+
 	consumeStarted := time.Now()
 	var consumerWG sync.WaitGroup
 	for i := 0; i < cfg.Consumers; i++ {
+		consumerIdx := i
 		consumerWG.Add(1)
 		go func() {
 			defer consumerWG.Done()
+			var lastSeq int = -1
+			lastSeqByProducer := make(map[int]int)
 			for {
-				if consumed.Load() >= int64(messages) {
+				if consumed.Load() >= int64(totalToConsume) {
 					return
 				}
 
@@ -393,6 +552,10 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 					return
 				}
 
+				if cfg.ConsumerDelayMs > 0 {
+					time.Sleep(time.Duration(cfg.ConsumerDelayMs) * time.Millisecond)
+				}
+
 				if err := msg.Ack(runCtx); err != nil {
 					recordErr(err)
 					return
@@ -402,7 +565,26 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 				latencies = append(latencies, latency)
 				latencyMu.Unlock()
 
-				if consumed.Add(1) >= int64(messages) {
+				if cfg.VerifyOrder {
+					var payload benchmarkPayload
+					if jsonErr := json.Unmarshal(msg.Body, &payload); jsonErr == nil {
+						if cfg.Producers == 1 {
+							if lastSeq >= 0 && payload.Seq < lastSeq {
+								fifoViolations.Add(1)
+							}
+							lastSeq = payload.Seq
+						} else {
+							prev, ok := lastSeqByProducer[payload.ProducerID]
+							if ok && payload.Seq < prev {
+								fifoViolations.Add(1)
+							}
+							lastSeqByProducer[payload.ProducerID] = payload.Seq
+						}
+					}
+				}
+
+				consumerCounts[consumerIdx].Add(1)
+				if consumed.Add(1) >= int64(totalToConsume) {
 					cancelConsume()
 					return
 				}
@@ -410,82 +592,124 @@ func executeWorkload(parent context.Context, target benchmarkTarget, cfg workloa
 		}()
 	}
 
-	publishStarted := time.Now()
-	var producerWG sync.WaitGroup
-	for i := 0; i < cfg.Producers; i++ {
-		pub, err := target.NewPublisher(i)
-		if err != nil {
-			cancelRun()
-			consumerWG.Wait()
-			return result, err
-		}
+	if cfg.PreFill == 0 {
+		publishStarted := time.Now()
+		var producerWG sync.WaitGroup
+		for i := 0; i < cfg.Producers; i++ {
+			pub, err := target.NewPublisher(i)
+			if err != nil {
+				cancelRun()
+				consumerWG.Wait()
+				return result, err
+			}
 
-		producerWG.Add(1)
-		go func(p publisher) {
-			defer producerWG.Done()
-			defer p.Close()
-
-			for seq := range seqCh {
-				body, err := makePayload(seq, cfg.PayloadBytes)
-				if err != nil {
+			producerID := i
+			producerWG.Add(1)
+			go func(p publisher, pid int) {
+				defer producerWG.Done()
+				defer func() {
+				if err := p.Close(); err != nil {
 					recordErr(err)
-					return
+				}
+			}()
+
+				var rateLimiter *time.Ticker
+				if cfg.RateLimit > 0 {
+					perProducerRate := float64(cfg.RateLimit) / float64(cfg.Producers)
+					interval := time.Duration(float64(time.Second) / perProducerRate)
+					rateLimiter = time.NewTicker(interval)
+					defer rateLimiter.Stop()
 				}
 
-				if err := p.Publish(runCtx, body); err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				for seq := range seqCh {
+					if rateLimiter != nil {
+						select {
+						case <-rateLimiter.C:
+						case <-runCtx.Done():
+							return
+						}
+					}
+
+					body, err := makePayload(seq, pid, cfg.PayloadBytes)
+					if err != nil {
+						recordErr(err)
 						return
 					}
-					recordErr(err)
-					return
-				}
 
-				produced.Add(1)
-			}
-		}(pub)
+					if err := p.Publish(runCtx, body); err != nil {
+						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+							return
+						}
+						recordErr(err)
+						return
+					}
+
+					produced.Add(1)
+				}
+			}(pub, producerID)
+		}
+
+		producerWG.Wait()
+		result.PublishSeconds = time.Since(publishStarted).Seconds()
 	}
 
-	producerWG.Wait()
-	publishDone := time.Now()
-
 	consumerWG.Wait()
-	consumeDone := time.Now()
+	consumeDone := time.Since(consumeStarted)
 
 	if firstErr != nil {
 		return result, firstErr
 	}
-	if produced.Load() != int64(messages) {
-		return result, fmt.Errorf("published %d/%d messages", produced.Load(), messages)
+	msgCount := int64(messages)
+	if cfg.PreFill > 0 {
+		msgCount = int64(totalToConsume)
 	}
-	if consumed.Load() != int64(messages) {
-		return result, fmt.Errorf("consumed %d/%d messages", consumed.Load(), messages)
+	if produced.Load() != msgCount && cfg.PreFill == 0 {
+		return result, fmt.Errorf("published %d/%d messages", produced.Load(), msgCount)
 	}
-	if len(latencies) != messages {
-		return result, fmt.Errorf("recorded %d/%d latencies", len(latencies), messages)
+	if consumed.Load() != msgCount {
+		return result, fmt.Errorf("consumed %d/%d messages", consumed.Load(), msgCount)
+	}
+	expectedLatencies := int(messages)
+	if cfg.PreFill > 0 {
+		expectedLatencies = totalToConsume
+	}
+	if len(latencies) != expectedLatencies {
+		return result, fmt.Errorf("recorded %d/%d latencies", len(latencies), expectedLatencies)
 	}
 
 	sort.Slice(latencies, func(i, j int) bool {
 		return latencies[i] < latencies[j]
 	})
 
-	result.PublishSeconds = publishDone.Sub(publishStarted).Seconds()
-	result.ConsumeSeconds = consumeDone.Sub(consumeStarted).Seconds()
-	result.EndToEndSeconds = consumeDone.Sub(publishStarted).Seconds()
-	result.PublishRate = float64(messages) / result.PublishSeconds
-	result.ConsumeRate = float64(messages) / result.ConsumeSeconds
+	result.ConsumeSeconds = consumeDone.Seconds()
+	result.EndToEndSeconds = consumeDone.Seconds()
+	if cfg.PreFill == 0 && result.PublishSeconds > 0 {
+		result.PublishRate = float64(messages) / result.PublishSeconds
+	}
+	result.ConsumeRate = float64(msgCount) / result.ConsumeSeconds
 	result.LatencyP50Ms = percentileMs(latencies, 0.50)
 	result.LatencyP95Ms = percentileMs(latencies, 0.95)
 	result.LatencyP99Ms = percentileMs(latencies, 0.99)
+	result.LatencyP999Ms = percentileMs(latencies, 0.999)
 	result.LatencyMaxMs = latencyToMs(latencies[len(latencies)-1])
 	result.PublishedMessages = produced.Load()
 	result.ConsumedMessages = consumed.Load()
+	result.FIFOViolations = int(fifoViolations.Load())
+
+	counts := make([]int64, cfg.Consumers)
+	for i := range consumerCounts {
+		counts[i] = consumerCounts[i].Load()
+	}
+	result.ConsumerCountMin, result.ConsumerCountMax = minMaxInt64(counts)
+	result.ConsumerCountStdDev = stdDevInt64(counts)
 
 	return result, nil
 }
 
-func makePayload(seq, payloadBytes int) ([]byte, error) {
+func makePayload(seq, producerID, payloadBytes int) ([]byte, error) {
 	payload := benchmarkPayload{
 		Seq:            seq,
+		ProducerID:     producerID,
 		SentAtUnixNano: time.Now().UnixNano(),
 	}
 
@@ -546,29 +770,67 @@ func latencyToMs(value time.Duration) float64 {
 	return float64(value) / float64(time.Millisecond)
 }
 
+func minMaxInt64(vals []int64) (int64, int64) {
+	if len(vals) == 0 {
+		return 0, 0
+	}
+	minVal, maxVal := vals[0], vals[0]
+	for _, v := range vals[1:] {
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	return minVal, maxVal
+}
+
+func stdDevInt64(vals []int64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range vals {
+		sum += float64(v)
+	}
+	mean := sum / float64(len(vals))
+	var sumSqDiff float64
+	for _, v := range vals {
+		diff := float64(v) - mean
+		sumSqDiff += diff * diff
+	}
+	return math.Sqrt(sumSqDiff / float64(len(vals)))
+}
+
 func medianResult(target string, runs []benchmarkResult) benchmarkResult {
 	if len(runs) == 0 {
 		return benchmarkResult{Target: target}
 	}
 
 	return benchmarkResult{
-		Target:            target,
-		Run:               0,
-		Messages:          runs[0].Messages,
-		PayloadBytes:      runs[0].PayloadBytes,
-		Producers:         runs[0].Producers,
-		Consumers:         runs[0].Consumers,
-		PublishSeconds:    medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.PublishSeconds })),
-		ConsumeSeconds:    medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumeSeconds })),
-		EndToEndSeconds:   medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.EndToEndSeconds })),
-		PublishRate:       medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.PublishRate })),
-		ConsumeRate:       medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumeRate })),
-		LatencyP50Ms:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP50Ms })),
-		LatencyP95Ms:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP95Ms })),
-		LatencyP99Ms:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP99Ms })),
-		LatencyMaxMs:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyMaxMs })),
-		PublishedMessages: runs[0].PublishedMessages,
-		ConsumedMessages:  runs[0].ConsumedMessages,
+		Target:              target,
+		Run:                 0,
+		Messages:            runs[0].Messages,
+		PayloadBytes:        runs[0].PayloadBytes,
+		Producers:           runs[0].Producers,
+		Consumers:           runs[0].Consumers,
+		PublishSeconds:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.PublishSeconds })),
+		ConsumeSeconds:      medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumeSeconds })),
+		EndToEndSeconds:     medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.EndToEndSeconds })),
+		PublishRate:         medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.PublishRate })),
+		ConsumeRate:         medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumeRate })),
+		LatencyP50Ms:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP50Ms })),
+		LatencyP95Ms:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP95Ms })),
+		LatencyP99Ms:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP99Ms })),
+		LatencyP999Ms:       medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyP999Ms })),
+		LatencyMaxMs:        medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.LatencyMaxMs })),
+		PublishedMessages:   int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.PublishedMessages) }))),
+		ConsumedMessages:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumedMessages) }))),
+		FIFOViolations:      int(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.FIFOViolations) }))),
+		ConsumerCountStdDev: medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return r.ConsumerCountStdDev })),
+		ConsumerCountMin:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumerCountMin) }))),
+		ConsumerCountMax:    int64(medianFloat(extractMetric(runs, func(r benchmarkResult) float64 { return float64(r.ConsumerCountMax) }))),
 	}
 }
 
@@ -590,18 +852,33 @@ func medianFloat(values []float64) float64 {
 
 func printReport(report benchmarkReport) {
 	fmt.Println("\n== Summary ==")
-	fmt.Printf("%-10s %-12s %-12s %-12s %-12s %-12s\n", "target", "pub msg/s", "con msg/s", "p50 ms", "p95 ms", "p99 ms")
+	fmt.Printf("%-10s %-12s %-12s %-10s %-10s %-10s %-10s %-12s\n", "target", "pub msg/s", "con msg/s", "p50 ms", "p95 ms", "p99 ms", "p99.9 ms", "max ms")
 	for _, summary := range report.Summaries {
 		median := summary.MedianResult
 		fmt.Printf(
-			"%-10s %-12.0f %-12.0f %-12.2f %-12.2f %-12.2f\n",
+			"%-10s %-12.0f %-12.0f %-10.2f %-10.2f %-10.2f %-10.2f %-12.2f\n",
 			summary.Target,
 			median.PublishRate,
 			median.ConsumeRate,
 			median.LatencyP50Ms,
 			median.LatencyP95Ms,
 			median.LatencyP99Ms,
+			median.LatencyP999Ms,
+			median.LatencyMaxMs,
 		)
+	}
+	for _, summary := range report.Summaries {
+		median := summary.MedianResult
+		extras := []string{}
+		if median.FIFOViolations > 0 {
+			extras = append(extras, fmt.Sprintf("FIFO violations: %d", median.FIFOViolations))
+		}
+		if median.Consumers > 1 {
+			extras = append(extras, fmt.Sprintf("consumer fairness: std=%.1f range=[%d,%d]", median.ConsumerCountStdDev, median.ConsumerCountMin, median.ConsumerCountMax))
+		}
+		if len(extras) > 0 {
+			fmt.Printf("  %s: %s\n", summary.Target, strings.Join(extras, ", "))
+		}
 	}
 }
 
@@ -1008,8 +1285,7 @@ func (p *kueuePublisher) Flush(ctx context.Context) error {
 func (p *kueuePublisher) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = p.Flush(ctx)
-	return nil
+	return p.Flush(ctx)
 }
 
 func (t *kueueTarget) receive(ctx context.Context, wait bool) (*delivery, error) {
