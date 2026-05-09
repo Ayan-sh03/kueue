@@ -1,97 +1,210 @@
 {
-  "generatedAt": "2026-04-24T18:04:15.489277133Z",
-  "workload": {
-    "messages": 2000,
-    "warmup": 500,
-    "runs": 3,
-    "payloadBytes": 256,
-    "producers": 1,
-    "consumers": 1,
-    "prefetch": 200,
-    "targets": [
-      "kueue"
-    ]
-  },
-  "summaries": [
+  "generatedAt": "2026-05-03T11:14:54.7075467Z",
+  "sections": [
     {
-      "target": "kueue",
-      "runs": [
-        {
-          "target": "kueue",
-          "run": 1,
-          "messages": 2000,
+      "label": "End-to-end (default client config)",
+      "note": "Note: measures protocol + broker together.",
+      "report": {
+        "generatedAt": "2026-05-03T11:14:32.0241656Z",
+        "workload": {
+          "messages": 10000,
+          "warmup": 500,
+          "runs": 3,
           "payloadBytes": 256,
           "producers": 1,
-          "consumers": 1,
-          "publishSeconds": 4.002623865,
-          "consumeSeconds": 19.803585858,
-          "endToEndSeconds": 19.803578405,
-          "publishRate": 499.6722318798246,
-          "consumeRate": 100.99181099528323,
-          "latencyP50Ms": 5489.499827,
-          "latencyP95Ms": 15182.132335,
-          "latencyP99Ms": 15693.026536,
-          "latencyMaxMs": 15802.032209,
-          "publishedMessages": 2000,
-          "consumedMessages": 2000
+          "consumers": 10,
+          "prefetch": 10,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 10
         },
-        {
-          "target": "kueue",
-          "run": 2,
-          "messages": 2000,
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.3086904,
+                "consumeSeconds": 1.2558478,
+                "endToEndSeconds": 1.2558478,
+                "publishRate": 32394.91736704478,
+                "consumeRate": 7962.748352149042,
+                "latencyP50Ms": 381.8388,
+                "latencyP95Ms": 918.6113,
+                "latencyP99Ms": 943.2155,
+                "latencyMaxMs": 948.2931,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              },
+              {
+                "target": "kueue",
+                "run": 2,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.2962389,
+                "consumeSeconds": 1.1585134,
+                "endToEndSeconds": 1.1585134,
+                "publishRate": 33756.53906357335,
+                "consumeRate": 8631.751691434903,
+                "latencyP50Ms": 401.6399,
+                "latencyP95Ms": 811.3022,
+                "latencyP99Ms": 850.6477,
+                "latencyMaxMs": 862.7851,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              },
+              {
+                "target": "kueue",
+                "run": 3,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.324555,
+                "consumeSeconds": 1.26006,
+                "endToEndSeconds": 1.26006,
+                "publishRate": 30811.418711774586,
+                "consumeRate": 7936.130025554339,
+                "latencyP50Ms": 492.2395,
+                "latencyP95Ms": 911.9092,
+                "latencyP99Ms": 930.3302,
+                "latencyMaxMs": 936.5259,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 10000,
+              "payloadBytes": 256,
+              "producers": 1,
+              "consumers": 10,
+              "publishSeconds": 0.3086904,
+              "consumeSeconds": 1.2558478,
+              "endToEndSeconds": 1.2558478,
+              "publishRate": 32394.91736704478,
+              "consumeRate": 7962.748352149042,
+              "latencyP50Ms": 401.6399,
+              "latencyP95Ms": 911.9092,
+              "latencyP99Ms": 930.3302,
+              "latencyMaxMs": 936.5259,
+              "publishedMessages": 10000,
+              "consumedMessages": 10000
+            }
+          }
+        ]
+      }
+    },
+    {
+      "label": "Apples-to-apples (one message per round-trip)",
+      "note": "Note: isolates broker behavior; not a realistic config for either.",
+      "report": {
+        "generatedAt": "2026-05-03T11:14:35.8742146Z",
+        "workload": {
+          "messages": 10000,
+          "warmup": 500,
+          "runs": 3,
           "payloadBytes": 256,
           "producers": 1,
-          "consumers": 1,
-          "publishSeconds": 4.417091477,
-          "consumeSeconds": 22.316460622,
-          "endToEndSeconds": 22.316456675,
-          "publishRate": 452.78663808845545,
-          "consumeRate": 89.6199461857478,
-          "latencyP50Ms": 5909.815346,
-          "latencyP95Ms": 17107.655915,
-          "latencyP99Ms": 17717.944259,
-          "latencyMaxMs": 17898.608844,
-          "publishedMessages": 2000,
-          "consumedMessages": 2000
+          "consumers": 10,
+          "prefetch": 1,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 1
         },
-        {
-          "target": "kueue",
-          "run": 3,
-          "messages": 2000,
-          "payloadBytes": 256,
-          "producers": 1,
-          "consumers": 1,
-          "publishSeconds": 4.588714568,
-          "consumeSeconds": 19.849499459,
-          "endToEndSeconds": 19.849491414,
-          "publishRate": 435.85190805879733,
-          "consumeRate": 100.75820824253461,
-          "latencyP50Ms": 7082.092396,
-          "latencyP95Ms": 14493.668731,
-          "latencyP99Ms": 15188.046023,
-          "latencyMaxMs": 15288.466731,
-          "publishedMessages": 2000,
-          "consumedMessages": 2000
-        }
-      ],
-      "medianResult": {
-        "target": "kueue",
-        "run": 0,
-        "messages": 2000,
-        "payloadBytes": 256,
-        "producers": 1,
-        "consumers": 1,
-        "publishSeconds": 4.417091477,
-        "consumeSeconds": 19.849499459,
-        "endToEndSeconds": 19.849491414,
-        "publishRate": 452.78663808845545,
-        "consumeRate": 100.75820824253461,
-        "latencyP50Ms": 5909.815346,
-        "latencyP95Ms": 15182.132335,
-        "latencyP99Ms": 15693.026536,
-        "latencyMaxMs": 15802.032209,
-        "publishedMessages": 2000,
-        "consumedMessages": 2000
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.3248734,
+                "consumeSeconds": 6.5303534,
+                "endToEndSeconds": 6.5303534,
+                "publishRate": 30781.221238796406,
+                "consumeRate": 1531.310694456444,
+                "latencyP50Ms": 2645.7073,
+                "latencyP95Ms": 6047.4474,
+                "latencyP99Ms": 6172.4248,
+                "latencyMaxMs": 6206.6742,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              },
+              {
+                "target": "kueue",
+                "run": 2,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.3069433,
+                "consumeSeconds": 6.1948172,
+                "endToEndSeconds": 6.1948172,
+                "publishRate": 32579.30699252924,
+                "consumeRate": 1614.2526368655397,
+                "latencyP50Ms": 2725.0995,
+                "latencyP95Ms": 5470.386,
+                "latencyP99Ms": 5807.9717,
+                "latencyMaxMs": 5888.4207,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              },
+              {
+                "target": "kueue",
+                "run": 3,
+                "messages": 10000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 10,
+                "publishSeconds": 0.2258177,
+                "consumeSeconds": 5.6919217,
+                "endToEndSeconds": 5.6919217,
+                "publishRate": 44283.508334377686,
+                "consumeRate": 1756.8758895611652,
+                "latencyP50Ms": 2568.228,
+                "latencyP95Ms": 5214.6165,
+                "latencyP99Ms": 5407.5983,
+                "latencyMaxMs": 5466.8931,
+                "publishedMessages": 10000,
+                "consumedMessages": 10000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 10000,
+              "payloadBytes": 256,
+              "producers": 1,
+              "consumers": 10,
+              "publishSeconds": 0.3069433,
+              "consumeSeconds": 6.1948172,
+              "endToEndSeconds": 6.1948172,
+              "publishRate": 32579.30699252924,
+              "consumeRate": 1614.2526368655397,
+              "latencyP50Ms": 2645.7073,
+              "latencyP95Ms": 5470.386,
+              "latencyP99Ms": 5807.9717,
+              "latencyMaxMs": 5888.4207,
+              "publishedMessages": 10000,
+              "consumedMessages": 10000
+            }
+          }
+        ]
       }
     }
   ]

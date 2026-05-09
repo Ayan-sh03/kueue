@@ -17,7 +17,7 @@ jobs:
       - name: Start kueue server
         run: |
           go build -o kueue .
-          PORT=8080 KUEUE_DB_PATH=$(mktemp -d) KUEUE_SYNC_WRITES=false ./kueue &>/tmp/kueue.log &
+          PORT=8080 KUEUE_DB_PATH=$(mktemp -d) ./kueue &>/tmp/kueue.log &
           echo "Server PID: $!"
 
           # Wait until port 8080 is accepting connections

@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/google/uuid"
 )
 
@@ -83,12 +83,13 @@ type Queue struct {
 	MaxRetries int       `json:"maxRetries"`
 }
 
-var Db *badger.DB
+var Db *pebble.DB
 
 var Queues []Queue
 var DeadLetterQueue []Message
 
 var messageKeyCache sync.Map // key: receiptHandle -> value: []byte (message key)
+var claimMu sync.Mutex
 
 func cacheMessageKey(receiptHandle string, key []byte) {
 	messageKeyCache.Store(receiptHandle, append([]byte(nil), key...))
@@ -168,37 +169,32 @@ func getOrCreateMetrics(queueID string) *queueMetrics {
 
 func reconcileMetricsFromDB(queueID string, m *queueMetrics) error {
 	var ready, inFlight, dead int64
-	err := Db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
-		opts.Prefix = queueMessagePrefix(queueID)
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			if err := item.Value(func(v []byte) error {
-				var msg Message
-				if err := json.Unmarshal(v, &msg); err != nil {
-					return err
-				}
-				switch msg.State {
-				case StateReady:
-					ready++
-				case StateInFlight:
-					inFlight++
-				case StateDead:
-					dead++
-				}
-				return nil
-			}); err != nil {
-				log.Printf("reconcileMetricsFromDB: error reading message in queue %s: %v", queueID, err)
-				return err
-			}
-		}
-		return nil
+	prefix := queueMessagePrefix(queueID)
+	snap := Db.NewSnapshot()
+	defer snap.Close()
+	iter, _ := snap.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
 	})
-	if err != nil {
-		return err
+	defer iter.Close()
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			log.Printf("reconcileMetricsFromDB: error reading message in queue %s: %v", queueID, err)
+			return err
+		}
+		var msg Message
+		if err := json.Unmarshal(val, &msg); err != nil {
+			return err
+		}
+		switch msg.State {
+		case StateReady:
+			ready++
+		case StateInFlight:
+			inFlight++
+		case StateDead:
+			dead++
+		}
 	}
 	snapshotMax(&m.readyCount, ready)
 	snapshotMax(&m.inFlightCount, inFlight)
@@ -247,35 +243,69 @@ func queueSequenceKey(queueID string) []byte {
 	return []byte("seq:" + queueID)
 }
 
+var seqMu sync.Mutex
+
 func nextMessageSequence(queueID string) (uint64, error) {
-	seq, err := Db.GetSequence(queueSequenceKey(queueID), 1)
-	if err != nil {
+	seqMu.Lock()
+	defer seqMu.Unlock()
+
+	key := queueSequenceKey(queueID)
+	val, closer, err := Db.Get(key)
+	var current uint64
+	if err == pebble.ErrNotFound {
+		current = 0
+	} else if err != nil {
+		return 0, err
+	} else {
+		current = binary.BigEndian.Uint64(val)
+		closer.Close()
+	}
+	next := current + 1
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], next)
+	if err := Db.Set(key, buf[:], pebble.NoSync); err != nil {
 		return 0, err
 	}
-	defer seq.Release()
-
-	return seq.Next()
+	return next, nil
 }
 
 func nextMessageSequenceN(queueID string, n int) ([]uint64, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	seq, err := Db.GetSequence(queueSequenceKey(queueID), uint64(n))
-	if err != nil {
+	seqMu.Lock()
+	defer seqMu.Unlock()
+
+	key := queueSequenceKey(queueID)
+	val, closer, err := Db.Get(key)
+	var current uint64
+	if err == pebble.ErrNotFound {
+		current = 0
+	} else if err != nil {
 		return nil, err
+	} else {
+		current = binary.BigEndian.Uint64(val)
+		closer.Close()
 	}
-	defer seq.Release()
 
 	seqs := make([]uint64, n)
 	for i := 0; i < n; i++ {
-		s, err := seq.Next()
-		if err != nil {
-			return nil, err
-		}
-		seqs[i] = s
+		current++
+		seqs[i] = current
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], current)
+	if err := Db.Set(key, buf[:], pebble.NoSync); err != nil {
+		return nil, err
 	}
 	return seqs, nil
+}
+
+func prefixUpperBound(prefix []byte) []byte {
+	upper := make([]byte, len(prefix)+1)
+	copy(upper, prefix)
+	upper[len(prefix)] = 0xFF
+	return upper
 }
 
 const readyKeySep = "|"
@@ -370,19 +400,19 @@ func inflightScanUpperBound(now time.Time) []byte {
 	return key
 }
 
-func setInflightIndex(txn *badger.Txn, queueID string, msg Message, msgKey []byte) error {
+func setInflightIndex(batch *pebble.Batch, queueID string, msg Message, msgKey []byte) error {
 	if msg.VisibilityDeadline.IsZero() {
 		return nil
 	}
-	return txn.Set(inflightKey(queueID, msg.VisibilityDeadline, msg.ID), msgKey)
+	return batch.Set(inflightKey(queueID, msg.VisibilityDeadline, msg.ID), msgKey, nil)
 }
 
-func deleteInflightIndex(txn *badger.Txn, queueID string, msg Message) error {
+func deleteInflightIndex(batch *pebble.Batch, queueID string, msg Message) error {
 	if msg.VisibilityDeadline.IsZero() || msg.ID == "" {
 		return nil
 	}
-	err := txn.Delete(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
-	if err == badger.ErrKeyNotFound {
+	err := batch.Delete(inflightKey(queueID, msg.VisibilityDeadline, msg.ID), nil)
+	if err == pebble.ErrNotFound {
 		return nil
 	}
 	return err
@@ -429,55 +459,45 @@ func readyPartsFromKey(key, prefix []byte) (uint64, []byte, error) {
 	return binary.BigEndian.Uint64(rest[:8]), rest[9:], nil
 }
 
-func findMessageRecord(txn *badger.Txn, queueID, messageID string) ([]byte, *Message, error) {
-	opts := badger.DefaultIteratorOptions
-	opts.PrefetchValues = true
-	opts.Prefix = queueMessagePrefix(queueID)
-	it := txn.NewIterator(opts)
-	defer it.Close()
+func findMessageRecord(queueID, messageID string) ([]byte, *Message, error) {
+	prefix := queueMessagePrefix(queueID)
+	iter, _ := Db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	defer iter.Close()
 
-	for it.Rewind(); it.Valid(); it.Next() {
-		item := it.Item()
-		var found *Message
-
-		err := item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
-			if msg.ID != messageID {
-				return nil
-			}
-
-			found = &msg
-			return nil
-		})
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		val, err := iter.ValueAndErr()
 		if err != nil {
 			return nil, nil, err
 		}
-		if found != nil {
-			return item.KeyCopy(nil), found, nil
+		var msg Message
+		if err := json.Unmarshal(val, &msg); err != nil {
+			return nil, nil, err
+		}
+		if msg.ID == messageID {
+			return append([]byte(nil), iter.Key()...), &msg, nil
 		}
 	}
 
-	return nil, nil, badger.ErrKeyNotFound
+	return nil, nil, pebble.ErrNotFound
 }
 
-func messageByReceiptHandle(txn *badger.Txn, queueID, receiptHandle string) ([]byte, *Message, error) {
+func messageByReceiptHandle(batch *pebble.Batch, queueID, receiptHandle string) ([]byte, *Message, error) {
 	key, err := messageKeyFromReceiptHandle(queueID, receiptHandle)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	item, err := txn.Get(key)
+	val, closer, err := batch.Get(key)
 	if err != nil {
 		return nil, nil, err
 	}
+	defer closer.Close()
 
 	var msg Message
-	if err := item.Value(func(v []byte) error {
-		return json.Unmarshal(v, &msg)
-	}); err != nil {
+	if err := json.Unmarshal(val, &msg); err != nil {
 		return nil, nil, err
 	}
 
@@ -571,13 +591,18 @@ func create(w http.ResponseWriter, r *http.Request) {
 		MaxRetries: publishRequest.MaxRetries,
 	}
 
-	err = Db.Update(func(txn *badger.Txn) error {
+	err = func() error {
+		batch := Db.NewIndexedBatch()
+		defer batch.Close()
 		config, err := json.Marshal(QueueConfig{Name: queue.Name, MaxRetries: queue.MaxRetries})
 		if err != nil {
 			return err
 		}
-		return txn.Set([]byte(queue.Id), config)
-	})
+		if err := batch.Set([]byte(queue.Id), config, nil); err != nil {
+			return err
+		}
+		return batch.Commit(pebble.NoSync)
+	}()
 	if err != nil {
 		http.Error(w, "Failed to create queue: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -610,27 +635,9 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 
 	//get from db
 
-	err := Db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(id))
-		if err != nil {
-			return err
-		}
-		return item.Value(func(val []byte) error {
-			var config QueueConfig
-			if err := json.Unmarshal(val, &config); err != nil {
-				return err
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(map[string]any{
-				"id":   id,
-				"name": config.Name,
-			})
-			return nil
-		})
-	})
+	val, closer, err := Db.Get([]byte(id))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 			return
 		}
@@ -638,6 +645,18 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer closer.Close()
+	var config QueueConfig
+	if err := json.Unmarshal(val, &config); err != nil {
+		http.Error(w, "Error decoding queue config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":   id,
+		"name": config.Name,
+	})
 
 }
 
@@ -656,23 +675,21 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 	queueId := message.QueueId
 	var queueConfig QueueConfig
-	err = Db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(queueId))
-		if err != nil {
-			return err
-		}
-		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &queueConfig)
-		})
-	})
+	val, closer, err := Db.Get([]byte(queueId))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
 			return
 		}
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := json.Unmarshal(val, &queueConfig); err != nil {
+		http.Error(w, "Error decoding queue: "+err.Error(), http.StatusInternalServerError)
+		closer.Close()
+		return
+	}
+	closer.Close()
 
 	// push to queue and return id
 	seq, err := nextMessageSequence(queueId)
@@ -692,14 +709,19 @@ func publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = Db.Update(func(txn *badger.Txn) error {
-		msgKey := messageKey(queueId, seq, message.Message.ID)
-		if err := txn.Set(msgKey, messageJson); err != nil {
+	msgKey := messageKey(queueId, seq, message.Message.ID)
+	err = func() error {
+		batch := Db.NewIndexedBatch()
+		defer batch.Close()
+		if err := batch.Set(msgKey, messageJson, nil); err != nil {
 			return err
 		}
 		cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
-		return txn.Set(readyKey(queueId, seq, message.Message.ID), readyValue(msgKey))
-	})
+		if err := batch.Set(readyKey(queueId, seq, message.Message.ID), readyValue(msgKey), nil); err != nil {
+			return err
+		}
+		return batch.Commit(pebble.NoSync)
+	}()
 	if err != nil {
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -751,23 +773,21 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var queueConfig QueueConfig
-	err := Db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(req.QueueId))
-		if err != nil {
-			return err
-		}
-		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &queueConfig)
-		})
-	})
+	val, closer, err := Db.Get([]byte(req.QueueId))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+req.QueueId, http.StatusNotFound)
 			return
 		}
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if err := json.Unmarshal(val, &queueConfig); err != nil {
+		http.Error(w, "Error decoding queue: "+err.Error(), http.StatusInternalServerError)
+		closer.Close()
+		return
+	}
+	closer.Close()
 
 	ids := make([]string, len(req.Messages))
 	now := time.Now()
@@ -778,31 +798,33 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = Db.Update(func(txn *badger.Txn) error {
-		for i, msg := range req.Messages {
-			msg.ID = uuid.NewString()
-			msg.State = StateReady
-			msg.EnqueuedAt = now
-			msg.MaxDeliveryCount = queueConfig.MaxRetries
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
+	for i, msg := range req.Messages {
+		msg.ID = uuid.NewString()
+		msg.State = StateReady
+		msg.EnqueuedAt = now
+		msg.MaxDeliveryCount = queueConfig.MaxRetries
 
-			msgJson, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-
-			msgKey := messageKey(req.QueueId, seqs[i], msg.ID)
-			if err := txn.Set(msgKey, msgJson); err != nil {
-				return err
-			}
-			cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
-			if err := txn.Set(readyKey(req.QueueId, seqs[i], msg.ID), readyValue(msgKey)); err != nil {
-				return err
-			}
-			ids[i] = msg.ID
+		msgJson, err := json.Marshal(msg)
+		if err != nil {
+			http.Error(w, "Error encoding message: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
-		return nil
-	})
-	if err != nil {
+
+		msgKey := messageKey(req.QueueId, seqs[i], msg.ID)
+		if err := batch.Set(msgKey, msgJson, nil); err != nil {
+			http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
+		if err := batch.Set(readyKey(req.QueueId, seqs[i], msg.ID), readyValue(msgKey), nil); err != nil {
+			http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		ids[i] = msg.ID
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -820,7 +842,7 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 
 // claimNextReadyMessage seeks the first ready pointer for the queue,
 // reads the corresponding message, atomically transitions it to StateInFlight,
-// and deletes the ready pointer — all in a single Db.Update transaction.
+// and deletes the ready pointer — all in a single IndexedBatch commit.
 // Returns ErrNoReadyMessages if no ready messages are available.
 func claimNextReadyMessage(queueId string) (*claimedMessage, error) {
 	msgs, err := claimReadyMessages(queueId, 1)
@@ -831,98 +853,106 @@ func claimNextReadyMessage(queueId string) (*claimedMessage, error) {
 }
 
 func claimReadyMessages(queueId string, max int) ([]claimedMessage, error) {
+	claimMu.Lock()
+	defer claimMu.Unlock()
 	var claimed []claimedMessage
-	err := Db.Update(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		prefix := readyPrefix(queueId)
-		opts.Prefix = prefix
-		it := txn.NewIterator(opts)
-		defer it.Close()
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
 
-		for it.Rewind(); it.Valid() && len(claimed) < max; it.Next() {
-			item := it.Item()
-			rKey := item.KeyCopy(nil)
-			_, msgID, err := readyPartsFromKey(rKey, prefix)
-			if err != nil {
-				return fmt.Errorf("parse ready key: %w", err)
-			}
+	prefix := readyPrefix(queueId)
+	iter, _ := batch.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	defer iter.Close()
 
-			var msgKey []byte
-			if err := item.Value(func(v []byte) error {
-				var err error
-				msgKey, err = parseReadyValue(v)
-				return err
-			}); err != nil {
-				return fmt.Errorf("parse ready value: %w", err)
-			}
-			msgItem, err := txn.Get(msgKey)
-			if err != nil {
-				if err == badger.ErrKeyNotFound {
-					readySeq, _, parseErr := readyPartsFromKey(rKey, prefix)
-					if parseErr != nil {
-						return fmt.Errorf("parse ready key fallback: %w", parseErr)
+	for iter.SeekGE(prefix); iter.Valid() && len(claimed) < max; iter.Next() {
+		rKey := append([]byte(nil), iter.Key()...)
+		_, msgID, err := readyPartsFromKey(rKey, prefix)
+		if err != nil {
+			return nil, fmt.Errorf("parse ready key: %w", err)
+		}
+
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			return nil, fmt.Errorf("read ready value: %w", err)
+		}
+		msgKey, err := parseReadyValue(val)
+		if err != nil {
+			return nil, fmt.Errorf("parse ready value: %w", err)
+		}
+
+		msgVal, closer, err := batch.Get(msgKey)
+		if err != nil {
+			if err == pebble.ErrNotFound {
+				readySeq, _, parseErr := readyPartsFromKey(rKey, prefix)
+				if parseErr != nil {
+					return nil, fmt.Errorf("parse ready key fallback: %w", parseErr)
+				}
+				msgKey = messageKeyBytes(queueId, readySeq, msgID)
+				msgVal, closer, err = batch.Get(msgKey)
+				if err == pebble.ErrNotFound {
+					if delErr := batch.Delete(rKey, nil); delErr != nil {
+						return nil, fmt.Errorf("delete stale ready pointer %x: %w", rKey, delErr)
 					}
-					msgKey = messageKeyBytes(queueId, readySeq, msgID)
-					msgItem, err = txn.Get(msgKey)
-					if err == badger.ErrKeyNotFound {
-						if err := txn.Delete(rKey); err != nil {
-							return fmt.Errorf("delete stale ready pointer %x: %w", rKey, err)
-						}
-						continue
-					}
+					continue
 				}
 				if err != nil {
-					return fmt.Errorf("get message for ready key: %w", err)
+					return nil, fmt.Errorf("get message for ready key: %w", err)
 				}
+			} else {
+				return nil, fmt.Errorf("get message for ready key: %w", err)
 			}
-
-			var msg Message
-			if err := msgItem.Value(func(v []byte) error {
-				return json.Unmarshal(v, &msg)
-			}); err != nil {
-				return fmt.Errorf("unmarshal message: %w", err)
-			}
-
-			if msg.State != StateReady {
-				txn.Delete(rKey)
-				continue
-			}
-
-			if err := txn.Delete(rKey); err != nil {
-				return fmt.Errorf("delete ready key: %w", err)
-			}
-
-			msg.State = StateInFlight
-			msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
-			msg.DeliveryCount++
-			msg.DeliveryAttemptID = uuid.NewString()
-
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return fmt.Errorf("marshal claimed message: %w", err)
-			}
-			if err := txn.Set(msgKey, updated); err != nil {
-				return fmt.Errorf("set claimed message: %w", err)
-			}
-			if err := setInflightIndex(txn, queueId, msg, msgKey); err != nil {
-				return fmt.Errorf("set in-flight index: %w", err)
-			}
-
-			receiptHandle := receiptHandleForMessageKey(msgKey)
-			cacheMessageKey(receiptHandle, msgKey)
-			claimed = append(claimed, claimedMessage{
-				Message:       msg,
-				ReceiptHandle: receiptHandle,
-			})
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+
+		var msg Message
+		if err := json.Unmarshal(msgVal, &msg); err != nil {
+			closer.Close()
+			return nil, fmt.Errorf("unmarshal message: %w", err)
+		}
+		closer.Close()
+
+		if msg.State != StateReady {
+			batch.Delete(rKey, nil)
+			continue
+		}
+
+		if err := batch.Delete(rKey, nil); err != nil {
+			return nil, fmt.Errorf("delete ready key: %w", err)
+		}
+
+		msg.State = StateInFlight
+		msg.VisibilityDeadline = time.Now().Add(30 * time.Second)
+		msg.DeliveryCount++
+		msg.DeliveryAttemptID = uuid.NewString()
+
+		updated, err := json.Marshal(msg)
+		if err != nil {
+			return nil, fmt.Errorf("marshal claimed message: %w", err)
+		}
+		if err := batch.Set(msgKey, updated, nil); err != nil {
+			return nil, fmt.Errorf("set claimed message: %w", err)
+		}
+		if err := setInflightIndex(batch, queueId, msg, msgKey); err != nil {
+			return nil, fmt.Errorf("set in-flight index: %w", err)
+		}
+
+		receiptHandle := receiptHandleForMessageKey(msgKey)
+		cacheMessageKey(receiptHandle, msgKey)
+		claimed = append(claimed, claimedMessage{
+			Message:       msg,
+			ReceiptHandle: receiptHandle,
+		})
 	}
+
 	if len(claimed) == 0 {
+		iter.Close()
+		batch.Close()
 		return nil, ErrNoReadyMessages
+	}
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return nil, fmt.Errorf("commit claim batch: %w", err)
 	}
 	return claimed, nil
 }
@@ -940,12 +970,9 @@ func receive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// verify queue exists
-	err := Db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get([]byte(id))
-		return err
-	})
+	_, closer, err := Db.Get([]byte(id))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 			return
 		}
@@ -953,6 +980,7 @@ func receive(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	closer.Close()
 
 	max := 1
 	maxSpecified := false
@@ -1134,12 +1162,9 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err := Db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get([]byte(id))
-		return err
-	})
+	_, closer, err := Db.Get([]byte(id))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 			return
 		}
@@ -1147,6 +1172,7 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	closer.Close()
 
 	var msgs []claimedMessage
 	var claimErr error
@@ -1257,39 +1283,55 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = Db.Update(func(txn *badger.Txn) error {
-		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
-			return err
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
+	if _, closer, err := batch.Get([]byte(ackReq.QueueId)); err != nil {
+		batch.Close()
+		if err == pebble.ErrNotFound {
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
 		}
-		key, msg, err := messageByReceiptHandle(txn, ackReq.QueueId, ackReq.ReceiptHandle)
-		if err != nil {
-			return err
-		}
-		if msg.State != StateInFlight {
-			return ErrMessageNotInFlight
-		}
-		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
-			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
-		}
-		if err := deleteInflightIndex(txn, ackReq.QueueId, *msg); err != nil {
-			return err
-		}
-		deleteCachedMessageKey(ackReq.ReceiptHandle)
-		return txn.Delete(key)
-	})
+		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		closer.Close()
+	}
+	key, msg, err := messageByReceiptHandle(batch, ackReq.QueueId, ackReq.ReceiptHandle)
 	if err != nil {
+		batch.Close()
 		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
 			return
 		}
-		if _, ok := err.(*ErrDeliveryTokenMismatch); ok || err == ErrMessageNotInFlight {
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
-		}
+		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if msg.State != StateInFlight {
+		batch.Close()
+		http.Error(w, ErrMessageNotInFlight.Error(), http.StatusConflict)
+		return
+	}
+	if msg.DeliveryAttemptID != ackReq.DeliveryToken {
+		batch.Close()
+		http.Error(w, (&ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}).Error(), http.StatusConflict)
+		return
+	}
+	if err := deleteInflightIndex(batch, ackReq.QueueId, *msg); err != nil {
+		batch.Close()
+		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	deleteCachedMessageKey(ackReq.ReceiptHandle)
+	if err := batch.Delete(key, nil); err != nil {
+		batch.Close()
+		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1319,52 +1361,54 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 
 	results := make([]batchAckResult, len(batchReq.Acks))
 
-	err := Db.Update(func(txn *badger.Txn) error {
-		if _, err := txn.Get([]byte(batchReq.QueueId)); err != nil {
-			return err
-		}
-
-		for i, entry := range batchReq.Acks {
-			results[i].MessageId = entry.MessageId
-			results[i].ReceiptHandle = entry.ReceiptHandle
-
-			key, msg, err := messageByReceiptHandle(txn, batchReq.QueueId, entry.ReceiptHandle)
-			if err != nil {
-				results[i].Status = "error"
-				results[i].Error = fmt.Sprintf("message not found: %v", err)
-				continue
-			}
-			results[i].MessageId = msg.ID
-			if msg.State != StateInFlight {
-				results[i].Status = "error"
-				results[i].Error = ErrMessageNotInFlight.Error()
-				continue
-			}
-			if msg.DeliveryAttemptID != entry.DeliveryToken {
-				results[i].Status = "error"
-				results[i].Error = fmt.Sprintf("delivery token mismatch: expected %q, got %q", msg.DeliveryAttemptID, entry.DeliveryToken)
-				continue
-			}
-			if err := deleteInflightIndex(txn, batchReq.QueueId, *msg); err != nil {
-				results[i].Status = "error"
-				results[i].Error = fmt.Sprintf("delete in-flight index failed: %v", err)
-				continue
-			}
-			if err := txn.Delete(key); err != nil {
-				results[i].Status = "error"
-				results[i].Error = fmt.Sprintf("delete failed: %v", err)
-				continue
-			}
-			deleteCachedMessageKey(entry.ReceiptHandle)
-			results[i].Status = "ok"
-		}
-		return nil
-	})
-	if err != nil {
-		if err == badger.ErrKeyNotFound {
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
+	if _, closer, err := batch.Get([]byte(batchReq.QueueId)); err != nil {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue not found", http.StatusNotFound)
 			return
 		}
+		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		closer.Close()
+	}
+
+	for i, entry := range batchReq.Acks {
+		results[i].MessageId = entry.MessageId
+		results[i].ReceiptHandle = entry.ReceiptHandle
+
+		key, msg, err := messageByReceiptHandle(batch, batchReq.QueueId, entry.ReceiptHandle)
+		if err != nil {
+			results[i].Status = "error"
+			results[i].Error = fmt.Sprintf("message not found: %v", err)
+			continue
+		}
+		results[i].MessageId = msg.ID
+		if msg.State != StateInFlight {
+			results[i].Status = "error"
+			results[i].Error = ErrMessageNotInFlight.Error()
+			continue
+		}
+		if msg.DeliveryAttemptID != entry.DeliveryToken {
+			results[i].Status = "error"
+			results[i].Error = fmt.Sprintf("delivery token mismatch: expected %q, got %q", msg.DeliveryAttemptID, entry.DeliveryToken)
+			continue
+		}
+		if err := deleteInflightIndex(batch, batchReq.QueueId, *msg); err != nil {
+			results[i].Status = "error"
+			results[i].Error = fmt.Sprintf("delete in-flight index failed: %v", err)
+			continue
+		}
+		if err := batch.Delete(key, nil); err != nil {
+			results[i].Status = "error"
+			results[i].Error = fmt.Sprintf("delete failed: %v", err)
+			continue
+		}
+		deleteCachedMessageKey(entry.ReceiptHandle)
+		results[i].Status = "ok"
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1442,74 +1486,93 @@ func nack(w http.ResponseWriter, r *http.Request) {
 	var nackResultState MessageState
 	var needReadyPointer bool
 
-	err = Db.Update(func(txn *badger.Txn) error {
-		if _, err := txn.Get([]byte(ackReq.QueueId)); err != nil {
-			return err
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
+	if _, closer, err := batch.Get([]byte(ackReq.QueueId)); err != nil {
+		batch.Close()
+		if err == pebble.ErrNotFound {
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+			return
 		}
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		closer.Close()
+	}
 
-		key, msg, err := messageByReceiptHandle(txn, ackReq.QueueId, ackReq.ReceiptHandle)
-		if err != nil {
-			return err
-		}
-
-		if msg.State != StateInFlight {
-			return ErrMessageNotInFlight
-		}
-		if msg.DeliveryAttemptID != ackReq.DeliveryToken {
-			return &ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}
-		}
-		if err := deleteInflightIndex(txn, ackReq.QueueId, *msg); err != nil {
-			return err
-		}
-
-		if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
-			msg.State = StateDead
-		} else {
-			msg.State = StateReady
-		}
-		msg.VisibilityDeadline = time.Time{}
-		msg.DeliveryAttemptID = ""
-
-		nackResultState = msg.State
-		needReadyPointer = nackResultState == StateReady
-
-		updated, err := json.Marshal(msg)
-		if err != nil {
-			return err
-		}
-
-		if err := txn.Set(key, updated); err != nil {
-			return err
-		}
-
-		if needReadyPointer {
-			newSeq, err := nextMessageSequence(ackReq.QueueId)
-			if err != nil {
-				return fmt.Errorf("allocate nack sequence: %w", err)
-			}
-			if err := txn.Set(readyKey(ackReq.QueueId, newSeq, msg.ID), readyValue(key)); err != nil {
-				return err
-			}
-			cacheMessageKey(ackReq.ReceiptHandle, key)
-		} else {
-			deleteCachedMessageKey(ackReq.ReceiptHandle)
-		}
-
-		return nil
-	})
+	key, msg, err := messageByReceiptHandle(batch, ackReq.QueueId, ackReq.ReceiptHandle)
 	if err != nil {
+		batch.Close()
 		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
 			return
 		}
-		if _, ok := err.(*ErrDeliveryTokenMismatch); ok || err == ErrMessageNotInFlight {
-			http.Error(w, err.Error(), http.StatusConflict)
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if msg.State != StateInFlight {
+		batch.Close()
+		http.Error(w, ErrMessageNotInFlight.Error(), http.StatusConflict)
+		return
+	}
+	if msg.DeliveryAttemptID != ackReq.DeliveryToken {
+		batch.Close()
+		http.Error(w, (&ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}).Error(), http.StatusConflict)
+		return
+	}
+	if err := deleteInflightIndex(batch, ackReq.QueueId, *msg); err != nil {
+		batch.Close()
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+		msg.State = StateDead
+	} else {
+		msg.State = StateReady
+	}
+	msg.VisibilityDeadline = time.Time{}
+	msg.DeliveryAttemptID = ""
+
+	nackResultState = msg.State
+	needReadyPointer = nackResultState == StateReady
+
+	updated, err := json.Marshal(msg)
+	if err != nil {
+		batch.Close()
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := batch.Set(key, updated, nil); err != nil {
+		batch.Close()
+		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if needReadyPointer {
+		newSeq, err := nextMessageSequence(ackReq.QueueId)
+		if err != nil {
+			batch.Close()
+			http.Error(w, fmt.Sprintf("allocate nack sequence: %v", err), http.StatusInternalServerError)
 			return
 		}
+		if err := batch.Set(readyKey(ackReq.QueueId, newSeq, msg.ID), readyValue(key), nil); err != nil {
+			batch.Close()
+			http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		cacheMessageKey(ackReq.ReceiptHandle, key)
+	} else {
+		deleteCachedMessageKey(ackReq.ReceiptHandle)
+	}
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1547,35 +1610,30 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 	}
 	var expired []expiredMsg
 
-	err := Db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
-		opts.Prefix = inflightPrefix()
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		upper := inflightScanUpperBound(now)
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			key := item.KeyCopy(nil)
-			if len(key) >= len(upper) && bytes.Compare(key[:len(upper)], upper) > 0 {
-				break
-			}
-
-			if err := item.Value(func(v []byte) error {
-				expired = append(expired, expiredMsg{
-					indexKey: key,
-					msgKey:   append([]byte(nil), v...),
-				})
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
+	prefix := inflightPrefix()
+	snap := Db.NewSnapshot()
+	defer snap.Close()
+	iter, _ := snap.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
 	})
-	if err != nil {
-		return nil, err
+	defer iter.Close()
+
+	upper := inflightScanUpperBound(now)
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		if len(key) >= len(upper) && bytes.Compare(key[:len(upper)], upper) > 0 {
+			break
+		}
+
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			return nil, err
+		}
+		expired = append(expired, expiredMsg{
+			indexKey: key,
+			msgKey:   append([]byte(nil), val...),
+		})
 	}
 
 	const reapBatch = 1024
@@ -1588,86 +1646,84 @@ func reapExpiredMessages(now time.Time) ([]reapTransition, error) {
 		}
 		chunk := expired[i:end]
 
-		err = Db.Update(func(txn *badger.Txn) error {
-			for _, exp := range chunk {
-				item, err := txn.Get(exp.msgKey)
-				if err != nil {
-					if err == badger.ErrKeyNotFound {
-						if delErr := txn.Delete(exp.indexKey); delErr != nil && delErr != badger.ErrKeyNotFound {
-							return delErr
-						}
-						continue
-					}
-					return err
-				}
-
-				var msg Message
-				if err := item.Value(func(v []byte) error {
-					return json.Unmarshal(v, &msg)
-				}); err != nil {
-					return err
-				}
-
-				if msg.State != StateInFlight {
-					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-						return err
-					}
+		batch := Db.NewIndexedBatch()
+		for _, exp := range chunk {
+			msgVal, closer, err := batch.Get(exp.msgKey)
+			if err != nil {
+				if err == pebble.ErrNotFound {
+					_ = batch.Delete(exp.indexKey, nil)
 					continue
 				}
-				if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
-					if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-						return err
-					}
-					continue
-				}
-
-				queueID, err := parseMessageKeyQueueID(exp.msgKey)
-				if err != nil {
-					return err
-				}
-
-				if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
-					msg.State = StateDead
-				} else {
-					msg.State = StateReady
-				}
-				msg.VisibilityDeadline = time.Time{}
-				msg.DeliveryAttemptID = ""
-
-				updated, err := json.Marshal(msg)
-				if err != nil {
-					return err
-				}
-				if err := txn.Set(exp.msgKey, updated); err != nil {
-					return err
-				}
-				if err := txn.Delete(exp.indexKey); err != nil && err != badger.ErrKeyNotFound {
-					return err
-				}
-
-				if msg.State == StateReady {
-					newSeq, err := nextMessageSequence(queueID)
-					if err != nil {
-						return fmt.Errorf("allocate reaper sequence: %w", err)
-					}
-					if err := txn.Set(readyKey(queueID, newSeq, msg.ID), readyValue(exp.msgKey)); err != nil {
-						return err
-					}
-				}
-
-				transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
+				batch.Close()
+				return transitions, err
 			}
-			return nil
-		})
-		if err != nil {
+
+			var msg Message
+			if err := json.Unmarshal(msgVal, &msg); err != nil {
+				closer.Close()
+				batch.Close()
+				return transitions, err
+			}
+			closer.Close()
+
+			if msg.State != StateInFlight {
+				_ = batch.Delete(exp.indexKey, nil)
+				continue
+			}
+			if msg.VisibilityDeadline.IsZero() || now.Before(msg.VisibilityDeadline) {
+				_ = batch.Delete(exp.indexKey, nil)
+				continue
+			}
+
+			queueID, err := parseMessageKeyQueueID(exp.msgKey)
+			if err != nil {
+				batch.Close()
+				return transitions, err
+			}
+
+			if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+				msg.State = StateDead
+			} else {
+				msg.State = StateReady
+			}
+			msg.VisibilityDeadline = time.Time{}
+			msg.DeliveryAttemptID = ""
+
+			updated, err := json.Marshal(msg)
+			if err != nil {
+				batch.Close()
+				return transitions, err
+			}
+			if err := batch.Set(exp.msgKey, updated, nil); err != nil {
+				batch.Close()
+				return transitions, err
+			}
+			_ = batch.Delete(exp.indexKey, nil)
+
+			if msg.State == StateReady {
+				newSeq, err := nextMessageSequence(queueID)
+				if err != nil {
+					batch.Close()
+					return transitions, fmt.Errorf("allocate reaper sequence: %w", err)
+				}
+				if err := batch.Set(readyKey(queueID, newSeq, msg.ID), readyValue(exp.msgKey), nil); err != nil {
+					batch.Close()
+					return transitions, err
+				}
+			}
+
+			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: msg.State})
+		}
+		if err := batch.Commit(pebble.NoSync); err != nil {
 			return transitions, err
 		}
+		batch.Close()
 	}
 
 	return transitions, nil
 }
 
-// runs every second and resets expired in-flight messages back to ready in Badger.
+// runs every second and resets expired in-flight messages back to ready.
 func reaper() {
 
 	go func() {
@@ -1717,18 +1773,16 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := Db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get([]byte(id))
-		return err
-	})
+	_, closer, err := Db.Get([]byte(id))
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 			return
 		}
 		http.Error(w, "Error checking queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	closer.Close()
 
 	m := getOrCreateMetrics(id)
 	if err := reconcileMetricsFromDB(id, m); err != nil {
@@ -1756,7 +1810,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	dbPath := os.Getenv("KUEUE_DB_PATH")
 	if dbPath == "" {
-		dbPath = "./tmp/badger"
+		dbPath = "./tmp/pebble"
 	}
 
 	port := os.Getenv("PORT")
@@ -1764,14 +1818,9 @@ func main() {
 		port = "8080"
 	}
 
-	opts := badger.DefaultOptions(dbPath)
-	if os.Getenv("KUEUE_SYNC_WRITES") == "false" {
-		opts = opts.WithSyncWrites(false)
-	}
-
-	db, err := badger.Open(opts)
+	db, err := pebble.Open(dbPath, &pebble.Options{})
 	if err != nil {
-		fmt.Println("Error opening BadgerDB:", err)
+		fmt.Println("Error opening Pebble:", err)
 		return
 	}
 	Db = db

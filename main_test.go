@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 func setupTestDB(t *testing.T) {
 	t.Helper()
 
-	db, err := badger.Open(badger.DefaultOptions(t.TempDir()).WithLogger(nil))
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
@@ -106,16 +106,7 @@ func publishTestMessage(t *testing.T, queueID string, body []byte) string {
 func storedMessageKey(t *testing.T, queueID, messageID string) []byte {
 	t.Helper()
 
-	var key []byte
-	err := Db.View(func(txn *badger.Txn) error {
-		foundKey, _, err := findMessageRecord(txn, queueID, messageID)
-		if err != nil {
-			return err
-		}
-
-		key = foundKey
-		return nil
-	})
+	key, _, err := findMessageRecord(queueID, messageID)
 	if err != nil {
 		t.Fatalf("find stored message key: %v", err)
 	}
@@ -229,11 +220,11 @@ func TestPublishReceiveAck(t *testing.T) {
 		t.Fatalf("ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
 	}
 
-	err = Db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(storedKey)
-		return err
-	})
-	if err != badger.ErrKeyNotFound {
+	_, closer, err := Db.Get(storedKey)
+	if closer != nil {
+		closer.Close()
+	}
+	if err != pebble.ErrNotFound {
 		t.Fatalf("expected message to be deleted after ack, got %v", err)
 	}
 }
@@ -391,7 +382,7 @@ func TestReceiveLongPollIgnoresOtherQueuePublishes(t *testing.T) {
 }
 
 func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
-	t.Skip("TODO: fix BadgerDB nested txn conflict in nextMessageSequence inside Update")
+	t.Skip("TODO: fix nested batch write issue in nextMessageSequence")
 	setupTestDB(t)
 
 	queueID := createTestQueue(t, "reaper-queue")
@@ -402,36 +393,37 @@ func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
 	firstReceiptHandle := firstResp.ReceiptHandle
 
 	storedKey := storedMessageKey(t, queueID, messageID)
-	err := Db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(storedKey)
-		if err != nil {
-			return err
-		}
-
-		return item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
-
-			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
-				return err
-			}
-			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-
-			if err := txn.Set(storedKey, updated); err != nil {
-				return err
-			}
-			return setInflightIndex(txn, queueID, msg, storedKey)
-		})
-	})
+	batch := Db.NewIndexedBatch()
+	defer batch.Close()
+	val, closer, err := batch.Get(storedKey)
 	if err != nil {
-		t.Fatalf("prepare expired in-flight message: %v", err)
+		t.Fatalf("get message: %v", err)
+	}
+	var msg Message
+	if err := json.Unmarshal(val, &msg); err != nil {
+		closer.Close()
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	closer.Close()
+
+	if err := deleteInflightIndex(batch, queueID, msg); err != nil {
+		t.Fatalf("delete inflight index: %v", err)
+	}
+	msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+
+	updated, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+
+	if err := batch.Set(storedKey, updated, nil); err != nil {
+		t.Fatalf("set message: %v", err)
+	}
+	if err := setInflightIndex(batch, queueID, msg, storedKey); err != nil {
+		t.Fatalf("set inflight index: %v", err)
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		t.Fatalf("commit batch: %v", err)
 	}
 
 	time.Sleep(200 * time.Millisecond)
@@ -562,24 +554,24 @@ func TestAckDeletesInflightIndex(t *testing.T) {
 
 	resp := receiveTestMessage(t, queueID)
 
-	err := Db.View(func(txn *badger.Txn) error {
-		key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
-		if err != nil {
-			return err
-		}
-		item, err := txn.Get(key)
-		if err != nil {
-			return err
-		}
-		return item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
-			_, err = txn.Get(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
-			return err
-		})
-	})
+	key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
+	if err != nil {
+		t.Fatalf("message key from receipt handle: %v", err)
+	}
+	val, closer, err := Db.Get(key)
+	if err != nil {
+		t.Fatalf("get message: %v", err)
+	}
+	var msg Message
+	if err := json.Unmarshal(val, &msg); err != nil {
+		closer.Close()
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	closer.Close()
+	_, closer, err = Db.Get(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
+	if closer != nil {
+		closer.Close()
+	}
 	if err != nil {
 		t.Fatalf("expected in-flight index after receive: %v", err)
 	}
@@ -595,18 +587,14 @@ func TestAckDeletesInflightIndex(t *testing.T) {
 		t.Fatalf("ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
 	}
 
-	err = Db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = inflightPrefix()
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Rewind(); it.Valid(); it.Next() {
-			t.Fatalf("expected no in-flight index keys, found %q", it.Item().Key())
-		}
-		return nil
+	prefix := inflightPrefix()
+	iter, _ := Db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
 	})
-	if err != nil {
-		t.Fatalf("scan in-flight index: %v", err)
+	defer iter.Close()
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		t.Fatalf("expected no in-flight index keys, found %q", iter.Key())
 	}
 }
 
@@ -633,51 +621,47 @@ func TestReapDeadLettersAfterMaxDeliveries(t *testing.T) {
 	_ = receiveTestMessage(t, queueID)
 
 	storedKey := storedMessageKey(t, queueID, messageID)
-	err = Db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(storedKey)
-		if err != nil {
-			return err
-		}
-		return item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
-			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
-				return err
-			}
-			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(storedKey, updated); err != nil {
-				return err
-			}
-			return setInflightIndex(txn, queueID, msg, storedKey)
-		})
-	})
+	batch := Db.NewIndexedBatch()
+	val, closer, err := batch.Get(storedKey)
 	if err != nil {
-		t.Fatalf("prepare expired in-flight message: %v", err)
+		t.Fatalf("get message: %v", err)
 	}
+	var deadMsg Message
+	if err := json.Unmarshal(val, &deadMsg); err != nil {
+		closer.Close()
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	closer.Close()
+	if err := deleteInflightIndex(batch, queueID, deadMsg); err != nil {
+		t.Fatalf("delete inflight index: %v", err)
+	}
+	deadMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+	updated, err := json.Marshal(deadMsg)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	if err := batch.Set(storedKey, updated, nil); err != nil {
+		t.Fatalf("set message: %v", err)
+	}
+	if err := setInflightIndex(batch, queueID, deadMsg, storedKey); err != nil {
+		t.Fatalf("set inflight index: %v", err)
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		t.Fatalf("commit batch: %v", err)
+	}
+	batch.Close()
 
 	_, err = reapExpiredMessages(time.Now())
 	if err != nil {
 		t.Fatalf("reap expired messages: %v", err)
 	}
 
-	err = Db.View(func(txn *badger.Txn) error {
-		_, msg, err := findMessageRecord(txn, queueID, messageID)
-		if err != nil {
-			return err
-		}
-		if msg.State != StateDead {
-			t.Fatalf("expected StateDead after max deliveries, got %s", msg.State)
-		}
-		return nil
-	})
+	_, foundMsg, err := findMessageRecord(queueID, messageID)
 	if err != nil {
 		t.Fatalf("find message record: %v", err)
+	}
+	if foundMsg.State != StateDead {
+		t.Fatalf("expected StateDead after max deliveries, got %s", foundMsg.State)
 	}
 }
 
@@ -695,33 +679,35 @@ func TestReaperUsesInflightIndexWithReadyBacklog(t *testing.T) {
 	}
 
 	storedKey := storedMessageKey(t, queueID, messageID)
-	err := Db.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(storedKey)
-		if err != nil {
-			return err
-		}
-		return item.Value(func(v []byte) error {
-			var msg Message
-			if err := json.Unmarshal(v, &msg); err != nil {
-				return err
-			}
-			if err := deleteInflightIndex(txn, queueID, msg); err != nil {
-				return err
-			}
-			msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-			updated, err := json.Marshal(msg)
-			if err != nil {
-				return err
-			}
-			if err := txn.Set(storedKey, updated); err != nil {
-				return err
-			}
-			return setInflightIndex(txn, queueID, msg, storedKey)
-		})
-	})
+	batch := Db.NewIndexedBatch()
+	val, closer, err := batch.Get(storedKey)
 	if err != nil {
-		t.Fatalf("prepare expired in-flight message: %v", err)
+		t.Fatalf("get message: %v", err)
 	}
+	var expiredMsg Message
+	if err := json.Unmarshal(val, &expiredMsg); err != nil {
+		closer.Close()
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	closer.Close()
+	if err := deleteInflightIndex(batch, queueID, expiredMsg); err != nil {
+		t.Fatalf("delete inflight index: %v", err)
+	}
+	expiredMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+	updated, err := json.Marshal(expiredMsg)
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	if err := batch.Set(storedKey, updated, nil); err != nil {
+		t.Fatalf("set message: %v", err)
+	}
+	if err := setInflightIndex(batch, queueID, expiredMsg, storedKey); err != nil {
+		t.Fatalf("set inflight index: %v", err)
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		t.Fatalf("commit batch: %v", err)
+	}
+	batch.Close()
 
 	transitions, err := reapExpiredMessages(time.Now())
 	if err != nil {
@@ -775,18 +761,12 @@ func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
 		t.Fatalf("expected StateDead after nack with max deliveries, got %s", nackResp.State)
 	}
 
-	err = Db.View(func(txn *badger.Txn) error {
-		_, msg, err := findMessageRecord(txn, queueID, messageID)
-		if err != nil {
-			return err
-		}
-		if msg.State != StateDead {
-			t.Fatalf("expected persisted StateDead, got %s", msg.State)
-		}
-		return nil
-	})
+	_, foundMsg, err := findMessageRecord(queueID, messageID)
 	if err != nil {
 		t.Fatalf("find message record: %v", err)
+	}
+	if foundMsg.State != StateDead {
+		t.Fatalf("expected persisted StateDead, got %s", foundMsg.State)
 	}
 }
 
@@ -808,7 +788,7 @@ func BenchmarkReceiveLatencyVsDepth(b *testing.B) {
 	depths := []int{100, 1000, 10000}
 	for _, depth := range depths {
 		b.Run(fmt.Sprintf("depth_%d", depth), func(b *testing.B) {
-			db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLogger(nil))
+			db, err := pebble.Open(b.TempDir(), &pebble.Options{})
 			if err != nil {
 				b.Fatalf("open db: %v", err)
 			}
@@ -952,7 +932,7 @@ func ackClaimedMessagesBench(b testing.TB, queueID string, msgs []claimedMessage
 func setupDepthBenchmarkDB(b *testing.B) string {
 	b.Helper()
 
-	db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLogger(nil))
+	db, err := pebble.Open(b.TempDir(), &pebble.Options{})
 	if err != nil {
 		b.Fatalf("open bench db: %v", err)
 	}
@@ -1057,30 +1037,35 @@ func BenchmarkReaperDueInflightIndex(b *testing.B) {
 				if err != nil {
 					b.Fatalf("decode receipt handle: %v", err)
 				}
-				err = Db.Update(func(txn *badger.Txn) error {
-					item, err := txn.Get(key)
+				err = func() error {
+					batch := Db.NewIndexedBatch()
+					defer batch.Close()
+					val, closer, err := batch.Get(key)
 					if err != nil {
 						return err
 					}
-					return item.Value(func(v []byte) error {
-						var msg Message
-						if err := json.Unmarshal(v, &msg); err != nil {
-							return err
-						}
-						if err := deleteInflightIndex(txn, queueID, msg); err != nil {
-							return err
-						}
-						msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-						updated, err := json.Marshal(msg)
-						if err != nil {
-							return err
-						}
-						if err := txn.Set(key, updated); err != nil {
-							return err
-						}
-						return setInflightIndex(txn, queueID, msg, key)
-					})
-				})
+					var benchMsg Message
+					if err := json.Unmarshal(val, &benchMsg); err != nil {
+						closer.Close()
+						return err
+					}
+					closer.Close()
+					if err := deleteInflightIndex(batch, queueID, benchMsg); err != nil {
+						return err
+					}
+					benchMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+					updated, err := json.Marshal(benchMsg)
+					if err != nil {
+						return err
+					}
+					if err := batch.Set(key, updated, nil); err != nil {
+						return err
+					}
+					if err := setInflightIndex(batch, queueID, benchMsg, key); err != nil {
+						return err
+					}
+					return batch.Commit(pebble.NoSync)
+				}()
 				if err != nil {
 					b.Fatalf("prepare expired message: %v", err)
 				}
@@ -1261,16 +1246,12 @@ func TestBatchAckMultipleMessages(t *testing.T) {
 
 	// Verify all messages are deleted
 	for _, msgID := range []string{msg1ID, msg2ID, msg3ID} {
-		err := Db.View(func(txn *badger.Txn) error {
-			key, _, err := findMessageRecord(txn, queueID, msgID)
-			if err != nil {
-				return err
-			}
-			t.Fatalf("expected message %s to be deleted, found at %x", msgID, key)
-			return nil
-		})
+		key, _, err := findMessageRecord(queueID, msgID)
 		if err == nil {
-			t.Fatalf("message %s was not deleted", msgID)
+			t.Fatalf("expected message %s to be deleted, found at %x", msgID, key)
+		}
+		if err != pebble.ErrNotFound {
+			t.Fatalf("unexpected error finding message %s: %v", msgID, err)
 		}
 	}
 }
@@ -1325,17 +1306,13 @@ func TestBatchAckReportsPartialErrors(t *testing.T) {
 
 	// msg1 should be deleted, msg2 should still exist
 	var msg2Exists bool
-	err := Db.View(func(txn *badger.Txn) error {
-		_, _, err := findMessageRecord(txn, queueID, msg2ID)
-		if err == badger.ErrKeyNotFound {
-			msg2Exists = false
-			return nil
-		}
-		msg2Exists = true
-		return err
-	})
-	if err != nil {
+	_, _, err := findMessageRecord(queueID, msg2ID)
+	if err == pebble.ErrNotFound {
+		msg2Exists = false
+	} else if err != nil {
 		t.Fatalf("check msg2: %v", err)
+	} else {
+		msg2Exists = true
 	}
 	if !msg2Exists {
 		t.Fatal("msg2 should not have been deleted")
