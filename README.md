@@ -1,6 +1,6 @@
 # kueue
 
-A persistent message queue server built in Go with BadgerDB storage.
+A persistent message queue server built in Go with Pebble storage.
 
 ## Features
 
@@ -52,14 +52,35 @@ go run main.go
 ```
 
 Environment variables:
-- `KUEUE_DB_PATH` - BadgerDB data directory (default: `./tmp/badger`)
+- `KUEUE_DB_PATH` - Pebble data directory (default: `./tmp/pebble`)
 - `PORT` - Server port (default: `8080`)
 
 ## Benchmark
 
 ```bash
-go run ./cmd/bench --targets kueue,rabbitmq
+go run ./cmd/bench --targets kueue
 ```
+
+## Performance
+
+Benchmarked with 10k messages, 256-byte payload, 1 producer, 10 consumers, batch receive (prefetch=10):
+
+| Metric | Value |
+| --- | ---: |
+| Publish throughput | ~28,000 msg/s |
+| Consume throughput | ~8,700 msg/s |
+| Latency p50 | ~354 ms |
+| Latency p95 | ~742 ms |
+| Latency p99 | ~774 ms |
+
+Apples-to-apples (1 message per round-trip, 1 consumer):
+
+| Metric | Value |
+| --- | ---: |
+| Publish throughput | ~35,500 msg/s |
+| Consume throughput | ~1,700 msg/s |
+| Latency p50 | ~2,580 ms |
+| Latency p99 | ~5,590 ms |
 
 ## Test
 
