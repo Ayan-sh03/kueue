@@ -1162,14 +1162,7 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err := func() error {
-		_, closer, err := Db.Get([]byte(id))
-		if err != nil {
-			return err
-		}
-		closer.Close()
-		return nil
-	}()
+	_, closer, err := Db.Get([]byte(id))
 	if err != nil {
 		if err == pebble.ErrNotFound {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
@@ -1179,6 +1172,7 @@ func receiveBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	closer.Close()
 
 	var msgs []claimedMessage
 	var claimErr error
