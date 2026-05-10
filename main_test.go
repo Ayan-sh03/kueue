@@ -892,6 +892,48 @@ func TestAckRatePerSec_EmptyWindow(t *testing.T) {
 	}
 }
 
+func TestReconcileMetricsFromDBIfStaleSkipsWithinInterval(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "metrics-throttle-queue")
+	key := messageKey(queueID, 1, "bad-message")
+	if err := Db.Set(key, []byte("{bad json"), pebble.Sync); err != nil {
+		t.Fatalf("write malformed message: %v", err)
+	}
+
+	m := getOrCreateMetrics(queueID)
+	now := time.Now()
+	m.lastReconcile = now.Add(-metricsReconcileInterval / 2)
+
+	if err := reconcileMetricsFromDBIfStale(queueID, m, now); err != nil {
+		t.Fatalf("reconcile inside throttle interval returned error: %v", err)
+	}
+}
+
+func TestReconcileMetricsFromDBIfStaleRunsAfterInterval(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "metrics-throttle-expired-queue")
+	key := messageKey(queueID, 1, "bad-message")
+	if err := Db.Set(key, []byte("{bad json"), pebble.Sync); err != nil {
+		t.Fatalf("write malformed message: %v", err)
+	}
+
+	m := getOrCreateMetrics(queueID)
+	now := time.Now()
+	m.lastReconcile = now.Add(-metricsReconcileInterval)
+
+	if err := reconcileMetricsFromDBIfStale(queueID, m, now); err == nil {
+		t.Fatal("expected reconcile after throttle interval to scan DB and return an error")
+	}
+	if !m.lastReconcile.Equal(now) {
+		t.Fatalf("lastReconcile = %v, want %v", m.lastReconcile, now)
+	}
+	if err := reconcileMetricsFromDBIfStale(queueID, m, now.Add(time.Second)); err != nil {
+		t.Fatalf("expected failed reconcile to be throttled, got error: %v", err)
+	}
+}
+
 func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
 	b.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
