@@ -117,9 +117,13 @@ type queueMetrics struct {
 	totalNacked    atomic.Int64
 	ackCountWindow atomic.Int64 // acks in last second (approximate, updated by reaper)
 	startedAt      time.Time
+	reconcileMu    sync.Mutex
+	lastReconcile  time.Time
 }
 
 var metricsStore sync.Map
+
+const metricsReconcileInterval = 10 * time.Second
 
 func snapshotMax(counter *atomic.Int64, val int64) {
 	for {
@@ -199,6 +203,20 @@ func reconcileMetricsFromDB(queueID string, m *queueMetrics) error {
 	snapshotMax(&m.readyCount, ready)
 	snapshotMax(&m.inFlightCount, inFlight)
 	snapshotMax(&m.deadCount, dead)
+	return nil
+}
+
+func reconcileMetricsFromDBIfStale(queueID string, m *queueMetrics, now time.Time) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
+	if !m.lastReconcile.IsZero() && now.Sub(m.lastReconcile) < metricsReconcileInterval {
+		return nil
+	}
+	if err := reconcileMetricsFromDB(queueID, m); err != nil {
+		return err
+	}
+	m.lastReconcile = now
 	return nil
 }
 
@@ -1785,11 +1803,10 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	closer.Close()
 
 	m := getOrCreateMetrics(id)
-	if err := reconcileMetricsFromDB(id, m); err != nil {
+	if err := reconcileMetricsFromDBIfStale(id, m, time.Now()); err != nil {
 		http.Error(w, "Error reconciling metrics: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	m.resetAckWindow()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
