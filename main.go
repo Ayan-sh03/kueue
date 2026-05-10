@@ -213,11 +213,9 @@ func reconcileMetricsFromDBIfStale(queueID string, m *queueMetrics, now time.Tim
 	if !m.lastReconcile.IsZero() && now.Sub(m.lastReconcile) < metricsReconcileInterval {
 		return nil
 	}
-	if err := reconcileMetricsFromDB(queueID, m); err != nil {
-		return err
-	}
+	err := reconcileMetricsFromDB(queueID, m)
 	m.lastReconcile = now
-	return nil
+	return err
 }
 
 // channel for long polling in receive

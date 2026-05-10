@@ -926,6 +926,12 @@ func TestReconcileMetricsFromDBIfStaleRunsAfterInterval(t *testing.T) {
 	if err := reconcileMetricsFromDBIfStale(queueID, m, now); err == nil {
 		t.Fatal("expected reconcile after throttle interval to scan DB and return an error")
 	}
+	if !m.lastReconcile.Equal(now) {
+		t.Fatalf("lastReconcile = %v, want %v", m.lastReconcile, now)
+	}
+	if err := reconcileMetricsFromDBIfStale(queueID, m, now.Add(time.Second)); err != nil {
+		t.Fatalf("expected failed reconcile to be throttled, got error: %v", err)
+	}
 }
 
 func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
