@@ -281,10 +281,13 @@ func (w *walStore) Replay(ctx context.Context, afterLSN uint64, apply func(walEn
 	if afterLSN > 0 {
 		lower = walKey(afterLSN + 1)
 	}
-	iter, _ := w.db.NewIter(&pebble.IterOptions{
+	iter, err := w.db.NewIter(&pebble.IterOptions{
 		LowerBound: lower,
 		UpperBound: prefixUpperBound(walPrefix()),
 	})
+	if err != nil {
+		return err
+	}
 	defer iter.Close()
 
 	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
@@ -307,6 +310,9 @@ func (w *walStore) Replay(ctx context.Context, afterLSN uint64, apply func(walEn
 		if err := apply(entry); err != nil {
 			return err
 		}
+	}
+	if err := iter.Error(); err != nil {
+		return err
 	}
 	return nil
 }
