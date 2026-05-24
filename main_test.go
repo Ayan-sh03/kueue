@@ -2285,3 +2285,58 @@ func TestRuntimeAckBatchRejectsDuplicateReceiptHandle(t *testing.T) {
 		t.Fatalf("inFlightCount = %d, want 0", inFlight)
 	}
 }
+
+// ============================================================================
+// T19: Claim WAL failure leaves no stale inflight entries
+// ============================================================================
+
+func TestRuntimeClaimWALFailNoStaleInflight(t *testing.T) {
+	qm, wal := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "claim-rollback", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("a"), []byte("b")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	readyBefore := q.ready.Len()
+	q.mu.Unlock()
+	if readyBefore != 2 {
+		t.Fatalf("ready before = %d, want 2", readyBefore)
+	}
+
+	wal.fail = true
+	_, err = qm.ClaimBatch(ctx, id, 2)
+	if err == nil {
+		t.Fatal("expected WAL failure error")
+	}
+
+	q.mu.Lock()
+	inflightLen := len(q.inflight)
+	deadlinesLen := q.deadlines.Len()
+	readyAfter := q.ready.Len()
+	q.mu.Unlock()
+
+	if inflightLen != 0 {
+		t.Fatalf("inflight len after rollback = %d, want 0", inflightLen)
+	}
+	if deadlinesLen != 0 {
+		t.Fatalf("deadlines len after rollback = %d, want 0", deadlinesLen)
+	}
+	if readyAfter != 2 {
+		t.Fatalf("ready len after rollback = %d, want 2", readyAfter)
+	}
+
+	// After WAL failure, the messages should be claimable again.
+	wal.fail = false
+	claimed, err := qm.ClaimBatch(ctx, id, 2)
+	if err != nil {
+		t.Fatalf("claim after rollback: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed %d messages, want 2", len(claimed))
+	}
+}

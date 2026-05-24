@@ -2232,21 +2232,19 @@ func (qm *queueManager) ClaimBatch(ctx context.Context, queueID string, max int)
 		},
 	}
 	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
-		// Rollback: restore popped records to ready front in reverse order.
+		// Rollback: restore popped records to ready front in reverse order
+		// and remove the delivery records added to inflight/heap.
 		for i := len(popped) - 1; i >= 0; i-- {
 			msg := popped[i]
+			rh := msg.CurrentReceiptHandle
 			msg.State = StateReady
 			msg.CurrentReceiptHandle = ""
 			msg.CurrentDeliveryToken = ""
 			msg.VisibilityDeadline = time.Time{}
 			msg.DeliveryCount--
 			msg.readyElement = q.ready.PushFront(msg)
-			delete(q.inflight, msg.CurrentReceiptHandle)
+			delete(q.inflight, rh)
 		}
-		// Clean up any heap entries that were added (they'll be stale but harmless
-		// until the reaper tries to process them; we'll rebuild the heap from
-		// inflight on the next operation that needs it).
-		// Simpler: rebuild the heap from the current inflight map.
 		q.deadlines = q.deadlines[:0]
 		for _, dr := range q.inflight {
 			dr.heapIndex = -1
