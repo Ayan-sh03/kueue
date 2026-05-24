@@ -2489,6 +2489,15 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		var transitions []reapTransition
 		var reaps []walReapedMessage
 
+		// Collect expired deliveries without mutating state yet.
+		type pendingReap struct {
+			dr          *deliveryRecord
+			msg         *messageRecord
+			targetState MessageState
+			newSeq      uint64
+		}
+		var pending []pendingReap
+
 		for len(q.deadlines) > 0 && q.deadlines[0].Deadline.Before(now) {
 			dr := heap.Pop(&q.deadlines).(*deliveryRecord)
 			msg, ok := q.messages[dr.MessageID]
@@ -2498,35 +2507,29 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			if msg.State != StateInFlight {
 				continue
 			}
-			// Guard against stale heap entries (token changed since push).
 			if msg.CurrentDeliveryToken != dr.DeliveryToken {
 				continue
 			}
 			if msg.VisibilityDeadline.After(now) {
-				// Should not happen because heap ordering, but guard.
 				continue
 			}
-
-			// Remove from inflight.
-			delete(q.inflight, dr.ReceiptHandle)
 
 			var targetState MessageState
 			var newSeq uint64
 			if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
 				targetState = StateDead
-				msg.State = StateDead
-				q.dead[msg.ID] = msg
 			} else {
 				targetState = StateReady
-				msg.State = StateReady
 				newSeq = q.nextSeq
 				q.nextSeq++
-				msg.Seq = newSeq
-				msg.CurrentReceiptHandle = ""
-				msg.CurrentDeliveryToken = ""
-				msg.VisibilityDeadline = time.Time{}
-				msg.readyElement = q.ready.PushBack(msg)
 			}
+
+			pending = append(pending, pendingReap{
+				dr:          dr,
+				msg:         msg,
+				targetState: targetState,
+				newSeq:      newSeq,
+			})
 
 			reaps = append(reaps, walReapedMessage{
 				MessageID:             msg.ID,
@@ -2539,6 +2542,13 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		}
 
 		if len(reaps) == 0 {
+			// Nothing expired, but we may have popped stale entries from the heap.
+			// Push any valid inflight entries back.
+			q.deadlines = q.deadlines[:0]
+			for _, dr := range q.inflight {
+				dr.heapIndex = -1
+				heap.Push(&q.deadlines, dr)
+			}
 			q.mu.Unlock()
 			continue
 		}
@@ -2551,26 +2561,14 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			},
 		}
 		if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
-			// Rollback: restore all transitioned messages to inflight.
-			for _, tr := range reaps {
-				msg := q.messages[tr.MessageID]
-				if msg == nil {
-					continue
+			// WAL failed — no mutations were applied. The delivery records
+			// are still in q.inflight. Rebuild the heap from the inflight
+			// map (which is unchanged) and rollback seq allocations.
+			for _, p := range pending {
+				if p.targetState == StateReady {
+					q.nextSeq-- // rollback seq allocation
 				}
-				if tr.TargetState == StateReady {
-					q.ready.Remove(msg.readyElement)
-					msg.readyElement = nil
-					q.nextSeq = tr.NewReadySeq
-				} else {
-					delete(q.dead, msg.ID)
-				}
-				msg.State = StateInFlight
-				msg.Seq = 0 // we don't restore seq; it'll be set correctly on next claim
-				// Rebuild receipt handle and token from the original delivery record
-				// is impossible here, so we rebuild the heap from current inflight map
-				// and skip this message in the reaper until it's explicitly claimed again.
 			}
-			// Rebuild deadlines heap from current inflight map.
 			q.deadlines = q.deadlines[:0]
 			for _, dr := range q.inflight {
 				dr.heapIndex = -1
@@ -2580,7 +2578,23 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			continue
 		}
 
-		// WAL succeeded — apply metrics.
+		// WAL succeeded — apply all pending mutations.
+		for _, p := range pending {
+			delete(q.inflight, p.dr.ReceiptHandle)
+			msg := p.msg
+			if p.targetState == StateDead {
+				msg.State = StateDead
+				q.dead[msg.ID] = msg
+			} else {
+				msg.State = StateReady
+				msg.Seq = p.newSeq
+				msg.CurrentReceiptHandle = ""
+				msg.CurrentDeliveryToken = ""
+				msg.VisibilityDeadline = time.Time{}
+				msg.readyElement = q.ready.PushBack(msg)
+			}
+		}
+
 		for _, tr := range transitions {
 			q.metrics.inFlightCount.Add(-1)
 			if tr.ToState == StateReady {

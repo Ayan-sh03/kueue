@@ -2064,3 +2064,89 @@ func TestRuntimeMemoryLimitReject(t *testing.T) {
 		t.Fatalf("ready count = %d, want 1", readyCount)
 	}
 }
+
+// ============================================================================
+// T16: Reap WAL failure preserves inflight state for re-reaping
+// ============================================================================
+
+func TestRuntimeReapWALFailPreservesInflight(t *testing.T) {
+	qm, wal := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "reap-wal-fail", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	_, err = qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	var rh string
+	for k := range q.inflight {
+		rh = k
+		break
+	}
+	if rh == "" {
+		t.Fatal("expected inflight delivery record")
+	}
+
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.heapIndex = -1
+		dr.Deadline = time.Now().Add(-1 * time.Second)
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	wal.fail = true
+	transitions := qm.ReapExpired(ctx, time.Now())
+	if len(transitions) != 0 {
+		t.Fatalf("expected no transitions on WAL failure, got %d", len(transitions))
+	}
+
+	wal.fail = false
+
+	q.mu.Lock()
+	if len(q.inflight) != 1 {
+		t.Fatalf("inflight len = %d, want 1 after WAL failure", len(q.inflight))
+	}
+	if len(q.dead) != 0 {
+		t.Fatalf("dead len = %d, want 0 after WAL failure", len(q.dead))
+	}
+	if q.ready.Len() != 0 {
+		t.Fatalf("ready len = %d, want 0 after WAL failure", q.ready.Len())
+	}
+	if q.deadlines.Len() != 1 {
+		t.Fatalf("deadlines len = %d, want 1 after WAL failure", q.deadlines.Len())
+	}
+
+	for _, msg := range q.messages {
+		if msg.State != StateInFlight {
+			t.Fatalf("message state = %q, want in_flight", msg.State)
+		}
+	}
+	q.mu.Unlock()
+
+	transitions = qm.ReapExpired(ctx, time.Now())
+	if len(transitions) != 1 {
+		t.Fatalf("reap after WAL recovery: transitions = %d, want 1", len(transitions))
+	}
+	if transitions[0].ToState != StateReady {
+		t.Fatalf("reap toState = %q, want ready", transitions[0].ToState)
+	}
+
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim after reap: %v", err)
+	}
+	if !bytes.Equal(claimed[0].Body, []byte("hello")) {
+		t.Fatalf("body = %q, want hello", claimed[0].Body)
+	}
+}
