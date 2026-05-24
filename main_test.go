@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1783,11 +1784,18 @@ func TestRuntimeStaleAckRejected(t *testing.T) {
 		t.Fatal("expected new delivery token after redelivery")
 	}
 
+	// Using the old token with the current receipt handle should yield
+	// a delivery token mismatch, not "receipt handle not found".
+	// Seq is now immutable across redeliveries, so the receipt handle
+	// stays the same and the inflight lookup succeeds.
 	results := qm.AckBatch(ctx, id, []AckEntry{
 		{ReceiptHandle: claimed2[0].ReceiptHandle, DeliveryToken: oldToken},
 	})
 	if len(results) != 1 || results[0].Status != "error" {
 		t.Fatalf("expected stale ack rejected, got %+v", results)
+	}
+	if !strings.Contains(results[0].Error, "delivery token mismatch") {
+		t.Fatalf("expected delivery token mismatch error, got: %s", results[0].Error)
 	}
 }
 
@@ -1839,6 +1847,37 @@ func TestRuntimeReapExpiredToReady(t *testing.T) {
 	}
 	if !bytes.Equal(claimed2[0].Body, []byte("hello")) {
 		t.Fatalf("reclaimed body = %q, want hello", claimed2[0].Body)
+	}
+}
+
+// T9b: Receipt handle is preserved across redeliveries
+func TestRuntimeReceiptHandlePreservedAcrossRedelivery(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "rh-preserve", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	firstRH := claimed[0].ReceiptHandle
+
+	_, err = qm.Nack(ctx, id, claimed[0].ReceiptHandle, claimed[0].DeliveryAttemptID)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	claimed2, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	// Receipt handle must be the same after redelivery because Seq is immutable.
+	if claimed2[0].ReceiptHandle != firstRH {
+		t.Fatalf("receipt handle changed after redelivery: got %q, want %q", claimed2[0].ReceiptHandle, firstRH)
 	}
 }
 

@@ -2405,7 +2405,6 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 
 	// Determine target state.
 	var targetState MessageState
-	var newSeq uint64
 	if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
 		targetState = StateDead
 		msg.State = StateDead
@@ -2413,9 +2412,6 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 	} else {
 		targetState = StateReady
 		msg.State = StateReady
-		newSeq = q.nextSeq
-		q.nextSeq++
-		msg.Seq = newSeq
 		msg.CurrentReceiptHandle = ""
 		msg.CurrentDeliveryToken = ""
 		msg.VisibilityDeadline = time.Time{}
@@ -2430,8 +2426,8 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 			ReceiptHandle:  dr.ReceiptHandle,
 			DeliveryToken:  dr.DeliveryToken,
 			TargetState:    targetState,
-			HasNewReadySeq: targetState == StateReady,
-			NewReadySeq:    newSeq,
+			HasNewReadySeq: false,
+			NewReadySeq:    0,
 		},
 	}
 	if _, _, err := qm.wal.Append(ctx, []walEntry{walEntryVal}); err != nil {
@@ -2446,7 +2442,6 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 			msg.CurrentReceiptHandle = dr.ReceiptHandle
 			msg.CurrentDeliveryToken = dr.DeliveryToken
 			msg.VisibilityDeadline = dr.Deadline
-			q.nextSeq = newSeq
 		} else {
 			delete(q.dead, msg.ID)
 			msg.State = StateInFlight
@@ -2494,7 +2489,6 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			dr          *deliveryRecord
 			msg         *messageRecord
 			targetState MessageState
-			newSeq      uint64
 		}
 		var pending []pendingReap
 
@@ -2515,28 +2509,24 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			}
 
 			var targetState MessageState
-			var newSeq uint64
 			if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
 				targetState = StateDead
 			} else {
 				targetState = StateReady
-				newSeq = q.nextSeq
-				q.nextSeq++
 			}
 
 			pending = append(pending, pendingReap{
 				dr:          dr,
 				msg:         msg,
 				targetState: targetState,
-				newSeq:      newSeq,
 			})
 
 			reaps = append(reaps, walReapedMessage{
 				MessageID:             msg.ID,
 				PreviousDeliveryToken: dr.DeliveryToken,
 				TargetState:           targetState,
-				HasNewReadySeq:        targetState == StateReady,
-				NewReadySeq:           newSeq,
+				HasNewReadySeq:        false,
+				NewReadySeq:           0,
 			})
 			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: targetState})
 		}
@@ -2563,12 +2553,7 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
 			// WAL failed — no mutations were applied. The delivery records
 			// are still in q.inflight. Rebuild the heap from the inflight
-			// map (which is unchanged) and rollback seq allocations.
-			for _, p := range pending {
-				if p.targetState == StateReady {
-					q.nextSeq-- // rollback seq allocation
-				}
-			}
+			// map (which is unchanged).
 			q.deadlines = q.deadlines[:0]
 			for _, dr := range q.inflight {
 				dr.heapIndex = -1
@@ -2587,7 +2572,6 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 				q.dead[msg.ID] = msg
 			} else {
 				msg.State = StateReady
-				msg.Seq = p.newSeq
 				msg.CurrentReceiptHandle = ""
 				msg.CurrentDeliveryToken = ""
 				msg.VisibilityDeadline = time.Time{}
