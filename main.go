@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
+	"container/list"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -1873,4 +1876,173 @@ func main() {
 		log.Fatalf("server failed: %v", err)
 	}
 
+}
+
+// ============================================================================
+// Phase 2.2: In-memory queueRuntime state model
+// ============================================================================
+
+// walAppender is the minimal interface the queue manager needs from the WAL.
+// walStore already satisfies this. A fake implementation is used in tests.
+type walAppender interface {
+	Append(ctx context.Context, entries []walEntry) (firstLSN, lastLSN uint64, err error)
+}
+
+// messageRecord is the in-memory representation of a message.
+// Body is immutable after publish (caller must copy input).
+type messageRecord struct {
+	ID               string
+	QueueID          string
+	Seq              uint64
+	Body             []byte
+	State            MessageState
+	EnqueuedAt       time.Time
+	DeliveryCount    int
+	MaxDeliveryCount int
+
+	CurrentReceiptHandle string
+	CurrentDeliveryToken string
+	VisibilityDeadline   time.Time
+
+	readyElement *list.Element // list node for O(1) removal from ready list
+	heapIndex    int           // index in visibilityHeap; -1 when not in heap
+}
+
+// deliveryRecord tracks an in-flight delivery for O(1) ack/nack lookup.
+type deliveryRecord struct {
+	MessageID     string
+	ReceiptHandle string
+	DeliveryToken string
+	Deadline      time.Time
+	DeliveryCount int
+	heapIndex     int // index in visibilityHeap
+}
+
+// ============================================================================
+// visibilityHeap
+// ============================================================================
+
+// visibilityHeap is a min-heap of *deliveryRecord ordered by Deadline.
+type visibilityHeap []*deliveryRecord
+
+func (h visibilityHeap) Len() int { return len(h) }
+func (h visibilityHeap) Less(i, j int) bool {
+	return h[i].Deadline.Before(h[j].Deadline)
+}
+func (h visibilityHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIndex = i
+	h[j].heapIndex = j
+}
+
+func (h *visibilityHeap) Push(x any) {
+	dr := x.(*deliveryRecord)
+	dr.heapIndex = len(*h)
+	*h = append(*h, dr)
+}
+
+func (h *visibilityHeap) Pop() any {
+	old := *h
+	n := len(old)
+	dr := old[n-1]
+	dr.heapIndex = -1
+	*h = old[0 : n-1]
+	return dr
+}
+
+// ============================================================================
+// queueRuntime: per-queue in-memory state
+// ============================================================================
+
+type queueRuntime struct {
+	mu sync.Mutex
+
+	id     string
+	config QueueConfig
+
+	nextSeq uint64
+
+	ready    *list.List                    // []*messageRecord — FIFO order
+	messages map[string]*messageRecord     // keyed by message ID
+	inflight map[string]*deliveryRecord    // keyed by receiptHandle
+	dead     map[string]*messageRecord
+
+	deadlines visibilityHeap // min-heap of *deliveryRecord
+
+	readyCh chan struct{}
+	metrics *queueMetrics
+
+	maxMessages int64
+	maxBytes    int64
+	bytesInMem  int64
+}
+
+func newQueueRuntime(id string, config QueueConfig, metrics *queueMetrics) *queueRuntime {
+	q := &queueRuntime{
+		id:          id,
+		config:      config,
+		ready:       list.New(),
+		messages:    make(map[string]*messageRecord),
+		inflight:    make(map[string]*deliveryRecord),
+		dead:        make(map[string]*messageRecord),
+		readyCh:     make(chan struct{}, 1),
+		metrics:     metrics,
+		maxMessages: parseInt64Env("KUEUE_MAX_IN_MEMORY_MESSAGES", 0),
+		maxBytes:    parseInt64Env("KUEUE_MAX_IN_MEMORY_BYTES", 0),
+	}
+	heap.Init(&q.deadlines)
+	return q
+}
+
+func parseInt64Env(name string, defaultVal int64) int64 {
+	s := os.Getenv(name)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return v
+}
+
+// receiptHandleForMessage returns a deterministic receipt handle for a message.
+func receiptHandleForMessage(queueID string, seq uint64, messageID string) string {
+	raw := queueID + "|" + strconv.FormatUint(seq, 10) + "|" + messageID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func (q *queueRuntime) signalReady() {
+	select {
+	case q.readyCh <- struct{}{}:
+	default:
+	}
+}
+
+// ============================================================================
+// queueManager: process-wide manager
+// ============================================================================
+
+type queueManager struct {
+	mu     sync.RWMutex
+	queues map[string]*queueRuntime
+	wal    walAppender
+}
+
+func newQueueManager(wal walAppender) *queueManager {
+	return &queueManager{
+		queues: make(map[string]*queueRuntime),
+		wal:    wal,
+	}
+}
+
+// getQueue returns the queueRuntime for an existing queue.
+func (qm *queueManager) getQueue(queueID string) (*queueRuntime, error) {
+	qm.mu.RLock()
+	q, ok := qm.queues[queueID]
+	qm.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("queue %q not found", queueID)
+	}
+	return q, nil
 }
