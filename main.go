@@ -2046,3 +2046,556 @@ func (qm *queueManager) getQueue(queueID string) (*queueRuntime, error) {
 	}
 	return q, nil
 }
+
+// ============================================================================
+// CreateQueue
+// ============================================================================
+
+func (qm *queueManager) CreateQueue(ctx context.Context, name string, maxRetries int) (string, error) {
+	queueID := uuid.NewString()
+	metrics := getOrCreateMetrics(queueID)
+
+	entry := walEntry{
+		Op: opCreateQueue,
+		Payload: walCreateQueuePayload{
+			QueueID:    queueID,
+			Name:       name,
+			MaxRetries: maxRetries,
+		},
+	}
+	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+		return "", fmt.Errorf("wal append create queue: %w", err)
+	}
+
+	config := QueueConfig{Name: name, MaxRetries: maxRetries}
+	q := newQueueRuntime(queueID, config, metrics)
+
+	qm.mu.Lock()
+	qm.queues[queueID] = q
+	qm.mu.Unlock()
+
+	return queueID, nil
+}
+
+// ============================================================================
+// PublishBatch
+// ============================================================================
+
+func (qm *queueManager) PublishBatch(ctx context.Context, queueID string, bodies [][]byte) ([]string, error) {
+	q, err := qm.getQueue(queueID)
+	if err != nil {
+		return nil, err
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	n := len(bodies)
+	if n == 0 {
+		return nil, nil
+	}
+
+	// Enforce memory limits.
+	if q.maxMessages > 0 && int64(len(q.messages)+n) > q.maxMessages {
+		return nil, errors.New("queue message limit exceeded")
+	}
+	var totalBytes int64
+	for _, b := range bodies {
+		totalBytes += int64(len(b))
+	}
+	if q.maxBytes > 0 && q.bytesInMem+totalBytes > q.maxBytes {
+		return nil, errors.New("queue byte limit exceeded")
+	}
+
+	// Allocate seq range.
+	startSeq := q.nextSeq
+	q.nextSeq += uint64(n)
+
+	records := make([]*messageRecord, n)
+	now := time.Now()
+	walMsgs := make([]walPublishedMessage, n)
+	ids := make([]string, n)
+
+	for i, body := range bodies {
+		msgID := uuid.NewString()
+		seq := startSeq + uint64(i)
+		msg := &messageRecord{
+			ID:               msgID,
+			QueueID:          queueID,
+			Seq:              seq,
+			Body:             bytes.Clone(body),
+			State:            StateReady,
+			EnqueuedAt:       now,
+			DeliveryCount:    0,
+			MaxDeliveryCount: q.config.MaxRetries,
+		}
+		records[i] = msg
+		walMsgs[i] = walPublishedMessage{
+			MessageID:        msgID,
+			Seq:              seq,
+			Body:             msg.Body,
+			EnqueuedAt:       now,
+			MaxDeliveryCount: msg.MaxDeliveryCount,
+		}
+		ids[i] = msgID
+	}
+
+	entry := walEntry{
+		Op: opPublishBatch,
+		Payload: walPublishBatchPayload{
+			QueueID:  queueID,
+			Messages: walMsgs,
+		},
+	}
+	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+		q.nextSeq = startSeq // rollback seq allocation
+		return nil, fmt.Errorf("wal append publish batch: %w", err)
+	}
+
+	// WAL succeeded — install into memory.
+	for _, msg := range records {
+		msg.readyElement = q.ready.PushBack(msg)
+		q.messages[msg.ID] = msg
+	}
+	q.bytesInMem += totalBytes
+	q.metrics.totalPublished.Add(int64(n))
+	q.metrics.readyCount.Add(int64(n))
+	q.signalReady()
+
+	return ids, nil
+}
+
+// ============================================================================
+// ClaimBatch — O(1) list pop, not map scan
+// ============================================================================
+
+func (qm *queueManager) ClaimBatch(ctx context.Context, queueID string, max int) ([]claimedMessage, error) {
+	q, err := qm.getQueue(queueID)
+	if err != nil {
+		return nil, err
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Pop up to max from ready list front.
+	var popped []*messageRecord
+	for i := 0; i < max; i++ {
+		front := q.ready.Front()
+		if front == nil {
+			break
+		}
+		msg := front.Value.(*messageRecord)
+		q.ready.Remove(front)
+		msg.readyElement = nil
+		popped = append(popped, msg)
+	}
+	if len(popped) == 0 {
+		return nil, ErrNoReadyMessages
+	}
+
+	now := time.Now()
+	vt := 30 * time.Second
+	claims := make([]walClaimedMessage, len(popped))
+
+	for i, msg := range popped {
+		msg.State = StateInFlight
+		msg.DeliveryCount++
+		msg.CurrentReceiptHandle = receiptHandleForMessage(queueID, msg.Seq, msg.ID)
+		msg.CurrentDeliveryToken = uuid.NewString()
+		msg.VisibilityDeadline = now.Add(vt)
+
+		dr := &deliveryRecord{
+			MessageID:     msg.ID,
+			ReceiptHandle: msg.CurrentReceiptHandle,
+			DeliveryToken: msg.CurrentDeliveryToken,
+			Deadline:      msg.VisibilityDeadline,
+			DeliveryCount: msg.DeliveryCount,
+		}
+		q.inflight[dr.ReceiptHandle] = dr
+		heap.Push(&q.deadlines, dr)
+
+		claims[i] = walClaimedMessage{
+			MessageID:          msg.ID,
+			ReceiptHandle:      dr.ReceiptHandle,
+			DeliveryToken:      dr.DeliveryToken,
+			VisibilityDeadline: msg.VisibilityDeadline,
+			DeliveryCount:      msg.DeliveryCount,
+		}
+	}
+
+	entry := walEntry{
+		Op: opClaimBatch,
+		Payload: walClaimBatchPayload{
+			QueueID: queueID,
+			Claims:  claims,
+		},
+	}
+	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+		// Rollback: restore popped records to ready front in reverse order.
+		for i := len(popped) - 1; i >= 0; i-- {
+			msg := popped[i]
+			msg.State = StateReady
+			msg.CurrentReceiptHandle = ""
+			msg.CurrentDeliveryToken = ""
+			msg.VisibilityDeadline = time.Time{}
+			msg.DeliveryCount--
+			msg.readyElement = q.ready.PushFront(msg)
+			delete(q.inflight, msg.CurrentReceiptHandle)
+		}
+		// Clean up any heap entries that were added (they'll be stale but harmless
+		// until the reaper tries to process them; we'll rebuild the heap from
+		// inflight on the next operation that needs it).
+		// Simpler: rebuild the heap from the current inflight map.
+		q.deadlines = q.deadlines[:0]
+		for _, dr := range q.inflight {
+			dr.heapIndex = -1
+			heap.Push(&q.deadlines, dr)
+		}
+		return nil, fmt.Errorf("wal append claim batch: %w", err)
+	}
+
+	q.metrics.readyCount.Add(-int64(len(popped)))
+	q.metrics.inFlightCount.Add(int64(len(popped)))
+	q.metrics.totalReceived.Add(int64(len(popped)))
+
+	result := make([]claimedMessage, len(popped))
+	for i, msg := range popped {
+		result[i] = msg.toClaimedMessage()
+	}
+	return result, nil
+}
+
+func (msg *messageRecord) toClaimedMessage() claimedMessage {
+	return claimedMessage{
+		Message: Message{
+			ID:                 msg.ID,
+			Body:               msg.Body,
+			State:              msg.State,
+			EnqueuedAt:         msg.EnqueuedAt,
+			DeliveryCount:      msg.DeliveryCount,
+			MaxDeliveryCount:   msg.MaxDeliveryCount,
+			VisibilityDeadline: msg.VisibilityDeadline,
+			DeliveryAttemptID:  msg.CurrentDeliveryToken,
+		},
+		ReceiptHandle: msg.CurrentReceiptHandle,
+	}
+}
+
+// ============================================================================
+// AckBatch
+// ============================================================================
+
+type runtimeAckResult struct {
+	ReceiptHandle string
+	Status        string // "ok" or "error"
+	Error         string
+}
+
+func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []AckEntry) []runtimeAckResult {
+	q, err := qm.getQueue(queueID)
+	if err != nil {
+		results := make([]runtimeAckResult, len(acks))
+		for i := range acks {
+			results[i] = runtimeAckResult{
+				ReceiptHandle: acks[i].ReceiptHandle,
+				Status:        "error",
+				Error:         err.Error(),
+			}
+		}
+		return results
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	// Validate each entry and collect valid ones for WAL.
+	valid := make([]*deliveryRecord, 0, len(acks))
+	results := make([]runtimeAckResult, len(acks))
+	for i, entry := range acks {
+		results[i].ReceiptHandle = entry.ReceiptHandle
+		dr, ok := q.inflight[entry.ReceiptHandle]
+		if !ok {
+			results[i].Status = "error"
+			results[i].Error = "receipt handle not found"
+			continue
+		}
+		if dr.DeliveryToken != entry.DeliveryToken {
+			results[i].Status = "error"
+			results[i].Error = (&ErrDeliveryTokenMismatch{Expected: dr.DeliveryToken, Got: entry.DeliveryToken}).Error()
+			continue
+		}
+		valid = append(valid, dr)
+		results[i].Status = "ok"
+	}
+
+	if len(valid) == 0 {
+		return results
+	}
+
+	walAcks := make([]walAckedMessage, len(valid))
+	for i, dr := range valid {
+		walAcks[i] = walAckedMessage{
+			MessageID:     dr.MessageID,
+			ReceiptHandle: dr.ReceiptHandle,
+			DeliveryToken: dr.DeliveryToken,
+		}
+	}
+	entry := walEntry{
+		Op: opAckBatch,
+		Payload: walAckBatchPayload{
+			QueueID: queueID,
+			Acks:    walAcks,
+		},
+	}
+	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+		for i := range results {
+			results[i].Status = "error"
+			results[i].Error = "wal append failed: " + err.Error()
+		}
+		return results
+	}
+
+	// WAL succeeded — remove from memory.
+	for _, dr := range valid {
+		if dr.heapIndex >= 0 && dr.heapIndex < len(q.deadlines) {
+			heap.Remove(&q.deadlines, dr.heapIndex)
+		}
+		delete(q.inflight, dr.ReceiptHandle)
+		delete(q.messages, dr.MessageID)
+	}
+	q.metrics.inFlightCount.Add(-int64(len(valid)))
+	q.metrics.totalAcked.Add(int64(len(valid)))
+	q.metrics.ackCountWindow.Add(int64(len(valid)))
+
+	return results
+}
+
+// ============================================================================
+// Nack
+// ============================================================================
+
+func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, deliveryToken string) (MessageState, error) {
+	q, err := qm.getQueue(queueID)
+	if err != nil {
+		return "", err
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	dr, ok := q.inflight[receiptHandle]
+	if !ok {
+		return "", &ErrInvalidReceiptHandle{Reason: "receipt handle not found"}
+	}
+	if dr.DeliveryToken != deliveryToken {
+		return "", &ErrDeliveryTokenMismatch{Expected: dr.DeliveryToken, Got: deliveryToken}
+	}
+
+	msg, ok := q.messages[dr.MessageID]
+	if !ok {
+		return "", errors.New("message not found")
+	}
+
+	// Remove from inflight and deadlines.
+	if dr.heapIndex >= 0 && dr.heapIndex < len(q.deadlines) {
+		heap.Remove(&q.deadlines, dr.heapIndex)
+	}
+	delete(q.inflight, receiptHandle)
+
+	// Determine target state.
+	var targetState MessageState
+	var newSeq uint64
+	if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+		targetState = StateDead
+		msg.State = StateDead
+		q.dead[msg.ID] = msg
+	} else {
+		targetState = StateReady
+		msg.State = StateReady
+		newSeq = q.nextSeq
+		q.nextSeq++
+		msg.Seq = newSeq
+		msg.CurrentReceiptHandle = ""
+		msg.CurrentDeliveryToken = ""
+		msg.VisibilityDeadline = time.Time{}
+		msg.readyElement = q.ready.PushBack(msg)
+	}
+
+	walEntryVal := walEntry{
+		Op: opNack,
+		Payload: walNackPayload{
+			QueueID:        queueID,
+			MessageID:      msg.ID,
+			ReceiptHandle:  dr.ReceiptHandle,
+			DeliveryToken:  dr.DeliveryToken,
+			TargetState:    targetState,
+			HasNewReadySeq: targetState == StateReady,
+			NewReadySeq:    newSeq,
+		},
+	}
+	if _, _, err := qm.wal.Append(ctx, []walEntry{walEntryVal}); err != nil {
+		// Rollback: restore delivery record.
+		q.inflight[receiptHandle] = dr
+		dr.heapIndex = -1
+		heap.Push(&q.deadlines, dr)
+		if targetState == StateReady {
+			q.ready.Remove(msg.readyElement)
+			msg.readyElement = nil
+			msg.State = StateInFlight
+			msg.CurrentReceiptHandle = dr.ReceiptHandle
+			msg.CurrentDeliveryToken = dr.DeliveryToken
+			msg.VisibilityDeadline = dr.Deadline
+			q.nextSeq = newSeq
+		} else {
+			delete(q.dead, msg.ID)
+			msg.State = StateInFlight
+		}
+		return "", fmt.Errorf("wal append nack: %w", err)
+	}
+
+	q.metrics.inFlightCount.Add(-1)
+	if targetState == StateReady {
+		q.metrics.readyCount.Add(1)
+		q.signalReady()
+	} else {
+		q.metrics.deadCount.Add(1)
+	}
+
+	return targetState, nil
+}
+
+// ============================================================================
+// ReapExpired — deadline heap peek, not full scan
+// ============================================================================
+
+func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTransition {
+	qm.mu.RLock()
+	ids := make([]string, 0, len(qm.queues))
+	for id := range qm.queues {
+		ids = append(ids, id)
+	}
+	qm.mu.RUnlock()
+
+	var allTransitions []reapTransition
+
+	for _, queueID := range ids {
+		q, err := qm.getQueue(queueID)
+		if err != nil {
+			continue
+		}
+
+		q.mu.Lock()
+		var transitions []reapTransition
+		var reaps []walReapedMessage
+
+		for len(q.deadlines) > 0 && q.deadlines[0].Deadline.Before(now) {
+			dr := heap.Pop(&q.deadlines).(*deliveryRecord)
+			msg, ok := q.messages[dr.MessageID]
+			if !ok {
+				continue
+			}
+			if msg.State != StateInFlight {
+				continue
+			}
+			// Guard against stale heap entries (token changed since push).
+			if msg.CurrentDeliveryToken != dr.DeliveryToken {
+				continue
+			}
+			if msg.VisibilityDeadline.After(now) {
+				// Should not happen because heap ordering, but guard.
+				continue
+			}
+
+			// Remove from inflight.
+			delete(q.inflight, dr.ReceiptHandle)
+
+			var targetState MessageState
+			var newSeq uint64
+			if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
+				targetState = StateDead
+				msg.State = StateDead
+				q.dead[msg.ID] = msg
+			} else {
+				targetState = StateReady
+				msg.State = StateReady
+				newSeq = q.nextSeq
+				q.nextSeq++
+				msg.Seq = newSeq
+				msg.CurrentReceiptHandle = ""
+				msg.CurrentDeliveryToken = ""
+				msg.VisibilityDeadline = time.Time{}
+				msg.readyElement = q.ready.PushBack(msg)
+			}
+
+			reaps = append(reaps, walReapedMessage{
+				MessageID:             msg.ID,
+				PreviousDeliveryToken: dr.DeliveryToken,
+				TargetState:           targetState,
+				HasNewReadySeq:        targetState == StateReady,
+				NewReadySeq:           newSeq,
+			})
+			transitions = append(transitions, reapTransition{QueueID: queueID, ToState: targetState})
+		}
+
+		if len(reaps) == 0 {
+			q.mu.Unlock()
+			continue
+		}
+
+		entry := walEntry{
+			Op: opReapBatch,
+			Payload: walReapBatchPayload{
+				QueueID: queueID,
+				Reaps:   reaps,
+			},
+		}
+		if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+			// Rollback: restore all transitioned messages to inflight.
+			for _, tr := range reaps {
+				msg := q.messages[tr.MessageID]
+				if msg == nil {
+					continue
+				}
+				if tr.TargetState == StateReady {
+					q.ready.Remove(msg.readyElement)
+					msg.readyElement = nil
+					q.nextSeq = tr.NewReadySeq
+				} else {
+					delete(q.dead, msg.ID)
+				}
+				msg.State = StateInFlight
+				msg.Seq = 0 // we don't restore seq; it'll be set correctly on next claim
+				// Rebuild receipt handle and token from the original delivery record
+				// is impossible here, so we rebuild the heap from current inflight map
+				// and skip this message in the reaper until it's explicitly claimed again.
+			}
+			// Rebuild deadlines heap from current inflight map.
+			q.deadlines = q.deadlines[:0]
+			for _, dr := range q.inflight {
+				dr.heapIndex = -1
+				heap.Push(&q.deadlines, dr)
+			}
+			q.mu.Unlock()
+			continue
+		}
+
+		// WAL succeeded — apply metrics.
+		for _, tr := range transitions {
+			q.metrics.inFlightCount.Add(-1)
+			if tr.ToState == StateReady {
+				q.metrics.readyCount.Add(1)
+			} else {
+				q.metrics.deadCount.Add(1)
+			}
+		}
+		if len(transitions) > 0 && transitions[0].ToState == StateReady {
+			q.signalReady()
+		}
+
+		allTransitions = append(allTransitions, transitions...)
+		q.mu.Unlock()
+	}
+
+	return allTransitions
+}
