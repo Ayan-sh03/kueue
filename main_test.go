@@ -1443,13 +1443,19 @@ func TestBatchReceiveLongPollWithWait(t *testing.T) {
 // ============================================================================
 
 type fakeWAL struct {
-	mu      sync.Mutex
-	entries []walEntry
-	nextLSN uint64
-	fail    bool
+	mu           sync.Mutex
+	entries      []walEntry
+	nextLSN      uint64
+	fail         bool
+	beforeAppend func(context.Context, []walEntry) error
 }
 
 func (f *fakeWAL) Append(ctx context.Context, entries []walEntry) (uint64, uint64, error) {
+	if f.beforeAppend != nil {
+		if err := f.beforeAppend(ctx, entries); err != nil {
+			return 0, 0, err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail {
@@ -1473,6 +1479,26 @@ func setupRuntimeTest(t *testing.T) (*queueManager, *fakeWAL) {
 	wal := &fakeWAL{}
 	qm := newQueueManager(wal)
 	return qm, wal
+}
+
+func TestFakeWALAppendStoresReturnedLSNs(t *testing.T) {
+	wal := &fakeWAL{}
+	first, last, err := wal.Append(context.Background(), []walEntry{
+		{Op: opCreateQueue, Payload: walCreateQueuePayload{QueueID: "q1", Name: "one"}},
+		{Op: opCreateQueue, Payload: walCreateQueuePayload{QueueID: "q2", Name: "two"}},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if first != 1 || last != 2 {
+		t.Fatalf("first,last = %d,%d; want 1,2", first, last)
+	}
+	if len(wal.entries) != 2 {
+		t.Fatalf("stored entries = %d, want 2", len(wal.entries))
+	}
+	if wal.entries[0].LSN != 1 || wal.entries[1].LSN != 2 {
+		t.Fatalf("stored LSNs = %d,%d; want 1,2", wal.entries[0].LSN, wal.entries[1].LSN)
+	}
 }
 
 // ============================================================================
@@ -1850,6 +1876,43 @@ func TestRuntimeReapExpiredToReady(t *testing.T) {
 	}
 }
 
+func TestRuntimeReapDeadlineEqualNowIsExpired(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "reap-equal-now", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	_, err = qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	now := time.Now()
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = now
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.heapIndex = -1
+		dr.Deadline = now
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	transitions := qm.ReapExpired(ctx, now)
+	if len(transitions) != 1 {
+		t.Fatalf("reap transitions = %d, want 1", len(transitions))
+	}
+	if transitions[0].ToState != StateReady {
+		t.Fatalf("reap toState = %q, want ready", transitions[0].ToState)
+	}
+}
+
 // T9b: Receipt handle is preserved across redeliveries
 func TestRuntimeReceiptHandlePreservedAcrossRedelivery(t *testing.T) {
 	qm, _ := setupRuntimeTest(t)
@@ -1933,7 +1996,7 @@ func TestRuntimeReapDeadLetter(t *testing.T) {
 // ============================================================================
 
 func TestRuntimeConcurrentQueuesDontBlock(t *testing.T) {
-	qm, _ := setupRuntimeTest(t)
+	qm, wal := setupRuntimeTest(t)
 	ctx := context.Background()
 
 	id1, _ := qm.CreateQueue(ctx, "q1", 3)
@@ -1948,41 +2011,68 @@ func TestRuntimeConcurrentQueuesDontBlock(t *testing.T) {
 		t.Fatalf("publish q2: %v", err)
 	}
 
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(2)
+	blockEntered := make(chan struct{})
+	releaseBlock := make(chan struct{})
+	var blockOnce sync.Once
+	wal.beforeAppend = func(ctx context.Context, entries []walEntry) error {
+		if len(entries) == 0 || entries[0].Op != opClaimBatch {
+			return nil
+		}
+		payload, ok := entries[0].Payload.(walClaimBatchPayload)
+		if !ok || payload.QueueID != id1 {
+			return nil
+		}
+		blockOnce.Do(func() {
+			close(blockEntered)
+		})
+		select {
+		case <-releaseBlock:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 
-	var got1, got2 []claimedMessage
+	var got1 []claimedMessage
+	q1Done := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		<-start
 		var err1 error
 		got1, err1 = qm.ClaimBatch(ctx, id1, 1)
-		if err1 != nil {
-			t.Errorf("claim q1: %v", err1)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		<-start
-		var err2 error
-		got2, err2 = qm.ClaimBatch(ctx, id2, 1)
-		if err2 != nil {
-			t.Errorf("claim q2: %v", err2)
-		}
-	}()
-
-	close(start)
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
+		q1Done <- err1
 	}()
 
 	select {
-	case <-done:
+	case <-blockEntered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("concurrent claims blocked — possible global mutex contention")
+		t.Fatal("q1 claim did not reach blocked WAL append")
+	}
+
+	var got2 []claimedMessage
+	q2Done := make(chan error, 1)
+	go func() {
+		var err2 error
+		got2, err2 = qm.ClaimBatch(ctx, id2, 1)
+		q2Done <- err2
+	}()
+
+	select {
+	case err := <-q2Done:
+		if err != nil {
+			t.Fatalf("claim q2: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseBlock)
+		t.Fatal("q2 claim blocked behind q1 claim")
+	}
+
+	close(releaseBlock)
+	select {
+	case err := <-q1Done:
+		if err != nil {
+			t.Fatalf("claim q1: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("q1 claim did not finish after unblocking WAL")
 	}
 
 	if len(got1) != 1 || string(got1[0].Body) != "a" {
@@ -1990,6 +2080,35 @@ func TestRuntimeConcurrentQueuesDontBlock(t *testing.T) {
 	}
 	if len(got2) != 1 || string(got2[0].Body) != "b" {
 		t.Fatalf("q2 claim wrong: %+v", got2)
+	}
+}
+
+func TestRuntimeVisibilityHeapOrdersEqualDeadlinesByClaimOrder(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "equal-deadlines", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 3)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	got := make([]string, 0, 3)
+	for q.deadlines.Len() > 0 {
+		dr := heap.Pop(&q.deadlines).(*deliveryRecord)
+		got = append(got, dr.ReceiptHandle)
+	}
+	want := []string{claimed[0].ReceiptHandle, claimed[1].ReceiptHandle, claimed[2].ReceiptHandle}
+	if !slicesEqual(got, want) {
+		t.Fatalf("heap pop order = %v, want %v", got, want)
 	}
 }
 
@@ -2339,4 +2458,78 @@ func TestRuntimeClaimWALFailNoStaleInflight(t *testing.T) {
 	if len(claimed) != 2 {
 		t.Fatalf("claimed %d messages, want 2", len(claimed))
 	}
+}
+
+func TestRuntimeReapSignalsWhenAnyTransitionReturnsReady(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "reap-signal", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("dead"), []byte("ready")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 2)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed %d, want 2", len(claimed))
+	}
+
+	now := time.Now()
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		switch string(msg.Body) {
+		case "dead":
+			msg.MaxDeliveryCount = 1
+			msg.VisibilityDeadline = now.Add(-2 * time.Second)
+		case "ready":
+			msg.MaxDeliveryCount = 3
+			msg.VisibilityDeadline = now.Add(-1 * time.Second)
+		}
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		msg := q.messages[dr.MessageID]
+		dr.heapIndex = -1
+		dr.Deadline = msg.VisibilityDeadline
+		heap.Push(&q.deadlines, dr)
+	}
+	for {
+		select {
+		case <-q.readyCh:
+		default:
+			q.mu.Unlock()
+			goto drained
+		}
+	}
+
+drained:
+	transitions := qm.ReapExpired(ctx, now)
+	if len(transitions) != 2 {
+		t.Fatalf("transitions = %d, want 2", len(transitions))
+	}
+	if transitions[0].ToState != StateDead || transitions[1].ToState != StateReady {
+		t.Fatalf("transition order = %+v, want dead then ready", transitions)
+	}
+
+	select {
+	case <-q.readyCh:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected ready signal when a later reap transition returned a message to ready")
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
