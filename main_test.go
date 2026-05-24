@@ -33,6 +33,7 @@ func setupTestDB(t *testing.T) {
 	queueReadyChans = map[string]chan struct{}{}
 	metricsStore = sync.Map{}
 	messageKeyCache = sync.Map{}
+	deliveryRecordSeq.Store(0)
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -1451,6 +1452,12 @@ type fakeWAL struct {
 }
 
 func (f *fakeWAL) Append(ctx context.Context, entries []walEntry) (uint64, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if len(entries) == 0 {
+		return 0, 0, nil
+	}
 	if f.beforeAppend != nil {
 		if err := f.beforeAppend(ctx, entries); err != nil {
 			return 0, 0, err
@@ -1461,13 +1468,9 @@ func (f *fakeWAL) Append(ctx context.Context, entries []walEntry) (uint64, uint6
 	if f.fail {
 		return 0, 0, errors.New("fake WAL failure")
 	}
-	first := f.nextLSN
-	if f.nextLSN == 0 {
-		f.nextLSN = 1
-		first = 1
-	}
+	first := f.nextLSN + 1
 	for i := range entries {
-		f.nextLSN++
+		f.nextLSN = first + uint64(i)
 		entries[i].LSN = f.nextLSN
 		f.entries = append(f.entries, entries[i])
 	}
@@ -1476,6 +1479,7 @@ func (f *fakeWAL) Append(ctx context.Context, entries []walEntry) (uint64, uint6
 
 func setupRuntimeTest(t *testing.T) (*queueManager, *fakeWAL) {
 	t.Helper()
+	deliveryRecordSeq.Store(0)
 	wal := &fakeWAL{}
 	qm := newQueueManager(wal)
 	return qm, wal

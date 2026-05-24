@@ -1915,8 +1915,11 @@ type deliveryRecord struct {
 	DeliveryToken string
 	Deadline      time.Time
 	DeliveryCount int
+	seq           uint64
 	heapIndex     int // index in visibilityHeap
 }
+
+var deliveryRecordSeq atomic.Uint64
 
 // ============================================================================
 // visibilityHeap
@@ -1927,6 +1930,9 @@ type visibilityHeap []*deliveryRecord
 
 func (h visibilityHeap) Len() int { return len(h) }
 func (h visibilityHeap) Less(i, j int) bool {
+	if h[i].Deadline.Equal(h[j].Deadline) {
+		return h[i].seq < h[j].seq
+	}
 	return h[i].Deadline.Before(h[j].Deadline)
 }
 func (h visibilityHeap) Swap(i, j int) {
@@ -1962,9 +1968,9 @@ type queueRuntime struct {
 
 	nextSeq uint64
 
-	ready    *list.List                    // []*messageRecord — FIFO order
-	messages map[string]*messageRecord     // keyed by message ID
-	inflight map[string]*deliveryRecord    // keyed by receiptHandle
+	ready    *list.List                 // []*messageRecord — FIFO order
+	messages map[string]*messageRecord  // keyed by message ID
+	inflight map[string]*deliveryRecord // keyed by receiptHandle
 	dead     map[string]*messageRecord
 
 	deadlines visibilityHeap // min-heap of *deliveryRecord
@@ -2211,6 +2217,7 @@ func (qm *queueManager) ClaimBatch(ctx context.Context, queueID string, max int)
 			DeliveryToken: msg.CurrentDeliveryToken,
 			Deadline:      msg.VisibilityDeadline,
 			DeliveryCount: msg.DeliveryCount,
+			seq:           deliveryRecordSeq.Add(1),
 		}
 		q.inflight[dr.ReceiptHandle] = dr
 		heap.Push(&q.deadlines, dr)
@@ -2500,7 +2507,7 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		}
 		var pending []pendingReap
 
-		for len(q.deadlines) > 0 && q.deadlines[0].Deadline.Before(now) {
+		for len(q.deadlines) > 0 && !q.deadlines[0].Deadline.After(now) {
 			dr := heap.Pop(&q.deadlines).(*deliveryRecord)
 			msg, ok := q.messages[dr.MessageID]
 			if !ok {
@@ -2587,15 +2594,17 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 			}
 		}
 
+		hasReadyTransition := false
 		for _, tr := range transitions {
 			q.metrics.inFlightCount.Add(-1)
 			if tr.ToState == StateReady {
 				q.metrics.readyCount.Add(1)
+				hasReadyTransition = true
 			} else {
 				q.metrics.deadCount.Add(1)
 			}
 		}
-		if len(transitions) > 0 && transitions[0].ToState == StateReady {
+		if hasReadyTransition {
 			q.signalReady()
 		}
 
