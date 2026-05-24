@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"container/heap"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -1431,5 +1434,633 @@ func TestBatchReceiveLongPollWithWait(t *testing.T) {
 	// FIFO: first published should be first received
 	if string(resp.Messages[0].Body) != "batch-0" {
 		t.Fatalf("first message body = %q, want batch-0", string(resp.Messages[0].Body))
+	}
+}
+
+// ============================================================================
+// Phase 2.2: queueRuntime test harness
+// ============================================================================
+
+type fakeWAL struct {
+	mu      sync.Mutex
+	entries []walEntry
+	nextLSN uint64
+	fail    bool
+}
+
+func (f *fakeWAL) Append(ctx context.Context, entries []walEntry) (uint64, uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return 0, 0, errors.New("fake WAL failure")
+	}
+	first := f.nextLSN
+	if f.nextLSN == 0 {
+		f.nextLSN = 1
+		first = 1
+	}
+	for i := range entries {
+		f.nextLSN++
+		entries[i].LSN = f.nextLSN
+		f.entries = append(f.entries, entries[i])
+	}
+	return first, f.nextLSN, nil
+}
+
+func setupRuntimeTest(t *testing.T) (*queueManager, *fakeWAL) {
+	t.Helper()
+	wal := &fakeWAL{}
+	qm := newQueueManager(wal)
+	return qm, wal
+}
+
+// ============================================================================
+// T1: CreateQueue
+// ============================================================================
+
+func TestRuntimeCreateQueue(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, err := qm.CreateQueue(ctx, "test-queue", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected non-empty queue ID")
+	}
+
+	q, err := qm.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue: %v", err)
+	}
+	if q.config.Name != "test-queue" {
+		t.Fatalf("queue name = %q, want test-queue", q.config.Name)
+	}
+	if q.config.MaxRetries != 3 {
+		t.Fatalf("maxRetries = %d, want 3", q.config.MaxRetries)
+	}
+}
+
+// ============================================================================
+// T2: PublishBatch FIFO
+// ============================================================================
+
+func TestRuntimePublishBatchFIFO(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "fifo", 3)
+	bodies := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d"), []byte("e")}
+	_, err := qm.PublishBatch(ctx, id, bodies)
+	if err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+
+	claimed, err := qm.ClaimBatch(ctx, id, 5)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+	if len(claimed) != 5 {
+		t.Fatalf("claimed %d, want 5", len(claimed))
+	}
+	for i, msg := range claimed {
+		want := bodies[i]
+		if !bytes.Equal(msg.Body, want) {
+			t.Fatalf("message %d body = %q, want %q", i, msg.Body, want)
+		}
+	}
+}
+
+// ============================================================================
+// T3: Claim empty queue
+// ============================================================================
+
+func TestRuntimeClaimEmptyQueue(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "empty", 3)
+	_, err := qm.ClaimBatch(ctx, id, 1)
+	if !errors.Is(err, ErrNoReadyMessages) {
+		t.Fatalf("expected ErrNoReadyMessages, got %v", err)
+	}
+}
+
+// ============================================================================
+// T4: ClaimBatch respects max
+// ============================================================================
+
+func TestRuntimeClaimBatchMax(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "max-test", 3)
+	bodies := make([][]byte, 10)
+	for i := range bodies {
+		bodies[i] = []byte(fmt.Sprintf("msg-%d", i))
+	}
+	_, err := qm.PublishBatch(ctx, id, bodies)
+	if err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+
+	claimed, err := qm.ClaimBatch(ctx, id, 3)
+	if err != nil {
+		t.Fatalf("claim batch: %v", err)
+	}
+	if len(claimed) != 3 {
+		t.Fatalf("claimed %d, want 3", len(claimed))
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	readyCount := q.ready.Len()
+	q.mu.Unlock()
+	if readyCount != 7 {
+		t.Fatalf("ready count = %d, want 7", readyCount)
+	}
+}
+
+// ============================================================================
+// T5: Ack removes from state
+// ============================================================================
+
+func TestRuntimeAckRemovesFromState(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "ack-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 {
+		t.Fatal("expected 1 claimed message")
+	}
+
+	results := qm.AckBatch(ctx, id, []AckEntry{
+		{ReceiptHandle: claimed[0].ReceiptHandle, DeliveryToken: claimed[0].DeliveryAttemptID},
+	})
+	if len(results) != 1 || results[0].Status != "ok" {
+		t.Fatalf("ack result = %+v", results)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	if len(q.messages) != 0 {
+		t.Fatalf("messages len = %d, want 0", len(q.messages))
+	}
+	if len(q.inflight) != 0 {
+		t.Fatalf("inflight len = %d, want 0", len(q.inflight))
+	}
+	if q.deadlines.Len() != 0 {
+		t.Fatalf("deadlines len = %d, want 0", q.deadlines.Len())
+	}
+	q.mu.Unlock()
+}
+
+// ============================================================================
+// T6: Nack returns to ready
+// ============================================================================
+
+func TestRuntimeNackReturnsToReady(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "nack-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	_, err = qm.Nack(ctx, id, claimed[0].ReceiptHandle, claimed[0].DeliveryAttemptID)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	readyCount := q.ready.Len()
+	q.mu.Unlock()
+	if readyCount != 1 {
+		t.Fatalf("ready count after nack = %d, want 1", readyCount)
+	}
+
+	// Should be receivable again.
+	claimed2, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("reclaim after nack: %v", err)
+	}
+	if !bytes.Equal(claimed2[0].Body, []byte("hello")) {
+		t.Fatalf("reclaimed body = %q, want hello", claimed2[0].Body)
+	}
+}
+
+// ============================================================================
+// T7: Nack appends to ready tail
+// ============================================================================
+
+func TestRuntimeNackToReadyTail(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "tail-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("A"), []byte("B")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if string(claimed[0].Body) != "A" {
+		t.Fatalf("first claim = %q, want A", claimed[0].Body)
+	}
+
+	_, err = qm.Nack(ctx, id, claimed[0].ReceiptHandle, claimed[0].DeliveryAttemptID)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	claimed2, err := qm.ClaimBatch(ctx, id, 2)
+	if err != nil {
+		t.Fatalf("claim 2: %v", err)
+	}
+	if len(claimed2) != 2 {
+		t.Fatalf("claimed %d, want 2", len(claimed2))
+	}
+	if string(claimed2[0].Body) != "B" {
+		t.Fatalf("first after nack = %q, want B", claimed2[0].Body)
+	}
+	if string(claimed2[1].Body) != "A" {
+		t.Fatalf("second after nack = %q, want A", claimed2[1].Body)
+	}
+}
+
+// ============================================================================
+// T8: Dead letter after max deliveries via nack
+// ============================================================================
+
+func TestRuntimeDeadLetterAfterMaxDeliveries(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "dead-test", 1)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed[0].DeliveryCount != 1 {
+		t.Fatalf("delivery count = %d, want 1", claimed[0].DeliveryCount)
+	}
+
+	state, err := qm.Nack(ctx, id, claimed[0].ReceiptHandle, claimed[0].DeliveryAttemptID)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+	if state != StateDead {
+		t.Fatalf("state = %q, want dead", state)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	deadCount := len(q.dead)
+	q.mu.Unlock()
+	if deadCount != 1 {
+		t.Fatalf("dead count = %d, want 1", deadCount)
+	}
+
+	// Should NOT be receivable.
+	_, err = qm.ClaimBatch(ctx, id, 1)
+	if !errors.Is(err, ErrNoReadyMessages) {
+		t.Fatalf("expected ErrNoReadyMessages after dead letter, got %v", err)
+	}
+}
+
+// ============================================================================
+// T9: Stale ack token rejected after redelivery
+// ============================================================================
+
+func TestRuntimeStaleAckRejected(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "stale-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	oldToken := claimed[0].DeliveryAttemptID
+
+	_, err = qm.Nack(ctx, id, claimed[0].ReceiptHandle, oldToken)
+	if err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	claimed2, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if claimed2[0].DeliveryAttemptID == oldToken {
+		t.Fatal("expected new delivery token after redelivery")
+	}
+
+	results := qm.AckBatch(ctx, id, []AckEntry{
+		{ReceiptHandle: claimed2[0].ReceiptHandle, DeliveryToken: oldToken},
+	})
+	if len(results) != 1 || results[0].Status != "error" {
+		t.Fatalf("expected stale ack rejected, got %+v", results)
+	}
+}
+
+// ============================================================================
+// T10: Reap expired to ready
+// ============================================================================
+
+func TestRuntimeReapExpiredToReady(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "reap-ready", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	_, err = qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Manually expire the message.
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+	}
+	// Rebuild deadlines heap with the new deadline.
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.heapIndex = -1
+		dr.Deadline = time.Now().Add(-1 * time.Second)
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	transitions := qm.ReapExpired(ctx, time.Now())
+	if len(transitions) != 1 {
+		t.Fatalf("reap transitions = %d, want 1", len(transitions))
+	}
+	if transitions[0].ToState != StateReady {
+		t.Fatalf("reap toState = %q, want ready", transitions[0].ToState)
+	}
+
+	// Should be receivable again.
+	claimed2, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("reclaim after reap: %v", err)
+	}
+	if !bytes.Equal(claimed2[0].Body, []byte("hello")) {
+		t.Fatalf("reclaimed body = %q, want hello", claimed2[0].Body)
+	}
+}
+
+// ============================================================================
+// T11: Reap dead letter
+// ============================================================================
+
+func TestRuntimeReapDeadLetter(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "reap-dead", 1)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	_, err = qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.heapIndex = -1
+		dr.Deadline = time.Now().Add(-1 * time.Second)
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	transitions := qm.ReapExpired(ctx, time.Now())
+	if len(transitions) != 1 {
+		t.Fatalf("reap transitions = %d, want 1", len(transitions))
+	}
+	if transitions[0].ToState != StateDead {
+		t.Fatalf("reap toState = %q, want dead", transitions[0].ToState)
+	}
+
+	q.mu.Lock()
+	deadCount := len(q.dead)
+	q.mu.Unlock()
+	if deadCount != 1 {
+		t.Fatalf("dead count = %d, want 1", deadCount)
+	}
+}
+
+// ============================================================================
+// T12: Concurrent queues do not block each other
+// ============================================================================
+
+func TestRuntimeConcurrentQueuesDontBlock(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id1, _ := qm.CreateQueue(ctx, "q1", 3)
+	id2, _ := qm.CreateQueue(ctx, "q2", 3)
+
+	_, err := qm.PublishBatch(ctx, id1, [][]byte{[]byte("a")})
+	if err != nil {
+		t.Fatalf("publish q1: %v", err)
+	}
+	_, err = qm.PublishBatch(ctx, id2, [][]byte{[]byte("b")})
+	if err != nil {
+		t.Fatalf("publish q2: %v", err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var got1, got2 []claimedMessage
+	go func() {
+		defer wg.Done()
+		<-start
+		var err1 error
+		got1, err1 = qm.ClaimBatch(ctx, id1, 1)
+		if err1 != nil {
+			t.Errorf("claim q1: %v", err1)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		var err2 error
+		got2, err2 = qm.ClaimBatch(ctx, id2, 1)
+		if err2 != nil {
+			t.Errorf("claim q2: %v", err2)
+		}
+	}()
+
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent claims blocked — possible global mutex contention")
+	}
+
+	if len(got1) != 1 || string(got1[0].Body) != "a" {
+		t.Fatalf("q1 claim wrong: %+v", got1)
+	}
+	if len(got2) != 1 || string(got2[0].Body) != "b" {
+		t.Fatalf("q2 claim wrong: %+v", got2)
+	}
+}
+
+// ============================================================================
+// T13: WAL append is called
+// ============================================================================
+
+func TestRuntimeWALAppendCalled(t *testing.T) {
+	qm, wal := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "wal-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	wal.mu.Lock()
+	count := len(wal.entries)
+	wal.mu.Unlock()
+	if count < 2 {
+		t.Fatalf("expected at least 2 WAL entries (create + publish), got %d", count)
+	}
+
+	var hasCreate, hasPublish bool
+	wal.mu.Lock()
+	for _, e := range wal.entries {
+		switch e.Op {
+		case opCreateQueue:
+			hasCreate = true
+		case opPublishBatch:
+			hasPublish = true
+		}
+	}
+	wal.mu.Unlock()
+	if !hasCreate {
+		t.Fatal("missing opCreateQueue in WAL")
+	}
+	if !hasPublish {
+		t.Fatal("missing opPublishBatch in WAL")
+	}
+}
+
+// ============================================================================
+// T14: WAL failure rolls back memory state
+// ============================================================================
+
+func TestRuntimeWALFailureRollsBack(t *testing.T) {
+	qm, wal := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "rollback-test", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	beforeReady := q.ready.Len()
+	beforeNextSeq := q.nextSeq
+	q.mu.Unlock()
+	if beforeReady != 1 {
+		t.Fatalf("ready before = %d, want 1", beforeReady)
+	}
+
+	wal.fail = true
+	_, err = qm.PublishBatch(ctx, id, [][]byte{[]byte("world")})
+	if err == nil {
+		t.Fatal("expected WAL failure error")
+	}
+
+	q.mu.Lock()
+	afterReady := q.ready.Len()
+	afterNextSeq := q.nextSeq
+	q.mu.Unlock()
+	if afterReady != beforeReady {
+		t.Fatalf("ready after rollback = %d, want %d", afterReady, beforeReady)
+	}
+	if afterNextSeq != beforeNextSeq {
+		t.Fatalf("nextSeq after rollback = %d, want %d", afterNextSeq, beforeNextSeq)
+	}
+}
+
+// ============================================================================
+// T15: Memory limit rejects publish
+// ============================================================================
+
+func TestRuntimeMemoryLimitReject(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "limit-test", 3)
+	q, _ := qm.getQueue(id)
+	q.maxMessages = 1
+
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("first")})
+	if err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+
+	_, err = qm.PublishBatch(ctx, id, [][]byte{[]byte("second")})
+	if err == nil {
+		t.Fatal("expected memory limit error")
+	}
+
+	q.mu.Lock()
+	readyCount := q.ready.Len()
+	q.mu.Unlock()
+	if readyCount != 1 {
+		t.Fatalf("ready count = %d, want 1", readyCount)
 	}
 }
