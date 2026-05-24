@@ -2311,9 +2311,15 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 
 	// Validate each entry and collect valid ones for WAL.
 	valid := make([]*deliveryRecord, 0, len(acks))
+	seen := make(map[string]bool, len(acks))
 	results := make([]runtimeAckResult, len(acks))
 	for i, entry := range acks {
 		results[i].ReceiptHandle = entry.ReceiptHandle
+		if seen[entry.ReceiptHandle] {
+			results[i].Status = "error"
+			results[i].Error = "duplicate receipt handle"
+			continue
+		}
 		dr, ok := q.inflight[entry.ReceiptHandle]
 		if !ok {
 			results[i].Status = "error"
@@ -2325,6 +2331,7 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 			results[i].Error = (&ErrDeliveryTokenMismatch{Expected: dr.DeliveryToken, Got: entry.DeliveryToken}).Error()
 			continue
 		}
+		seen[entry.ReceiptHandle] = true
 		valid = append(valid, dr)
 		results[i].Status = "ok"
 	}

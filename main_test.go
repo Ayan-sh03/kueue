@@ -2239,3 +2239,49 @@ func TestRuntimeAckReleasesByteQuota(t *testing.T) {
 		t.Fatalf("bytesInMem = %d, want 5", bytesInMem)
 	}
 }
+
+// ============================================================================
+// T18: Duplicate receipt handles in ack batch are rejected
+// ============================================================================
+
+func TestRuntimeAckBatchRejectsDuplicateReceiptHandle(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "dup-rh", 3)
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("hello")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Same receipt handle and token twice in one batch.
+	results := qm.AckBatch(ctx, id, []AckEntry{
+		{ReceiptHandle: claimed[0].ReceiptHandle, DeliveryToken: claimed[0].DeliveryAttemptID},
+		{ReceiptHandle: claimed[0].ReceiptHandle, DeliveryToken: claimed[0].DeliveryAttemptID},
+	})
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].Status != "ok" {
+		t.Fatalf("first result = %s, want ok", results[0].Status)
+	}
+	if results[1].Status != "error" {
+		t.Fatalf("second result = %s, want error (duplicate)", results[1].Status)
+	}
+	if !strings.Contains(results[1].Error, "duplicate") {
+		t.Fatalf("second result error = %q, want duplicate receipt handle", results[1].Error)
+	}
+
+	// Verify inFlightCount only decremented by 1.
+	q, _ := qm.getQueue(id)
+	q.mu.Lock()
+	inFlight := q.metrics.inFlightCount.Load()
+	q.mu.Unlock()
+	if inFlight != 0 {
+		t.Fatalf("inFlightCount = %d, want 0", inFlight)
+	}
+}
