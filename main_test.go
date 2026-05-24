@@ -2189,3 +2189,53 @@ func TestRuntimeReapWALFailPreservesInflight(t *testing.T) {
 		t.Fatalf("body = %q, want hello", claimed[0].Body)
 	}
 }
+
+// ============================================================================
+// T17: Ack releases byte quota for subsequent publishes
+// ============================================================================
+
+func TestRuntimeAckReleasesByteQuota(t *testing.T) {
+	qm, _ := setupRuntimeTest(t)
+	ctx := context.Background()
+
+	id, _ := qm.CreateQueue(ctx, "byte-quota", 3)
+	q, _ := qm.getQueue(id)
+	q.maxBytes = 5
+
+	_, err := qm.PublishBatch(ctx, id, [][]byte{[]byte("12345")})
+	if err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+
+	// Second publish should exceed byte limit (5+5 > 5 is false, but 5+1 > 5 is true
+	// since bytesInMem is already 5). Actually: bytesInMem(5) + totalBytes(5) > maxBytes(5).
+	_, err = qm.PublishBatch(ctx, id, [][]byte{[]byte("67890")})
+	if err == nil {
+		t.Fatal("expected byte limit exceeded error")
+	}
+
+	// Claim and ack the first message.
+	claimed, err := qm.ClaimBatch(ctx, id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	results := qm.AckBatch(ctx, id, []AckEntry{
+		{ReceiptHandle: claimed[0].ReceiptHandle, DeliveryToken: claimed[0].DeliveryAttemptID},
+	})
+	if len(results) != 1 || results[0].Status != "ok" {
+		t.Fatalf("ack result = %+v", results)
+	}
+
+	// Byte quota should now be released; publish should succeed.
+	_, err = qm.PublishBatch(ctx, id, [][]byte{[]byte("abcde")})
+	if err != nil {
+		t.Fatalf("publish after ack should succeed: %v", err)
+	}
+
+	q.mu.Lock()
+	bytesInMem := q.bytesInMem
+	q.mu.Unlock()
+	if bytesInMem != 5 {
+		t.Fatalf("bytesInMem = %d, want 5", bytesInMem)
+	}
+}

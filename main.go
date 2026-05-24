@@ -2362,7 +2362,10 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 			heap.Remove(&q.deadlines, dr.heapIndex)
 		}
 		delete(q.inflight, dr.ReceiptHandle)
-		delete(q.messages, dr.MessageID)
+		if msg, ok := q.messages[dr.MessageID]; ok {
+			q.bytesInMem -= int64(len(msg.Body))
+			delete(q.messages, dr.MessageID)
+		}
 	}
 	q.metrics.inFlightCount.Add(-int64(len(valid)))
 	q.metrics.totalAcked.Add(int64(len(valid)))
