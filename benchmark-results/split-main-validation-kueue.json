@@ -1,0 +1,165 @@
+{
+  "generatedAt": "2026-05-24T09:34:38.2674035Z",
+  "sections": [
+    {
+      "label": "End-to-end (default client config)",
+      "note": "Note: measures protocol + broker together.",
+      "report": {
+        "generatedAt": "2026-05-24T09:34:37.6667385Z",
+        "workload": {
+          "messages": 1000,
+          "warmup": 100,
+          "runs": 1,
+          "payloadBytes": 256,
+          "producers": 1,
+          "consumers": 1,
+          "prefetch": 200,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 10,
+          "rateLimit": 0,
+          "consumerDelayMs": 0,
+          "verifyOrder": false,
+          "preFill": 0,
+          "label": "End-to-end (default client config)"
+        },
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 1000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 1,
+                "publishSeconds": 0.0389809,
+                "consumeSeconds": 0.1068861,
+                "endToEndSeconds": 0.1068861,
+                "publishRate": 25653.58932194998,
+                "consumeRate": 9355.753460927099,
+                "latencyP50Ms": 38.7659,
+                "latencyP95Ms": 65.1947,
+                "latencyP99Ms": 67.9197,
+                "latencyP999Ms": 68.988,
+                "latencyMaxMs": 68.988,
+                "publishedMessages": 1000,
+                "consumedMessages": 1000,
+                "fifoViolations": 0,
+                "consumerCountStdDev": 0,
+                "consumerCountMin": 1000,
+                "consumerCountMax": 1000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 1000,
+              "payloadBytes": 256,
+              "producers": 1,
+              "consumers": 1,
+              "publishSeconds": 0.0389809,
+              "consumeSeconds": 0.1068861,
+              "endToEndSeconds": 0.1068861,
+              "publishRate": 25653.58932194998,
+              "consumeRate": 9355.753460927099,
+              "latencyP50Ms": 38.7659,
+              "latencyP95Ms": 65.1947,
+              "latencyP99Ms": 67.9197,
+              "latencyP999Ms": 68.988,
+              "latencyMaxMs": 68.988,
+              "publishedMessages": 1000,
+              "consumedMessages": 1000,
+              "fifoViolations": 0,
+              "consumerCountStdDev": 0,
+              "consumerCountMin": 1000,
+              "consumerCountMax": 1000
+            }
+          }
+        ]
+      }
+    },
+    {
+      "label": "Apples-to-apples (one message per round-trip)",
+      "note": "Note: isolates broker behavior; not a realistic config for either.",
+      "report": {
+        "generatedAt": "2026-05-24T09:34:37.7888815Z",
+        "workload": {
+          "messages": 1000,
+          "warmup": 100,
+          "runs": 1,
+          "payloadBytes": 256,
+          "producers": 1,
+          "consumers": 1,
+          "prefetch": 1,
+          "targets": [
+            "kueue"
+          ],
+          "kueueBatchSize": 1,
+          "rateLimit": 0,
+          "consumerDelayMs": 0,
+          "verifyOrder": false,
+          "preFill": 0,
+          "label": "Apples-to-apples (one message per round-trip)"
+        },
+        "summaries": [
+          {
+            "target": "kueue",
+            "runs": [
+              {
+                "target": "kueue",
+                "run": 1,
+                "messages": 1000,
+                "payloadBytes": 256,
+                "producers": 1,
+                "consumers": 1,
+                "publishSeconds": 0.0270596,
+                "consumeSeconds": 0.4443529,
+                "endToEndSeconds": 0.4443529,
+                "publishRate": 36955.461278067676,
+                "consumeRate": 2250.463539227492,
+                "latencyP50Ms": 223.5201,
+                "latencyP95Ms": 397.4039,
+                "latencyP99Ms": 414.0513,
+                "latencyP999Ms": 417.8457,
+                "latencyMaxMs": 418.3882,
+                "publishedMessages": 1000,
+                "consumedMessages": 1000,
+                "fifoViolations": 0,
+                "consumerCountStdDev": 0,
+                "consumerCountMin": 1000,
+                "consumerCountMax": 1000
+              }
+            ],
+            "medianResult": {
+              "target": "kueue",
+              "run": 0,
+              "messages": 1000,
+              "payloadBytes": 256,
+              "producers": 1,
+              "consumers": 1,
+              "publishSeconds": 0.0270596,
+              "consumeSeconds": 0.4443529,
+              "endToEndSeconds": 0.4443529,
+              "publishRate": 36955.461278067676,
+              "consumeRate": 2250.463539227492,
+              "latencyP50Ms": 223.5201,
+              "latencyP95Ms": 397.4039,
+              "latencyP99Ms": 414.0513,
+              "latencyP999Ms": 417.8457,
+              "latencyMaxMs": 418.3882,
+              "publishedMessages": 1000,
+              "consumedMessages": 1000,
+              "fifoViolations": 0,
+              "consumerCountStdDev": 0,
+              "consumerCountMin": 1000,
+              "consumerCountMax": 1000
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
