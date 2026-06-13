@@ -224,6 +224,9 @@ func (qm *queueManager) applyAckBatch(p walAckBatchPayload) error {
 		if dr.DeliveryToken != wa.DeliveryToken {
 			return fmt.Errorf("ack batch: delivery token mismatch for receipt handle %q", wa.ReceiptHandle)
 		}
+		if dr.MessageID != wa.MessageID {
+			return fmt.Errorf("ack batch: message ID mismatch for receipt handle %q (inflight=%q, wal=%q)", wa.ReceiptHandle, dr.MessageID, wa.MessageID)
+		}
 
 		if dr.heapIndex >= 0 && dr.heapIndex < len(q.deadlines) {
 			heap.Remove(&q.deadlines, dr.heapIndex)
@@ -256,6 +259,9 @@ func (qm *queueManager) applyNack(p walNackPayload) error {
 	}
 	if dr.DeliveryToken != p.DeliveryToken {
 		return fmt.Errorf("nack: delivery token mismatch for receipt handle %q", p.ReceiptHandle)
+	}
+	if dr.MessageID != p.MessageID {
+		return fmt.Errorf("nack: message ID mismatch for receipt handle %q (inflight=%q, wal=%q)", p.ReceiptHandle, dr.MessageID, p.MessageID)
 	}
 
 	msg, ok := q.messages[p.MessageID]
