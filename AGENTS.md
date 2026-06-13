@@ -59,7 +59,7 @@ Workload presets align with OpenMessaging canonical patterns:
 
 ## Architecture
 
-Everything lives in `main.go`. There is no package splitting.
+Code is in the root package (`package main`) split across focused files (`main.go`, `runtime.go`, `wal.go`, `recovery.go`). There is no sub-package splitting yet.
 
 ### HTTP routes
 
@@ -102,9 +102,42 @@ Per-queue in-memory counters in `queueMetrics`, stored in a `sync.Map` (`metrics
 
 `reapExpiredMessages` returns `[]reapTransition{QueueID, ToState}`. The reaper goroutine updates per-queue metrics per transition and only calls `signalQueueReady` when `ToState == StateReady` — dead-letter transitions must not wake long-polling consumers.
 
+### Runtime model
+
+`runtime.go` holds the in-memory queue manager (`queueManager`) and is being introduced in Phase 2. Each queue has:
+- A ready list (`readyList`) of messages ordered by monotonic sequence number for FIFO delivery.
+- An in-flight map (`inflight`) keyed by receipt handle, plus a deadline heap (`deadlineHeap`) ordered by `VisibilityDeadline`.
+- A dead-letter set (`dead`) of messages that exceeded `MaxDeliveryCount`.
+- Per-queue `nextSeq` and `bytesInMem` counters.
+
+State transitions follow: `ready -> in_flight -> ready|dead`. The runtime is the source of truth during Phase 2; Pebble still contains the legacy data layout until Phase 2.8 migration.
+
+### WAL
+
+`wal.go` implements a write-ahead log on top of Pebble. Every mutating runtime operation is recorded as a `WALEntry` before being applied. Entries are encoded as JSON per `WALEntry` and appended to the Pebble log. Supported operations: `create`, `publish`, `claim`, `ack`, `nack`, `reap`.
+
+The WAL stores:
+- `snapshot_lsn`: last snapshot LSN (currently `0`; reserved for Phase 2.7).
+- `next_lsn`: next write LSN.
+- `entries`: per-LSN entries.
+
+Snapshots truncate the log; replay starts from the latest snapshot LSN.
+
+### Recovery
+
+`recovery.go` rebuilds the runtime model at startup. `main()` calls `initQueueManagerFromEnv`, which:
+1. Opens/creates the `walStore` from Pebble.
+2. Creates an empty `queueManager`.
+3. Replays every WAL entry through `ApplyWALEntry`.
+4. Runs one `ReapExpired` pass to drain any in-flight messages that expired while the server was down.
+
+`ApplyWALEntry` validates consistency strictly: duplicate queue creates, missing messages, wrong states, or stale delivery tokens fail loudly and stop startup. During replay, ready channels are not signaled because there are no consumers yet.
+
 ## Testing
 
-Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `receiveChannel`, and `queueReadyChans`. Tests do NOT test the reaper goroutine directly — they call `reapExpiredMessages` synchronously.
+Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `receiveChannel`, `queueReadyChans`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `reapExpiredMessages` synchronously.
+
+Runtime/WAL/recovery tests typically build state through the runtime API, close the Pebble DB, reopen it, and call `recoverQueueManager` / `ApplyWALEntry` to verify that the in-memory model is rebuilt correctly.
 
 When adding new global state (like `metricsStore`), add cleanup in `setupTestDB`.
 
