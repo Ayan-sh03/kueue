@@ -2789,6 +2789,9 @@ func TestReplayNackReturnsToTail(t *testing.T) {
 	if !slicesEqual(bodies, want) {
 		t.Fatalf("ready order = %v, want %v", bodies, want)
 	}
+	if got := q.metrics.totalNacked.Load(); got != 1 {
+		t.Fatalf("totalNacked = %d, want 1", got)
+	}
 }
 
 func TestReplayExpiredInflightBecomesReady(t *testing.T) {
