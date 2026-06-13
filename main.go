@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,6 +30,15 @@ func main() {
 	Db = db
 	defer Db.Close()
 	fmt.Println("DB initialised successfully")
+
+	qm, wal, err := initQueueManagerFromEnv(context.Background(), Db)
+	if err != nil {
+		log.Fatalf("recovery failed: %v", err)
+	}
+	QueueManager = qm
+	WAL = wal
+	fmt.Println("WAL replay complete")
+
 	http.HandleFunc("/", queueHandler)
 	http.HandleFunc("/create", create)
 	http.HandleFunc("/get", getQueue)
