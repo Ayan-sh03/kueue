@@ -2537,3 +2537,454 @@ func slicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// ============================================================================
+// Phase 2.3: WAL replay into queueManager
+// ============================================================================
+
+func openRuntimeWAL(t *testing.T, dir string) (*queueManager, *walStore, *pebble.DB) {
+	t.Helper()
+	deliveryRecordSeq.Store(0)
+	metricsStore = sync.Map{}
+
+	db, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open pebble: %v", err)
+	}
+
+	wal, err := newWalStore(db, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store: %v", err)
+	}
+	qm := newQueueManager(wal)
+	return qm, wal, db
+}
+
+func recoverRuntimeWAL(t *testing.T, dir string) (*queueManager, *walStore, *pebble.DB) {
+	t.Helper()
+	deliveryRecordSeq.Store(0)
+	metricsStore = sync.Map{}
+
+	db, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("reopen pebble: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	wal, err := newWalStore(db, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store on reopen: %v", err)
+	}
+	qm := newQueueManager(wal)
+	if err := wal.Replay(context.Background(), wal.latestSnapshotLSN, qm.ApplyWALEntry); err != nil {
+		t.Fatalf("replay wal: %v", err)
+	}
+	return qm, wal, db
+}
+
+func TestReplayCreateQueueSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "replay-test", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+	q.mu.Lock()
+	if q.config.Name != "replay-test" || q.config.MaxRetries != 3 {
+		t.Fatalf("config = %+v, want name=replay-test retries=3", q.config)
+	}
+	q.mu.Unlock()
+}
+
+func TestReplayReadyMessagesFIFO(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "fifo", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	ids, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("a"), []byte("b"), []byte("c")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready.Len() != 3 {
+		t.Fatalf("ready len = %d, want 3", q.ready.Len())
+	}
+	var got []string
+	for e := q.ready.Front(); e != nil; e = e.Next() {
+		got = append(got, string(e.Value.(*messageRecord).Body))
+	}
+	want := []string{"a", "b", "c"}
+	if !slicesEqual(got, want) {
+		t.Fatalf("ready order = %v, want %v", got, want)
+	}
+	for _, id := range ids {
+		if _, ok := q.messages[id]; !ok {
+			t.Fatalf("message %s missing after replay", id)
+		}
+	}
+	if q.nextSeq < 3 {
+		t.Fatalf("nextSeq = %d, want >= 3", q.nextSeq)
+	}
+}
+
+func TestReplayInFlightPreservesHandleTokenDeadline(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "inflight", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("x")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	orig := claimed[0]
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready.Len() != 0 {
+		t.Fatalf("ready len = %d, want 0", q.ready.Len())
+	}
+	if len(q.inflight) != 1 {
+		t.Fatalf("inflight len = %d, want 1", len(q.inflight))
+	}
+	dr := q.inflight[orig.ReceiptHandle]
+	if dr == nil {
+		t.Fatal("delivery record missing after replay")
+	}
+	if dr.DeliveryToken != orig.DeliveryAttemptID {
+		t.Fatalf("token = %q, want %q", dr.DeliveryToken, orig.DeliveryAttemptID)
+	}
+	if !dr.Deadline.Equal(orig.VisibilityDeadline) {
+		t.Fatalf("deadline = %v, want %v", dr.Deadline, orig.VisibilityDeadline)
+	}
+	if q.deadlines.Len() != 1 {
+		t.Fatalf("deadlines heap len = %d, want 1", q.deadlines.Len())
+	}
+	msg := q.messages[orig.ID]
+	if msg == nil || msg.State != StateInFlight {
+		t.Fatalf("message state = %v, want in_flight", msg.State)
+	}
+}
+
+func TestReplayAckedMessagesDoNotReappear(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "ack", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("x")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	results := qm1.AckBatch(context.Background(), id, []AckEntry{
+		{ReceiptHandle: claimed[0].ReceiptHandle, DeliveryToken: claimed[0].DeliveryAttemptID},
+	})
+	if results[0].Status != "ok" {
+		t.Fatalf("ack failed: %s", results[0].Error)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.messages) != 0 {
+		t.Fatalf("messages len = %d, want 0", len(q.messages))
+	}
+	if len(q.inflight) != 0 {
+		t.Fatalf("inflight len = %d, want 0", len(q.inflight))
+	}
+	if q.ready.Len() != 0 {
+		t.Fatalf("ready len = %d, want 0", q.ready.Len())
+	}
+}
+
+func TestReplayNackReturnsToTail(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "nack", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("first"), []byte("second")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := qm1.Nack(context.Background(), id, claimed[0].ReceiptHandle, claimed[0].DeliveryAttemptID); err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready.Len() != 2 {
+		t.Fatalf("ready len = %d, want 2", q.ready.Len())
+	}
+	var bodies []string
+	for e := q.ready.Front(); e != nil; e = e.Next() {
+		bodies = append(bodies, string(e.Value.(*messageRecord).Body))
+	}
+	want := []string{"second", "first"}
+	if !slicesEqual(bodies, want) {
+		t.Fatalf("ready order = %v, want %v", bodies, want)
+	}
+}
+
+func TestReplayExpiredInflightBecomesReady(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "expired", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("x")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := qm1.ClaimBatch(context.Background(), id, 1); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	if len(q.inflight) != 1 {
+		t.Fatalf("inflight len = %d, want 1", len(q.inflight))
+	}
+	for _, dr := range q.inflight {
+		// Force an expired deadline by moving it into the past.
+		dr.Deadline = time.Now().Add(-time.Second)
+	}
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-time.Second)
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.heapIndex = -1
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	transitions := qm2.ReapExpired(context.Background(), time.Now())
+	if len(transitions) != 1 || transitions[0].ToState != StateReady {
+		t.Fatalf("transitions = %+v, want one ready", transitions)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.ready.Len() != 1 {
+		t.Fatalf("ready len after startup reap = %d, want 1", q.ready.Len())
+	}
+	if len(q.inflight) != 0 {
+		t.Fatalf("inflight len after startup reap = %d, want 0", len(q.inflight))
+	}
+}
+
+func TestReplayExpiredInflightMaxDeliveryBecomesDead(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "dead-letter", 1)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("x")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := qm1.ClaimBatch(context.Background(), id, 1); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	q, err := qm2.getQueue(id)
+	if err != nil {
+		t.Fatalf("get queue after replay: %v", err)
+	}
+
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-time.Second)
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.Deadline = time.Now().Add(-time.Second)
+		dr.heapIndex = -1
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+
+	transitions := qm2.ReapExpired(context.Background(), time.Now())
+	if len(transitions) != 1 || transitions[0].ToState != StateDead {
+		t.Fatalf("transitions = %+v, want one dead", transitions)
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.dead) != 1 {
+		t.Fatalf("dead len = %d, want 1", len(q.dead))
+	}
+	if len(q.inflight) != 0 {
+		t.Fatalf("inflight len = %d, want 0", len(q.inflight))
+	}
+}
+
+func TestReplayStaleAckTokenRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, _, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "stale", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	if _, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("x")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed1, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	oldToken := claimed1[0].DeliveryAttemptID
+
+	// Let the message expire and be reaped, then claimed again with a new token.
+	q, _ := qm1.getQueue(id)
+	q.mu.Lock()
+	for _, msg := range q.messages {
+		msg.VisibilityDeadline = time.Now().Add(-time.Second)
+	}
+	q.deadlines = q.deadlines[:0]
+	for _, dr := range q.inflight {
+		dr.Deadline = time.Now().Add(-time.Second)
+		dr.heapIndex = -1
+		heap.Push(&q.deadlines, dr)
+	}
+	q.mu.Unlock()
+	qm1.ReapExpired(context.Background(), time.Now())
+
+	claimed2, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("second claim: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	qm2, _, _ := recoverRuntimeWAL(t, dir)
+	// Try to ack with the old token.
+	results := qm2.AckBatch(context.Background(), id, []AckEntry{
+		{ReceiptHandle: claimed2[0].ReceiptHandle, DeliveryToken: oldToken},
+	})
+	if results[0].Status == "ok" {
+		t.Fatal("expected stale token ack to fail")
+	}
+}
+
+func TestReplayInconsistentRecordFailsStartup(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open pebble: %v", err)
+	}
+	wal, err := newWalStore(db, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store: %v", err)
+	}
+
+	// Append a create queue followed by an ack for a non-existent message.
+	if _, _, err := wal.Append(context.Background(), []walEntry{
+		{Op: opCreateQueue, Payload: walCreateQueuePayload{QueueID: "q", Name: "q", MaxRetries: 3}},
+		{Op: opAckBatch, Payload: walAckBatchPayload{
+			QueueID: "q",
+			Acks:    []walAckedMessage{{MessageID: "m1", ReceiptHandle: "rh", DeliveryToken: "tok"}},
+		}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	_ = db.Close()
+
+	db2, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("reopen pebble: %v", err)
+	}
+	defer db2.Close()
+	wal2, err := newWalStore(db2, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store on reopen: %v", err)
+	}
+	qm := newQueueManager(wal2)
+	if err := wal2.Replay(context.Background(), wal2.latestSnapshotLSN, qm.ApplyWALEntry); err == nil {
+		t.Fatal("expected replay to fail on inconsistent ack record")
+	}
+}
+
