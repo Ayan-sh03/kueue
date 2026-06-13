@@ -2988,3 +2988,105 @@ func TestReplayInconsistentRecordFailsStartup(t *testing.T) {
 	}
 }
 
+func TestReplayAckMessageIDMismatchFailsStartup(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, wal1, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "ack-mismatch", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	published, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("first"), []byte("second")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Append a bad ack that uses the correct receipt handle and token but a
+	// MessageID that belongs to a different (still ready) message.
+	wrongMessageID := published[1]
+	if _, _, err := wal1.Append(context.Background(), []walEntry{
+		{Op: opAckBatch, Payload: walAckBatchPayload{
+			QueueID: id,
+			Acks: []walAckedMessage{{
+				MessageID:     wrongMessageID,
+				ReceiptHandle: claimed[0].ReceiptHandle,
+				DeliveryToken: claimed[0].DeliveryAttemptID,
+			}},
+		}},
+	}); err != nil {
+		t.Fatalf("append bad ack: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	db2, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("reopen pebble: %v", err)
+	}
+	defer db2.Close()
+	wal2, err := newWalStore(db2, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store on reopen: %v", err)
+	}
+	qm2 := newQueueManager(wal2)
+	if err := wal2.Replay(context.Background(), wal2.latestSnapshotLSN, qm2.ApplyWALEntry); err == nil {
+		t.Fatal("expected replay to fail on ack MessageID mismatch")
+	}
+}
+
+func TestReplayNackMessageIDMismatchFailsStartup(t *testing.T) {
+	dir := t.TempDir()
+
+	qm1, wal1, db1 := openRuntimeWAL(t, dir)
+	id, err := qm1.CreateQueue(context.Background(), "nack-mismatch", 3)
+	if err != nil {
+		t.Fatalf("create queue: %v", err)
+	}
+	published, err := qm1.PublishBatch(context.Background(), id, [][]byte{[]byte("first"), []byte("second")})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	claimed, err := qm1.ClaimBatch(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// Append a bad nack that uses the correct receipt handle and token but a
+	// MessageID that belongs to a different (still ready) message.
+	wrongMessageID := published[1]
+	if _, _, err := wal1.Append(context.Background(), []walEntry{
+		{Op: opNack, Payload: walNackPayload{
+			QueueID:        id,
+			MessageID:      wrongMessageID,
+			ReceiptHandle:  claimed[0].ReceiptHandle,
+			DeliveryToken:  claimed[0].DeliveryAttemptID,
+			TargetState:    StateReady,
+			HasNewReadySeq: false,
+		}},
+	}); err != nil {
+		t.Fatalf("append bad nack: %v", err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	db2, err := pebble.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("reopen pebble: %v", err)
+	}
+	defer db2.Close()
+	wal2, err := newWalStore(db2, walSyncNone)
+	if err != nil {
+		t.Fatalf("new wal store on reopen: %v", err)
+	}
+	qm2 := newQueueManager(wal2)
+	if err := wal2.Replay(context.Background(), wal2.latestSnapshotLSN, qm2.ApplyWALEntry); err == nil {
+		t.Fatal("expected replay to fail on nack MessageID mismatch")
+	}
+}
+
