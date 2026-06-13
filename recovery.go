@@ -274,7 +274,11 @@ func (qm *queueManager) applyNack(p walNackPayload) error {
 	}
 	delete(q.inflight, p.ReceiptHandle)
 
-	return q.applyNackOrReapToMessage(msg, p.TargetState, p.HasNewReadySeq, p.NewReadySeq)
+	if err := q.applyNackOrReapToMessage(msg, p.TargetState, p.HasNewReadySeq, p.NewReadySeq); err != nil {
+		return err
+	}
+	q.metrics.totalNacked.Add(1)
+	return nil
 }
 
 func (qm *queueManager) applyReapBatch(p walReapBatchPayload) error {
