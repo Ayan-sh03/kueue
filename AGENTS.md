@@ -79,18 +79,18 @@ Code is in the root package (`package main`) split across focused files (`main.g
 
 ### Data model
 
-- **Queue**: stored in Pebble as key=`<uuid>`, value=`QueueConfig{Name, MaxRetries}`. The ID is the key clients pass around.
-- **Message**: stored as key=`<queueID>|<8-byte-big-endian-seq>|<messageID>`, value=JSON `Message`. The sequence number gives FIFO ordering. State machine: `ready -> in_flight -> ready|dead`.
+- **Queue**: `QueueConfig{Name, MaxRetries}` stored in the runtime `queueManager` and persisted via WAL. The ID (UUID) is the key clients pass around.
+- **Message**: in-memory `messageRecord` in the per-queue runtime. State machine: `ready -> in_flight -> ready|dead`. Persisted via WAL; Pebble holds the WAL log, not per-message keys.
 
 ### Key design decisions
 
-- **FIFO ordering**: `messageKey` uses a mutex-protected counter (`seqMu`) for monotonically increasing keys. Pebble iterators return lexicographic order, so `claimReadyMessages` scans in enqueue order.
-- **Atomic claim**: `claimReadyMessages` is protected by `claimMu` (global mutex) to serialize competing consumer claims. It finds the first `StateReady` message, flips it to `StateInFlight`, and writes it back — all within a single `IndexedBatch` commit. The mutex is needed because Pebble lacks Badger's serializable transaction isolation.
-- **Visibility timeout**: 30 seconds hardcoded. The reaper goroutine (`reaper()`) runs every 1 second, calls `reapExpiredMessages` which uses a snapshot iterator over inflight keys, finds in-flight messages past their `VisibilityDeadline`, and transitions them.
-- **Delivery tokens**: Each claim generates a `DeliveryAttemptID` (UUID). Both `/ack` and `/nack` require this token. If a message is re-delivered (after timeout expiry), the old token is rejected with 409. This prevents stale acks.
+- **FIFO ordering**: Each queue has a monotonically increasing `nextSeq` counter (per-queue, no global lock). Messages are pushed to the back of a doubly-linked `readyList` in seq order. `ClaimBatch` pops from the front in O(1).
+- **Atomic claim**: `ClaimBatch` is protected by the per-queue `queueRuntime.mu` mutex. It pops up to `max` messages from the ready list front, flips them to `StateInFlight`, assigns receipt handles + delivery tokens, and appends a single `opClaimBatch` WAL entry. If WAL append fails, all popped messages are rolled back to the ready list front.
+- **Visibility timeout**: 30 seconds hardcoded. The reaper goroutine (`reaper()`) runs every 1 second, calls `QueueManager.ReapExpired` which pops from each queue's deadline min-heap, finds in-flight messages past their `VisibilityDeadline`, and transitions them to `ready` or `dead`.
+- **Delivery tokens**: Each claim generates a `DeliveryAttemptID` (UUID). Both `/ack` and `/nack` require this token. If a message is re-delivered (after timeout expiry or nack), the old token is rejected with 409. This prevents stale acks.
 - **Long polling**: `signalQueueReady` closes the old per-queue channel and creates a new one. `receive?wait=true` blocks on that channel with a 30s timeout. The re-check between subscribing and waiting prevents lost signals.
-- **Dead letter**: When `DeliveryCount >= MaxDeliveryCount` and the message is nacked or reaped, state becomes `dead`. Dead messages stay in the store but are never returned by receive.
-- **Receipt handles**: Messages claimed via receive/get are assigned a `receiptHandle`. This is required for ack/nack alongside `deliveryToken`. The receipt handle maps to the Pebble key via `messageKeyCache` (a `sync.Map`).
+- **Dead letter**: When `DeliveryCount >= MaxDeliveryCount` and the message is nacked or reaped, state becomes `dead`. Dead messages stay in the runtime `dead` map but are never returned by receive.
+- **Receipt handles**: Messages claimed via receive are assigned a `receiptHandle` (base64 of `queueID|seq|messageID`). The receipt handle is immutable across redeliveries (seq is fixed at publish time). It's required for ack/nack alongside `deliveryToken`.
 
 ### Metrics
 
@@ -100,17 +100,17 @@ Per-queue in-memory counters in `queueMetrics`, stored in a `sync.Map` (`metrics
 
 ### Reaper returns transitions
 
-`reapExpiredMessages` returns `[]reapTransition{QueueID, ToState}`. The reaper goroutine updates per-queue metrics per transition and only calls `signalQueueReady` when `ToState == StateReady` — dead-letter transitions must not wake long-polling consumers.
+`QueueManager.ReapExpired` returns `[]reapTransition{QueueID, ToState}`. The reaper goroutine updates per-queue metrics per transition and only calls `signalQueueReady` when `ToState == StateReady` — dead-letter transitions must not wake long-polling consumers.
 
 ### Runtime model
 
-`runtime.go` holds the in-memory queue manager (`queueManager`) and is being introduced in Phase 2. Each queue has:
+`runtime.go` holds the in-memory queue manager (`queueManager`), which is the source of truth for all live handler operations. Each queue has:
 - A ready list (`readyList`) of messages ordered by monotonic sequence number for FIFO delivery.
 - An in-flight map (`inflight`) keyed by receipt handle, plus a deadline heap (`deadlineHeap`) ordered by `VisibilityDeadline`.
 - A dead-letter set (`dead`) of messages that exceeded `MaxDeliveryCount`.
 - Per-queue `nextSeq` and `bytesInMem` counters.
 
-State transitions follow: `ready -> in_flight -> ready|dead`. The runtime is the source of truth during Phase 2; Pebble still contains the legacy data layout until Phase 2.8 migration.
+State transitions follow: `ready -> in_flight -> ready|dead`. The runtime is the source of truth; Pebble holds the WAL log, not per-message keys.
 
 ### WAL
 
@@ -135,7 +135,7 @@ Snapshots truncate the log; replay starts from the latest snapshot LSN.
 
 ## Testing
 
-Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `receiveChannel`, `queueReadyChans`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `reapExpiredMessages` synchronously.
+Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `receiveChannel`, `queueReadyChans`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `QueueManager.ReapExpired` synchronously.
 
 Runtime/WAL/recovery tests typically build state through the runtime API, close the Pebble DB, reopen it, and call `recoverQueueManager` / `ApplyWALEntry` to verify that the in-memory model is rebuilt correctly.
 
@@ -146,8 +146,7 @@ There is also `cmd/bench/main_test.go` for benchmark tool tests.
 ## Known gotchas
 
 - `var queue []int` (line 25) and `var Queues []Queue` / `var DeadLetterQueue []Message` (lines 88-89) are legacy in-memory remnants. They should not be used.
-- `reapExpiredMessages` scans ALL keys with no prefix filter — it iterates the entire DB via a snapshot. This is intentional because it needs to find expired in-flight messages across all queues in one pass.
+- Legacy Pebble key functions (`messageKey`, `readyKey`, `inflightKey`, `nextMessageSequence`, `findMessageRecord`, key builders) and `store.go` functions remain in the codebase but are off the live handler path. Some are still referenced by metrics reconciliation tests (`TestReconcileMetricsFromDBIfStale*`) and `TestReadyPartsFromKeyUsesKnownPrefix`. Full removal is #35 (Phase 2.10).
+- `reapExpiredMessages` scanned ALL keys with no prefix filter — it iterated the entire DB via a snapshot. This was the legacy reaper path; it has been removed. The live reaper uses `QueueManager.ReapExpired` which pops from a per-queue deadline min-heap.
 - Pebble `Batch.Get()` returns `(val []byte, closer io.Closer, err error)`. Always call `closer.Close()` after reading the value.
-- `claimMu` serializes `claimReadyMessages` to prevent competing consumers from claiming the same message, since Pebble lacks Badger's transaction isolation.
 - The `Db` package global is set in `main()` and used everywhere. Tests set it in `setupTestDB`.
-- The `getQueue` handler does not return after writing the empty-id error — it falls through to the DB query with an empty string. This is a known bug, not a feature.
