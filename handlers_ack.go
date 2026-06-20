@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,7 +22,7 @@ func ack(w http.ResponseWriter, r *http.Request) {
 
 	var batchReq BatchAckRequest
 	if json.Unmarshal(body, &batchReq) == nil && len(batchReq.Acks) > 0 {
-		handleBatchAck(w, batchReq)
+		handleBatchAck(w, r, batchReq)
 		return
 	}
 
@@ -64,7 +63,7 @@ func ack(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
+func handleBatchAck(w http.ResponseWriter, r *http.Request, batchReq BatchAckRequest) {
 	if batchReq.QueueId == "" {
 		http.Error(w, "queueId is required", http.StatusBadRequest)
 		return
@@ -79,7 +78,7 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 		return
 	}
 
-	results := QueueManager.AckBatch(context.Background(), batchReq.QueueId, batchReq.Acks)
+	results := QueueManager.AckBatch(r.Context(), batchReq.QueueId, batchReq.Acks)
 
 	type batchAckResult struct {
 		MessageId     string `json:"messageId,omitempty"`
@@ -133,7 +132,7 @@ func ackBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	handleBatchAck(w, req)
+	handleBatchAck(w, r, req)
 }
 
 func respondAckError(w http.ResponseWriter, queueID, errMsg string) {
