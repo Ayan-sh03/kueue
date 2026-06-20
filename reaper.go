@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -142,24 +142,15 @@ func reaper() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			transitions, err := reapExpiredMessages(time.Now())
-			if err != nil {
-				log.Println("reaper:", err)
-				continue
-			}
+			transitions := QueueManager.ReapExpired(context.Background(), time.Now())
 
 			signaled := map[string]struct{}{}
 			for _, t := range transitions {
-				m := getOrCreateMetrics(t.QueueID)
-				m.inFlightCount.Add(-1)
 				if t.ToState == StateReady {
-					m.readyCount.Add(1)
 					if _, ok := signaled[t.QueueID]; !ok {
 						signalQueueReady(t.QueueID)
 						signaled[t.QueueID] = struct{}{}
 					}
-				} else if t.ToState == StateDead {
-					m.deadCount.Add(1)
 				}
 			}
 

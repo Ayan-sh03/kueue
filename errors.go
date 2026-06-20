@@ -28,3 +28,11 @@ func (e *ErrInvalidReceiptHandle) Error() string {
 var ErrNoReadyMessages = errors.New("no ready messages")
 
 var ErrMessageNotInFlight = errors.New("message is not in flight")
+
+var ErrQueueNotFound = errors.New("queue not found")
+
+var ErrMessageLimitExceeded = errors.New("queue message limit exceeded")
+
+var ErrByteLimitExceeded = errors.New("queue byte limit exceeded")
+
+var ErrMessageNotFound = errors.New("message not found")

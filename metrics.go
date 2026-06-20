@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"net/http"
@@ -135,16 +136,14 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, closer, err := Db.Get([]byte(id))
-	if err != nil {
-		if err == pebble.ErrNotFound {
+	if _, err := QueueManager.getQueue(id); err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
 			http.Error(w, "Queue Not Found for id: "+id, http.StatusNotFound)
 			return
 		}
 		http.Error(w, "Error checking queue: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	closer.Close()
 
 	m := getOrCreateMetrics(id)
 	if err := reconcileMetricsFromDBIfStale(id, m, time.Now()); err != nil {
