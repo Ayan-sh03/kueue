@@ -6,7 +6,6 @@ import (
 	"container/list"
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -135,7 +134,7 @@ func (qm *queueManager) getQueue(queueID string) (*queueRuntime, error) {
 	q, ok := qm.queues[queueID]
 	qm.mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("queue %q not found", queueID)
+		return nil, fmt.Errorf("%w: %q", ErrQueueNotFound, queueID)
 	}
 	return q, nil
 }
@@ -182,14 +181,14 @@ func (qm *queueManager) PublishBatch(ctx context.Context, queueID string, bodies
 
 	// Enforce memory limits.
 	if q.maxMessages > 0 && int64(len(q.messages)+n) > q.maxMessages {
-		return nil, errors.New("queue message limit exceeded")
+		return nil, ErrMessageLimitExceeded
 	}
 	var totalBytes int64
 	for _, b := range bodies {
 		totalBytes += int64(len(b))
 	}
 	if q.maxBytes > 0 && q.bytesInMem+totalBytes > q.maxBytes {
-		return nil, errors.New("queue byte limit exceeded")
+		return nil, ErrByteLimitExceeded
 	}
 
 	// Allocate seq range.
@@ -363,6 +362,7 @@ func (msg *messageRecord) toClaimedMessage() claimedMessage {
 }
 
 type runtimeAckResult struct {
+	MessageID     string
 	ReceiptHandle string
 	Status        string // "ok" or "error"
 	Error         string
@@ -410,6 +410,7 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 		seen[entry.ReceiptHandle] = true
 		valid = append(valid, dr)
 		results[i].Status = "ok"
+		results[i].MessageID = dr.MessageID
 	}
 
 	if len(valid) == 0 {
@@ -476,7 +477,7 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 
 	msg, ok := q.messages[dr.MessageID]
 	if !ok {
-		return "", errors.New("message not found")
+		return "", ErrMessageNotFound
 	}
 
 	// Remove from inflight and deadlines.
@@ -532,6 +533,7 @@ func (qm *queueManager) Nack(ctx context.Context, queueID, receiptHandle, delive
 	}
 
 	q.metrics.inFlightCount.Add(-1)
+	q.metrics.totalNacked.Add(1)
 	if targetState == StateReady {
 		q.metrics.readyCount.Add(1)
 		q.signalReady()

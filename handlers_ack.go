@@ -1,13 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
-	"time"
-
-	"github.com/cockroachdb/pebble/v2"
+	"strings"
 )
 
 func ack(w http.ResponseWriter, r *http.Request) {
@@ -22,14 +21,12 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try batch ack first
 	var batchReq BatchAckRequest
 	if json.Unmarshal(body, &batchReq) == nil && len(batchReq.Acks) > 0 {
 		handleBatchAck(w, batchReq)
 		return
 	}
 
-	// Fall back to single ack
 	var ackReq AckRequest
 	if err := json.Unmarshal(body, &ackReq); err != nil {
 		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
@@ -49,56 +46,14 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	batch := Db.NewIndexedBatch()
-	defer batch.Close()
-	if _, closer, err := batch.Get([]byte(ackReq.QueueId)); err != nil {
-		batch.Close()
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue or message not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
-		return
-	} else {
-		closer.Close()
-	}
-	key, msg, err := messageByReceiptHandle(batch, ackReq.QueueId, ackReq.ReceiptHandle)
-	if err != nil {
-		batch.Close()
-		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue or message not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if msg.State != StateInFlight {
-		batch.Close()
-		http.Error(w, ErrMessageNotInFlight.Error(), http.StatusConflict)
-		return
-	}
-	if msg.DeliveryAttemptID != ackReq.DeliveryToken {
-		batch.Close()
-		http.Error(w, (&ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}).Error(), http.StatusConflict)
-		return
-	}
-	if err := deleteInflightIndex(batch, ackReq.QueueId, *msg); err != nil {
-		batch.Close()
-		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	deleteCachedMessageKey(ackReq.ReceiptHandle)
-	if err := batch.Delete(key, nil); err != nil {
-		batch.Close()
-		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		http.Error(w, "Failed to acknowledge message: "+err.Error(), http.StatusInternalServerError)
+	results := QueueManager.AckBatch(r.Context(), ackReq.QueueId, []AckEntry{{
+		MessageId:     ackReq.MessageId,
+		ReceiptHandle: ackReq.ReceiptHandle,
+		DeliveryToken: ackReq.DeliveryToken,
+	}})
+	res := results[0]
+	if res.Status != "ok" {
+		respondAckError(w, ackReq.QueueId, res.Error)
 		return
 	}
 
@@ -107,9 +62,6 @@ func ack(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"message": "Message Acknowledged and removed from queue",
 	})
-
-	m := getOrCreateMetrics(ackReq.QueueId)
-	m.recordAck()
 }
 
 func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
@@ -118,6 +70,17 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 		return
 	}
 
+	if _, err := QueueManager.getQueue(batchReq.QueueId); err != nil {
+		if errors.Is(err, ErrQueueNotFound) {
+			http.Error(w, "Queue not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	results := QueueManager.AckBatch(context.Background(), batchReq.QueueId, batchReq.Acks)
+
 	type batchAckResult struct {
 		MessageId     string `json:"messageId,omitempty"`
 		ReceiptHandle string `json:"receiptHandle,omitempty"`
@@ -125,71 +88,20 @@ func handleBatchAck(w http.ResponseWriter, batchReq BatchAckRequest) {
 		Error         string `json:"error,omitempty"`
 	}
 
-	results := make([]batchAckResult, len(batchReq.Acks))
-
-	batch := Db.NewIndexedBatch()
-	defer batch.Close()
-	if _, closer, err := batch.Get([]byte(batchReq.QueueId)); err != nil {
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
-		return
-	} else {
-		closer.Close()
-	}
-
-	for i, entry := range batchReq.Acks {
-		results[i].MessageId = entry.MessageId
-		results[i].ReceiptHandle = entry.ReceiptHandle
-
-		key, msg, err := messageByReceiptHandle(batch, batchReq.QueueId, entry.ReceiptHandle)
-		if err != nil {
-			results[i].Status = "error"
-			results[i].Error = fmt.Sprintf("message not found: %v", err)
-			continue
-		}
-		results[i].MessageId = msg.ID
-		if msg.State != StateInFlight {
-			results[i].Status = "error"
-			results[i].Error = ErrMessageNotInFlight.Error()
-			continue
-		}
-		if msg.DeliveryAttemptID != entry.DeliveryToken {
-			results[i].Status = "error"
-			results[i].Error = fmt.Sprintf("delivery token mismatch: expected %q, got %q", msg.DeliveryAttemptID, entry.DeliveryToken)
-			continue
-		}
-		if err := deleteInflightIndex(batch, batchReq.QueueId, *msg); err != nil {
-			results[i].Status = "error"
-			results[i].Error = fmt.Sprintf("delete in-flight index failed: %v", err)
-			continue
-		}
-		if err := batch.Delete(key, nil); err != nil {
-			results[i].Status = "error"
-			results[i].Error = fmt.Sprintf("delete failed: %v", err)
-			continue
-		}
-		deleteCachedMessageKey(entry.ReceiptHandle)
-		results[i].Status = "ok"
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		http.Error(w, "Failed to acknowledge: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	m := getOrCreateMetrics(batchReq.QueueId)
-	for _, res := range results {
-		if res.Status == "ok" {
-			m.recordAck()
+	out := make([]batchAckResult, len(results))
+	for i, res := range results {
+		out[i] = batchAckResult{
+			MessageId:     res.MessageID,
+			ReceiptHandle: res.ReceiptHandle,
+			Status:        res.Status,
+			Error:         res.Error,
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
-		"results": results,
+		"results": out,
 	})
 }
 
@@ -224,6 +136,19 @@ func ackBatch(w http.ResponseWriter, r *http.Request) {
 	handleBatchAck(w, req)
 }
 
+func respondAckError(w http.ResponseWriter, queueID, errMsg string) {
+	switch {
+	case strings.Contains(errMsg, "queue not found"):
+		http.Error(w, "Queue or message not found", http.StatusNotFound)
+	case strings.Contains(errMsg, "receipt handle not found") || strings.Contains(errMsg, "duplicate receipt handle"):
+		http.Error(w, "invalid receipt handle: "+errMsg, http.StatusBadRequest)
+	case strings.Contains(errMsg, "delivery token mismatch"):
+		http.Error(w, errMsg, http.StatusConflict)
+	default:
+		http.Error(w, "Failed to acknowledge message: "+errMsg, http.StatusInternalServerError)
+	}
+}
+
 func nack(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -249,117 +174,33 @@ func nack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var nackResultState MessageState
-	var needReadyPointer bool
-
-	batch := Db.NewIndexedBatch()
-	defer batch.Close()
-	if _, closer, err := batch.Get([]byte(ackReq.QueueId)); err != nil {
-		batch.Close()
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue or message not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-		return
-	} else {
-		closer.Close()
-	}
-
-	key, msg, err := messageByReceiptHandle(batch, ackReq.QueueId, ackReq.ReceiptHandle)
+	state, err := QueueManager.Nack(r.Context(), ackReq.QueueId, ackReq.ReceiptHandle, ackReq.DeliveryToken)
 	if err != nil {
-		batch.Close()
-		if _, ok := err.(*ErrInvalidReceiptHandle); ok {
+		var tokenMismatch *ErrDeliveryTokenMismatch
+		var invalidHandle *ErrInvalidReceiptHandle
+		switch {
+		case errors.Is(err, ErrQueueNotFound):
+			http.Error(w, "Queue or message not found", http.StatusNotFound)
+		case errors.As(err, &invalidHandle):
 			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err == pebble.ErrNotFound {
+		case errors.Is(err, ErrMessageNotFound):
 			http.Error(w, "Queue or message not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if msg.State != StateInFlight {
-		batch.Close()
-		http.Error(w, ErrMessageNotInFlight.Error(), http.StatusConflict)
-		return
-	}
-	if msg.DeliveryAttemptID != ackReq.DeliveryToken {
-		batch.Close()
-		http.Error(w, (&ErrDeliveryTokenMismatch{Expected: msg.DeliveryAttemptID, Got: ackReq.DeliveryToken}).Error(), http.StatusConflict)
-		return
-	}
-	if err := deleteInflightIndex(batch, ackReq.QueueId, *msg); err != nil {
-		batch.Close()
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if msg.MaxDeliveryCount > 0 && msg.DeliveryCount >= msg.MaxDeliveryCount {
-		msg.State = StateDead
-	} else {
-		msg.State = StateReady
-	}
-	msg.VisibilityDeadline = time.Time{}
-	msg.DeliveryAttemptID = ""
-
-	nackResultState = msg.State
-	needReadyPointer = nackResultState == StateReady
-
-	updated, err := json.Marshal(msg)
-	if err != nil {
-		batch.Close()
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := batch.Set(key, updated, nil); err != nil {
-		batch.Close()
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if needReadyPointer {
-		newSeq, err := nextMessageSequence(ackReq.QueueId)
-		if err != nil {
-			batch.Close()
-			http.Error(w, fmt.Sprintf("allocate nack sequence: %v", err), http.StatusInternalServerError)
-			return
-		}
-		if err := batch.Set(readyKey(ackReq.QueueId, newSeq, msg.ID), readyValue(key), nil); err != nil {
-			batch.Close()
+		case errors.As(err, &tokenMismatch):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
 			http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
-			return
 		}
-		cacheMessageKey(ackReq.ReceiptHandle, key)
-	} else {
-		deleteCachedMessageKey(ackReq.ReceiptHandle)
-	}
-
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		http.Error(w, "Failed to nack message: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	if state == StateReady {
+		signalQueueReady(ackReq.QueueId)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
 		"message": "Message Nacked and state updated",
-		"state":   nackResultState,
+		"state":   state,
 	})
-
-	if needReadyPointer {
-		signalQueueReady(ackReq.QueueId)
-	}
-
-	m := getOrCreateMetrics(ackReq.QueueId)
-	m.totalNacked.Add(1)
-	m.inFlightCount.Add(-1)
-	if nackResultState == StateReady {
-		m.readyCount.Add(1)
-	} else if nackResultState == StateDead {
-		m.deadCount.Add(1)
-	}
-
 }

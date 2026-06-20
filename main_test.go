@@ -35,9 +35,18 @@ func setupTestDB(t *testing.T) {
 	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
 
+	qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
+	if err != nil {
+		t.Fatalf("init queue manager: %v", err)
+	}
+	QueueManager = qm
+	WAL = wal
+
 	t.Cleanup(func() {
 		_ = db.Close()
 		Db = nil
+		QueueManager = nil
+		WAL = nil
 	})
 }
 
@@ -117,6 +126,17 @@ func storedMessageKey(t *testing.T, queueID, messageID string) []byte {
 	}
 
 	return key
+}
+
+func runtimeQueueState(t *testing.T, queueID string) (ready, inflight, dead int) {
+	t.Helper()
+	q, err := QueueManager.getQueue(queueID)
+	if err != nil {
+		t.Fatalf("get queue: %v", err)
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.ready.Len(), len(q.inflight), len(q.dead)
 }
 
 type receiveResponse struct {
@@ -211,7 +231,6 @@ func TestPublishReceiveAck(t *testing.T) {
 		t.Fatal("expected non-empty receipt handle")
 	}
 
-	storedKey := storedMessageKey(t, queueID, messageID)
 	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
 	if err != nil {
 		t.Fatalf("marshal ack request: %v", err)
@@ -225,12 +244,25 @@ func TestPublishReceiveAck(t *testing.T) {
 		t.Fatalf("ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
 	}
 
-	_, closer, err := Db.Get(storedKey)
-	if closer != nil {
-		closer.Close()
+	// Message must be gone from the runtime: a second receive returns 404 and
+	// a second ack on the same handle is rejected.
+	secondReq := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	secondRecorder := httptest.NewRecorder()
+	receive(secondRecorder, secondReq)
+	if secondRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after ack, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
 	}
-	if err != pebble.ErrNotFound {
-		t.Fatalf("expected message to be deleted after ack, got %v", err)
+
+	dupAckReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	dupAckRecorder := httptest.NewRecorder()
+	ack(dupAckRecorder, dupAckReq)
+	if dupAckRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for duplicate ack, got %d: %s", dupAckRecorder.Code, dupAckRecorder.Body.String())
+	}
+
+	ready, inflight, dead := runtimeQueueState(t, queueID)
+	if ready != 0 || inflight != 0 || dead != 0 {
+		t.Fatalf("after ack: ready=%d inflight=%d dead=%d, want all 0", ready, inflight, dead)
 	}
 }
 
@@ -559,26 +591,9 @@ func TestAckDeletesInflightIndex(t *testing.T) {
 
 	resp := receiveTestMessage(t, queueID)
 
-	key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
-	if err != nil {
-		t.Fatalf("message key from receipt handle: %v", err)
-	}
-	val, closer, err := Db.Get(key)
-	if err != nil {
-		t.Fatalf("get message: %v", err)
-	}
-	var msg Message
-	if err := json.Unmarshal(val, &msg); err != nil {
-		closer.Close()
-		t.Fatalf("unmarshal message: %v", err)
-	}
-	closer.Close()
-	_, closer, err = Db.Get(inflightKey(queueID, msg.VisibilityDeadline, msg.ID))
-	if closer != nil {
-		closer.Close()
-	}
-	if err != nil {
-		t.Fatalf("expected in-flight index after receive: %v", err)
+	// After receive the message is in-flight in the runtime.
+	if _, inflight, _ := runtimeQueueState(t, queueID); inflight != 1 {
+		t.Fatalf("expected 1 in-flight after receive, got %d", inflight)
 	}
 
 	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: resp.ReceiptHandle, DeliveryToken: resp.DeliveryToken})
@@ -592,14 +607,18 @@ func TestAckDeletesInflightIndex(t *testing.T) {
 		t.Fatalf("ack status = %d, body = %s", ackRecorder.Code, ackRecorder.Body.String())
 	}
 
-	prefix := inflightPrefix()
-	iter, _ := Db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	defer iter.Close()
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		t.Fatalf("expected no in-flight index keys, found %q", iter.Key())
+	// After ack the in-flight entry is gone and the message is no longer
+	// receivable or re-ackable.
+	ready, inflight, dead := runtimeQueueState(t, queueID)
+	if ready != 0 || inflight != 0 || dead != 0 {
+		t.Fatalf("after ack: ready=%d inflight=%d dead=%d, want all 0", ready, inflight, dead)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	secondRecorder := httptest.NewRecorder()
+	receive(secondRecorder, secondReq)
+	if secondRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after ack, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
 	}
 }
 
@@ -621,52 +640,29 @@ func TestReapDeadLettersAfterMaxDeliveries(t *testing.T) {
 	}](t, recorder)
 
 	queueID := createResp.ID
-	messageID := publishTestMessage(t, queueID, []byte("poison"))
+	publishTestMessage(t, queueID, []byte("poison"))
 
 	_ = receiveTestMessage(t, queueID)
 
-	storedKey := storedMessageKey(t, queueID, messageID)
-	batch := Db.NewIndexedBatch()
-	val, closer, err := batch.Get(storedKey)
-	if err != nil {
-		t.Fatalf("get message: %v", err)
+	// Force the visibility timeout to elapse and reap from the runtime.
+	transitions := QueueManager.ReapExpired(context.Background(), time.Now().Add(31*time.Second))
+	if len(transitions) != 1 {
+		t.Fatalf("expected one reap transition, got %d", len(transitions))
 	}
-	var deadMsg Message
-	if err := json.Unmarshal(val, &deadMsg); err != nil {
-		closer.Close()
-		t.Fatalf("unmarshal message: %v", err)
-	}
-	closer.Close()
-	if err := deleteInflightIndex(batch, queueID, deadMsg); err != nil {
-		t.Fatalf("delete inflight index: %v", err)
-	}
-	deadMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-	updated, err := json.Marshal(deadMsg)
-	if err != nil {
-		t.Fatalf("marshal message: %v", err)
-	}
-	if err := batch.Set(storedKey, updated, nil); err != nil {
-		t.Fatalf("set message: %v", err)
-	}
-	if err := setInflightIndex(batch, queueID, deadMsg, storedKey); err != nil {
-		t.Fatalf("set inflight index: %v", err)
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		t.Fatalf("commit batch: %v", err)
-	}
-	batch.Close()
-
-	_, err = reapExpiredMessages(time.Now())
-	if err != nil {
-		t.Fatalf("reap expired messages: %v", err)
+	if transitions[0].QueueID != queueID || transitions[0].ToState != StateDead {
+		t.Fatalf("unexpected transition: %+v", transitions[0])
 	}
 
-	_, foundMsg, err := findMessageRecord(queueID, messageID)
-	if err != nil {
-		t.Fatalf("find message record: %v", err)
+	if _, _, dead := runtimeQueueState(t, queueID); dead != 1 {
+		t.Fatalf("expected 1 dead message after reap, got %d", dead)
 	}
-	if foundMsg.State != StateDead {
-		t.Fatalf("expected StateDead after max deliveries, got %s", foundMsg.State)
+
+	// Dead messages must not be delivered.
+	secondReq := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	secondRecorder := httptest.NewRecorder()
+	receive(secondRecorder, secondReq)
+	if secondRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for dead-lettered queue, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
 	}
 }
 
@@ -683,46 +679,22 @@ func TestReaperUsesInflightIndexWithReadyBacklog(t *testing.T) {
 		publishTestMessage(t, queueID, []byte("ready-backlog"))
 	}
 
-	storedKey := storedMessageKey(t, queueID, messageID)
-	batch := Db.NewIndexedBatch()
-	val, closer, err := batch.Get(storedKey)
-	if err != nil {
-		t.Fatalf("get message: %v", err)
+	// The claimed message is in-flight; the 50 new messages are ready.
+	if ready, inflight, _ := runtimeQueueState(t, queueID); ready != 50 || inflight != 1 {
+		t.Fatalf("before reap: ready=%d inflight=%d, want 50,1", ready, inflight)
 	}
-	var expiredMsg Message
-	if err := json.Unmarshal(val, &expiredMsg); err != nil {
-		closer.Close()
-		t.Fatalf("unmarshal message: %v", err)
-	}
-	closer.Close()
-	if err := deleteInflightIndex(batch, queueID, expiredMsg); err != nil {
-		t.Fatalf("delete inflight index: %v", err)
-	}
-	expiredMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-	updated, err := json.Marshal(expiredMsg)
-	if err != nil {
-		t.Fatalf("marshal message: %v", err)
-	}
-	if err := batch.Set(storedKey, updated, nil); err != nil {
-		t.Fatalf("set message: %v", err)
-	}
-	if err := setInflightIndex(batch, queueID, expiredMsg, storedKey); err != nil {
-		t.Fatalf("set inflight index: %v", err)
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		t.Fatalf("commit batch: %v", err)
-	}
-	batch.Close()
 
-	transitions, err := reapExpiredMessages(time.Now())
-	if err != nil {
-		t.Fatalf("reap expired messages: %v", err)
-	}
+	transitions := QueueManager.ReapExpired(context.Background(), time.Now().Add(31*time.Second))
 	if len(transitions) != 1 {
-		t.Fatalf("expected one indexed reaper transition, got %d", len(transitions))
+		t.Fatalf("expected one reaper transition, got %d", len(transitions))
 	}
 	if transitions[0].QueueID != queueID || transitions[0].ToState != StateReady {
 		t.Fatalf("unexpected transition: %+v", transitions[0])
+	}
+
+	// Reaped message returns to ready tail; backlog is undisturbed.
+	if ready, inflight, dead := runtimeQueueState(t, queueID); ready != 51 || inflight != 0 || dead != 0 {
+		t.Fatalf("after reap: ready=%d inflight=%d dead=%d, want 51,0,0", ready, inflight, dead)
 	}
 }
 
@@ -745,6 +717,7 @@ func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
 
 	queueID := createResp.ID
 	messageID := publishTestMessage(t, queueID, []byte("nack-poison"))
+	_ = messageID
 
 	resp := receiveTestMessage(t, queueID)
 
@@ -766,12 +739,16 @@ func TestNackDeadLettersAfterMaxDeliveries(t *testing.T) {
 		t.Fatalf("expected StateDead after nack with max deliveries, got %s", nackResp.State)
 	}
 
-	_, foundMsg, err := findMessageRecord(queueID, messageID)
-	if err != nil {
-		t.Fatalf("find message record: %v", err)
+	if _, _, dead := runtimeQueueState(t, queueID); dead != 1 {
+		t.Fatalf("expected 1 dead message after nack, got %d", dead)
 	}
-	if foundMsg.State != StateDead {
-		t.Fatalf("expected persisted StateDead, got %s", foundMsg.State)
+
+	// Dead messages must not be redelivered.
+	secondReq := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	secondRecorder := httptest.NewRecorder()
+	receive(secondRecorder, secondReq)
+	if secondRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for dead-lettered queue, got %d: %s", secondRecorder.Code, secondRecorder.Body.String())
 	}
 }
 
@@ -798,12 +775,24 @@ func BenchmarkReceiveLatencyVsDepth(b *testing.B) {
 				b.Fatalf("open db: %v", err)
 			}
 			Db = db
+			Queues = nil
+			DeadLetterQueue = nil
 			metricsStore = sync.Map{}
+			messageKeyCache = sync.Map{}
 			receiveChannel = make(chan struct{}, 1)
 			queueReadyChans = map[string]chan struct{}{}
+			deliveryRecordSeq.Store(0)
+			qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
+			if err != nil {
+				b.Fatalf("init queue manager: %v", err)
+			}
+			QueueManager = qm
+			WAL = wal
 			b.Cleanup(func() {
 				db.Close()
 				Db = nil
+				QueueManager = nil
+				WAL = nil
 			})
 
 			queueID := createBenchQueue(b, "bench-queue")
@@ -990,10 +979,21 @@ func setupDepthBenchmarkDB(b *testing.B) string {
 	receiveChannel = make(chan struct{}, 1)
 	queueReadyChans = map[string]chan struct{}{}
 	metricsStore = sync.Map{}
+	messageKeyCache = sync.Map{}
+	deliveryRecordSeq.Store(0)
+
+	qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
+	if err != nil {
+		b.Fatalf("init queue manager: %v", err)
+	}
+	QueueManager = qm
+	WAL = wal
 
 	b.Cleanup(func() {
 		_ = db.Close()
 		Db = nil
+		QueueManager = nil
+		WAL = nil
 	})
 
 	return createBenchQueue(b, "depth-bench-queue")
@@ -1291,16 +1291,21 @@ func TestBatchAckMultipleMessages(t *testing.T) {
 		}
 	}
 
-	// Verify all messages are deleted
-	for _, msgID := range []string{msg1ID, msg2ID, msg3ID} {
-		key, _, err := findMessageRecord(queueID, msgID)
-		if err == nil {
-			t.Fatalf("expected message %s to be deleted, found at %x", msgID, key)
-		}
-		if err != pebble.ErrNotFound {
-			t.Fatalf("unexpected error finding message %s: %v", msgID, err)
-		}
+	// Verify all messages are gone from the runtime.
+	ready, inflight, dead := runtimeQueueState(t, queueID)
+	if ready != 0 || inflight != 0 || dead != 0 {
+		t.Fatalf("after batch ack: ready=%d inflight=%d dead=%d, want all 0", ready, inflight, dead)
 	}
+
+	emptyReq := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	emptyRec := httptest.NewRecorder()
+	receive(emptyRec, emptyReq)
+	if emptyRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after batch ack, got %d: %s", emptyRec.Code, emptyRec.Body.String())
+	}
+	_ = msg1ID
+	_ = msg2ID
+	_ = msg3ID
 }
 
 func TestBatchAckReportsPartialErrors(t *testing.T) {
@@ -1309,7 +1314,7 @@ func TestBatchAckReportsPartialErrors(t *testing.T) {
 	queueID := createTestQueue(t, "batch-ack-err-queue")
 
 	_ = publishTestMessage(t, queueID, []byte("one"))
-	msg2ID := publishTestMessage(t, queueID, []byte("two"))
+	_ = publishTestMessage(t, queueID, []byte("two"))
 
 	batchResp := func() testBatchReceiveResponse {
 		req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID+"&max=10", nil)
@@ -1351,18 +1356,23 @@ func TestBatchAckReportsPartialErrors(t *testing.T) {
 		t.Fatalf("ack[1] expected error, got %s", r1.Status)
 	}
 
-	// msg1 should be deleted, msg2 should still exist
-	var msg2Exists bool
-	_, _, err := findMessageRecord(queueID, msg2ID)
-	if err == pebble.ErrNotFound {
-		msg2Exists = false
-	} else if err != nil {
-		t.Fatalf("check msg2: %v", err)
-	} else {
-		msg2Exists = true
+	// msg2 (wrong token) must still be in-flight: re-acking with the correct
+	// token succeeds, proving it was not deleted by the failed batch ack.
+	reAckBody, _ := json.Marshal(BatchAckRequest{
+		QueueId: queueID,
+		Acks: []AckEntry{
+			{ReceiptHandle: batchResp.Messages[1].ReceiptHandle, DeliveryToken: batchResp.Messages[1].DeliveryToken},
+		},
+	})
+	reAckReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(reAckBody))
+	reAckRecorder := httptest.NewRecorder()
+	ack(reAckRecorder, reAckReq)
+	if reAckRecorder.Code != http.StatusAccepted {
+		t.Fatalf("re-ack of msg2 status = %d, body = %s", reAckRecorder.Code, reAckRecorder.Body.String())
 	}
-	if !msg2Exists {
-		t.Fatal("msg2 should not have been deleted")
+	reAckResp := decodeResponse[batchAckResponse](t, reAckRecorder)
+	if reAckResp.Results[0].Status != "ok" {
+		t.Fatalf("re-ack of msg2 expected ok, got %s: %s", reAckResp.Results[0].Status, reAckResp.Results[0].Error)
 	}
 }
 
@@ -1436,6 +1446,235 @@ func TestBatchReceiveLongPollWithWait(t *testing.T) {
 	// FIFO: first published should be first received
 	if string(resp.Messages[0].Body) != "batch-0" {
 		t.Fatalf("first message body = %q, want batch-0", string(resp.Messages[0].Body))
+	}
+}
+
+// ============================================================================
+// Phase 2.4: create/publish handler runtime+WAL integration
+// ============================================================================
+
+func setupTestDBWithFakeWAL(t *testing.T) *fakeWAL {
+	t.Helper()
+
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open test db: %v", err)
+	}
+
+	Db = db
+	Queues = nil
+	DeadLetterQueue = nil
+	receiveChannel = make(chan struct{}, 1)
+	queueReadyChans = map[string]chan struct{}{}
+	metricsStore = sync.Map{}
+	messageKeyCache = sync.Map{}
+	deliveryRecordSeq.Store(0)
+
+	wal := &fakeWAL{}
+	QueueManager = newQueueManager(wal)
+
+	t.Cleanup(func() {
+		_ = db.Close()
+		Db = nil
+		QueueManager = nil
+	})
+
+	return wal
+}
+
+func collectReadySeqs(q *queueRuntime) []uint64 {
+	var seqs []uint64
+	for e := q.ready.Front(); e != nil; e = e.Next() {
+		seqs = append(seqs, e.Value.(*messageRecord).Seq)
+	}
+	return seqs
+}
+
+func TestPublishHandlerWALFailureReturns500AndRollsBack(t *testing.T) {
+	wal := setupTestDBWithFakeWAL(t)
+	queueID := createTestQueue(t, "wal-fail-handler")
+
+	publishTestMessage(t, queueID, []byte("ok"))
+
+	wal.mu.Lock()
+	beforeFail := len(wal.entries)
+	wal.fail = true
+	wal.mu.Unlock()
+
+	body, _ := json.Marshal(PublishRequest{QueueId: queueID, Message: Message{Body: []byte("fail")}})
+	req := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	publish(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on WAL failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	wal.mu.Lock()
+	afterFail := len(wal.entries)
+	wal.fail = false
+	wal.mu.Unlock()
+	if afterFail != beforeFail {
+		t.Fatalf("WAL entries changed on failed publish: %d -> %d", beforeFail, afterFail)
+	}
+
+	ready, inflight, dead := runtimeQueueState(t, queueID)
+	if ready != 1 || inflight != 0 || dead != 0 {
+		t.Fatalf("after failed publish: ready=%d inflight=%d dead=%d, want 1,0,0", ready, inflight, dead)
+	}
+
+	q, _ := QueueManager.getQueue(queueID)
+	q.mu.Lock()
+	nextSeq := q.nextSeq
+	q.mu.Unlock()
+	if nextSeq != 1 {
+		t.Fatalf("nextSeq = %d after rolled-back publish, want 1", nextSeq)
+	}
+}
+
+func TestPublishHandlerMemoryLimitReturns429(t *testing.T) {
+	wal := setupTestDBWithFakeWAL(t)
+	queueID := createTestQueue(t, "mem-limit-handler")
+
+	q, err := QueueManager.getQueue(queueID)
+	if err != nil {
+		t.Fatalf("get queue: %v", err)
+	}
+	q.mu.Lock()
+	q.maxMessages = 1
+	q.mu.Unlock()
+
+	publishTestMessage(t, queueID, []byte("first"))
+
+	body, _ := json.Marshal(PublishRequest{QueueId: queueID, Message: Message{Body: []byte("second")}})
+	req := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	publish(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on memory limit, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if ready, _, _ := runtimeQueueState(t, queueID); ready != 1 {
+		t.Fatalf("ready = %d, want 1 (rejected publish must not mutate memory)", ready)
+	}
+
+	wal.mu.Lock()
+	n := len(wal.entries)
+	wal.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("WAL entries = %d, want 2 (create + one publish; rejected publish appends nothing)", n)
+	}
+}
+
+func TestPerQueueSequenceIndependence(t *testing.T) {
+	setupTestDB(t)
+	queueA := createTestQueue(t, "seq-a")
+	queueB := createTestQueue(t, "seq-b")
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		publishTestMessage(t, queueA, []byte("a"))
+		publishTestMessage(t, queueB, []byte("b"))
+	}
+
+	qA, _ := QueueManager.getQueue(queueA)
+	qB, _ := QueueManager.getQueue(queueB)
+	qA.mu.Lock()
+	seqsA := collectReadySeqs(qA)
+	qA.mu.Unlock()
+	qB.mu.Lock()
+	seqsB := collectReadySeqs(qB)
+	qB.mu.Unlock()
+
+	if len(seqsA) != n || len(seqsB) != n {
+		t.Fatalf("seq counts = %d, %d, want %d each", len(seqsA), len(seqsB), n)
+	}
+	for i, s := range seqsA {
+		if s != uint64(i) {
+			t.Fatalf("seqA[%d] = %d, want %d", i, s, i)
+		}
+	}
+	for i, s := range seqsB {
+		if s != uint64(i) {
+			t.Fatalf("seqB[%d] = %d, want %d", i, s, i)
+		}
+	}
+}
+
+func TestCreatePublishAPICompatibility(t *testing.T) {
+	setupTestDB(t)
+
+	// create bad JSON -> 400
+	badCreate := httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader([]byte("{bad")))
+	badCreateRec := httptest.NewRecorder()
+	create(badCreateRec, badCreate)
+	if badCreateRec.Code != http.StatusBadRequest {
+		t.Fatalf("create bad json status = %d, want 400", badCreateRec.Code)
+	}
+
+	// create happy path -> 202 + {id, state: ready}
+	queueID := createTestQueue(t, "compat-queue")
+
+	// single publish -> 202 + {id, state: ready}
+	body, _ := json.Marshal(PublishRequest{QueueId: queueID, Message: Message{Body: []byte("x")}})
+	req := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	publish(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("publish status = %d, want 202", rec.Code)
+	}
+	var pr struct {
+		ID    string       `json:"id"`
+		State MessageState `json:"state"`
+	}
+	json.NewDecoder(rec.Body).Decode(&pr)
+	if pr.ID == "" {
+		t.Fatal("publish returned empty id")
+	}
+	if pr.State != StateReady {
+		t.Fatalf("publish state = %s, want ready", pr.State)
+	}
+
+	// publish-batch -> 202 + {ids:[...]}
+	batchBody, _ := json.Marshal(BatchPublishRequest{
+		QueueId:  queueID,
+		Messages: []Message{{Body: []byte("y")}, {Body: []byte("z")}},
+	})
+	breq := httptest.NewRequest(http.MethodPost, "/publish-batch", bytes.NewReader(batchBody))
+	brec := httptest.NewRecorder()
+	publishBatch(brec, breq)
+	if brec.Code != http.StatusAccepted {
+		t.Fatalf("publish-batch status = %d, want 202", brec.Code)
+	}
+	var br BatchPublishResponse
+	json.NewDecoder(brec.Body).Decode(&br)
+	if len(br.IDs) != 2 {
+		t.Fatalf("batch ids = %d, want 2", len(br.IDs))
+	}
+
+	// publish to missing queue -> 404
+	missBody, _ := json.Marshal(PublishRequest{QueueId: "nope", Message: Message{Body: []byte("x")}})
+	mreq := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader(missBody))
+	mrec := httptest.NewRecorder()
+	publish(mrec, mreq)
+	if mrec.Code != http.StatusNotFound {
+		t.Fatalf("missing queue publish status = %d, want 404", mrec.Code)
+	}
+
+	// publish bad JSON -> 400
+	badReq := httptest.NewRequest(http.MethodPost, "/publish", bytes.NewReader([]byte("{bad")))
+	badRec := httptest.NewRecorder()
+	publish(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("bad json publish status = %d, want 400", badRec.Code)
+	}
+
+	// publish-batch empty messages -> 400
+	emptyBatch, _ := json.Marshal(BatchPublishRequest{QueueId: queueID, Messages: nil})
+	emptyReq := httptest.NewRequest(http.MethodPost, "/publish-batch", bytes.NewReader(emptyBatch))
+	emptyRec := httptest.NewRecorder()
+	publishBatch(emptyRec, emptyReq)
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("empty batch status = %d, want 400", emptyRec.Code)
 	}
 }
 

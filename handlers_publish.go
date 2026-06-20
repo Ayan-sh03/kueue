@@ -2,11 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
-	"time"
-
-	"github.com/cockroachdb/pebble/v2"
-	"github.com/google/uuid"
 )
 
 func publish(w http.ResponseWriter, r *http.Request) {
@@ -14,83 +11,27 @@ func publish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// publish should , 1. take task 2. put it in queue 3. return id
 	var message PublishRequest
 
-	err := json.NewDecoder(r.Body).Decode(&message)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
 		http.Error(w, "Bad Request : "+err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	queueId := message.QueueId
-	var queueConfig QueueConfig
-	val, closer, err := Db.Get([]byte(queueId))
+	ids, err := QueueManager.PublishBatch(r.Context(), message.QueueId, [][]byte{message.Message.Body})
 	if err != nil {
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue Not Found for id: "+queueId, http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := json.Unmarshal(val, &queueConfig); err != nil {
-		http.Error(w, "Error decoding queue: "+err.Error(), http.StatusInternalServerError)
-		closer.Close()
-		return
-	}
-	closer.Close()
-
-	// push to queue and return id
-	seq, err := nextMessageSequence(queueId)
-	if err != nil {
-		http.Error(w, "Error Allocating Message Sequence: "+err.Error(), http.StatusInternalServerError)
+		respondPublishError(w, err)
 		return
 	}
 
-	message.Message.ID = uuid.NewString()
-	message.Message.State = StateReady
-	message.Message.EnqueuedAt = time.Now()
-	message.Message.MaxDeliveryCount = queueConfig.MaxRetries
-
-	messageJson, err := json.Marshal(message.Message)
-	if err != nil {
-		http.Error(w, "Bad Reqeust: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	msgKey := messageKey(queueId, seq, message.Message.ID)
-	err = func() error {
-		batch := Db.NewIndexedBatch()
-		defer batch.Close()
-		if err := batch.Set(msgKey, messageJson, nil); err != nil {
-			return err
-		}
-		cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
-		if err := batch.Set(readyKey(queueId, seq, message.Message.ID), readyValue(msgKey), nil); err != nil {
-			return err
-		}
-		return batch.Commit(pebble.NoSync)
-	}()
-	if err != nil {
-		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// queue.Messages = append(queue.Messages, message.Message)
-
-	signalQueueReady(queueId)
-
-	m := getOrCreateMetrics(queueId)
-	m.totalPublished.Add(1)
-	m.readyCount.Add(1)
+	signalQueueReady(message.QueueId)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":    message.Message.ID,
+		"id":    ids[0],
 		"state": StateReady,
 	})
-
 }
 
 func publishBatch(w http.ResponseWriter, r *http.Request) {
@@ -112,70 +53,31 @@ func publishBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var queueConfig QueueConfig
-	val, closer, err := Db.Get([]byte(req.QueueId))
-	if err != nil {
-		if err == pebble.ErrNotFound {
-			http.Error(w, "Queue Not Found for id: "+req.QueueId, http.StatusNotFound)
-			return
-		}
-		http.Error(w, "Error retrieving queue: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := json.Unmarshal(val, &queueConfig); err != nil {
-		http.Error(w, "Error decoding queue: "+err.Error(), http.StatusInternalServerError)
-		closer.Close()
-		return
-	}
-	closer.Close()
-
-	ids := make([]string, len(req.Messages))
-	now := time.Now()
-
-	seqs, err := nextMessageSequenceN(req.QueueId, len(req.Messages))
-	if err != nil {
-		http.Error(w, "Error Allocating Message Sequences: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	batch := Db.NewIndexedBatch()
-	defer batch.Close()
+	bodies := make([][]byte, len(req.Messages))
 	for i, msg := range req.Messages {
-		msg.ID = uuid.NewString()
-		msg.State = StateReady
-		msg.EnqueuedAt = now
-		msg.MaxDeliveryCount = queueConfig.MaxRetries
-
-		msgJson, err := json.Marshal(msg)
-		if err != nil {
-			http.Error(w, "Error encoding message: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		msgKey := messageKey(req.QueueId, seqs[i], msg.ID)
-		if err := batch.Set(msgKey, msgJson, nil); err != nil {
-			http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		cacheMessageKey(receiptHandleForMessageKey(msgKey), msgKey)
-		if err := batch.Set(readyKey(req.QueueId, seqs[i], msg.ID), readyValue(msgKey), nil); err != nil {
-			http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		ids[i] = msg.ID
+		bodies[i] = msg.Body
 	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		http.Error(w, "Error Saving Messages: "+err.Error(), http.StatusInternalServerError)
+
+	ids, err := QueueManager.PublishBatch(r.Context(), req.QueueId, bodies)
+	if err != nil {
+		respondPublishError(w, err)
 		return
 	}
 
 	signalQueueReady(req.QueueId)
 
-	m := getOrCreateMetrics(req.QueueId)
-	m.totalPublished.Add(int64(len(ids)))
-	m.readyCount.Add(int64(len(ids)))
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(BatchPublishResponse{IDs: ids})
+}
+
+func respondPublishError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrQueueNotFound):
+		http.Error(w, "Queue Not Found", http.StatusNotFound)
+	case errors.Is(err, ErrMessageLimitExceeded), errors.Is(err, ErrByteLimitExceeded):
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+	default:
+		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
+	}
 }
