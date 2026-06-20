@@ -418,85 +418,6 @@ func TestReceiveLongPollIgnoresOtherQueuePublishes(t *testing.T) {
 	}
 }
 
-func TestReapExpiredMessagesResetsPersistedInFlightMessage(t *testing.T) {
-	t.Skip("TODO: fix nested batch write issue in nextMessageSequence")
-	setupTestDB(t)
-
-	queueID := createTestQueue(t, "reaper-queue")
-	messageID := publishTestMessage(t, queueID, []byte("expired"))
-
-	firstResp := receiveTestMessage(t, queueID)
-	firstToken := firstResp.DeliveryToken
-	firstReceiptHandle := firstResp.ReceiptHandle
-
-	storedKey := storedMessageKey(t, queueID, messageID)
-	batch := Db.NewIndexedBatch()
-	defer batch.Close()
-	val, closer, err := batch.Get(storedKey)
-	if err != nil {
-		t.Fatalf("get message: %v", err)
-	}
-	var msg Message
-	if err := json.Unmarshal(val, &msg); err != nil {
-		closer.Close()
-		t.Fatalf("unmarshal message: %v", err)
-	}
-	closer.Close()
-
-	if err := deleteInflightIndex(batch, queueID, msg); err != nil {
-		t.Fatalf("delete inflight index: %v", err)
-	}
-	msg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-
-	updated, err := json.Marshal(msg)
-	if err != nil {
-		t.Fatalf("marshal message: %v", err)
-	}
-
-	if err := batch.Set(storedKey, updated, nil); err != nil {
-		t.Fatalf("set message: %v", err)
-	}
-	if err := setInflightIndex(batch, queueID, msg, storedKey); err != nil {
-		t.Fatalf("set inflight index: %v", err)
-	}
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		t.Fatalf("commit batch: %v", err)
-	}
-
-	time.Sleep(200 * time.Millisecond)
-	recoveredTransitions, err := reapExpiredMessages(time.Now())
-	if err != nil {
-		t.Fatalf("reap expired messages: %v", err)
-	}
-	if len(recoveredTransitions) != 1 || recoveredTransitions[0].QueueID != queueID {
-		t.Fatal("expected reapExpiredMessages to recover the expired message")
-	}
-
-	secondResp := receiveTestMessage(t, queueID)
-
-	if secondResp.ID != messageID {
-		t.Fatalf("expected same message id after reap, got %s", secondResp.ID)
-	}
-	if string(secondResp.Body) != "expired" {
-		t.Fatalf("expected body expired, got %q", string(secondResp.Body))
-	}
-	if secondResp.State != StateInFlight {
-		t.Fatalf("expected in-flight state after re-receive, got %s", secondResp.State)
-	}
-
-	// Stale delivery token should be rejected
-	ackBody, err := json.Marshal(AckRequest{QueueId: queueID, ReceiptHandle: firstReceiptHandle, DeliveryToken: firstToken})
-	if err != nil {
-		t.Fatalf("marshal ack request: %v", err)
-	}
-	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
-	ackRecorder := httptest.NewRecorder()
-	ack(ackRecorder, ackReq)
-	if ackRecorder.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for stale delivery token, got %d: %s", ackRecorder.Code, ackRecorder.Body.String())
-	}
-}
-
 func TestAckRejectsWrongDeliveryToken(t *testing.T) {
 	setupTestDB(t)
 
@@ -1010,7 +931,7 @@ func BenchmarkBatchReceiveOnly(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				msgs, err := claimReadyMessages(queueID, batchSize)
+				msgs, err := QueueManager.ClaimBatch(context.Background(), queueID, batchSize)
 				if err != nil {
 					b.Fatalf("claim batch: %v", err)
 				}
@@ -1033,7 +954,7 @@ func BenchmarkBatchAckOnly(b *testing.B) {
 
 			batches := make([][]claimedMessage, 0, b.N)
 			for i := 0; i < b.N; i++ {
-				msgs, err := claimReadyMessages(queueID, batchSize)
+				msgs, err := QueueManager.ClaimBatch(context.Background(), queueID, batchSize)
 				if err != nil {
 					b.Fatalf("claim batch: %v", err)
 				}
@@ -1059,7 +980,7 @@ func BenchmarkBatchReceiveAndAck(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				msgs, err := claimReadyMessages(queueID, batchSize)
+				msgs, err := QueueManager.ClaimBatch(context.Background(), queueID, batchSize)
 				if err != nil {
 					b.Fatalf("claim batch: %v", err)
 				}
@@ -1079,51 +1000,14 @@ func BenchmarkReaperDueInflightIndex(b *testing.B) {
 
 			for i := 0; i < b.N; i++ {
 				publishBenchMessage(b, queueID, []byte("expired"))
-				resp := receiveBenchMessage(b, queueID)
-				key, err := messageKeyFromReceiptHandle(queueID, resp.ReceiptHandle)
-				if err != nil {
-					b.Fatalf("decode receipt handle: %v", err)
-				}
-				err = func() error {
-					batch := Db.NewIndexedBatch()
-					defer batch.Close()
-					val, closer, err := batch.Get(key)
-					if err != nil {
-						return err
-					}
-					var benchMsg Message
-					if err := json.Unmarshal(val, &benchMsg); err != nil {
-						closer.Close()
-						return err
-					}
-					closer.Close()
-					if err := deleteInflightIndex(batch, queueID, benchMsg); err != nil {
-						return err
-					}
-					benchMsg.VisibilityDeadline = time.Now().Add(-1 * time.Second)
-					updated, err := json.Marshal(benchMsg)
-					if err != nil {
-						return err
-					}
-					if err := batch.Set(key, updated, nil); err != nil {
-						return err
-					}
-					if err := setInflightIndex(batch, queueID, benchMsg, key); err != nil {
-						return err
-					}
-					return batch.Commit(pebble.NoSync)
-				}()
-				if err != nil {
-					b.Fatalf("prepare expired message: %v", err)
+				if _, err := QueueManager.ClaimBatch(context.Background(), queueID, 1); err != nil {
+					b.Fatalf("claim for reap: %v", err)
 				}
 			}
 
 			b.ResetTimer()
-			transitions, err := reapExpiredMessages(time.Now())
+			transitions := QueueManager.ReapExpired(context.Background(), time.Now().Add(31*time.Second))
 			b.StopTimer()
-			if err != nil {
-				b.Fatalf("reap expired messages: %v", err)
-			}
 			if len(transitions) != b.N {
 				b.Fatalf("reaped %d messages, want %d", len(transitions), b.N)
 			}
@@ -1677,6 +1561,182 @@ func TestCreatePublishAPICompatibility(t *testing.T) {
 	publishBatch(emptyRec, emptyReq)
 	if emptyRec.Code != http.StatusBadRequest {
 		t.Fatalf("empty batch status = %d, want 400", emptyRec.Code)
+	}
+}
+
+// ============================================================================
+// Phase 2.5: receive/ack/nack handler-level validation
+// ============================================================================
+
+func TestCompetingConsumersNoDuplicateDelivery(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "competing-consumers")
+	const totalMsgs = 100
+	const consumers = 10
+
+	for i := 0; i < totalMsgs; i++ {
+		publishTestMessage(t, queueID, []byte(fmt.Sprintf("msg-%d", i)))
+	}
+
+	type consumerResult struct {
+		ids []string
+		err error
+	}
+
+	var mu sync.Mutex
+	results := make([]consumerResult, consumers)
+	var wg sync.WaitGroup
+	wg.Add(consumers)
+
+	for c := 0; c < consumers; c++ {
+		go func(consumerIdx int) {
+			defer wg.Done()
+			var ids []string
+			for {
+				req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+				rec := httptest.NewRecorder()
+				receive(rec, req)
+				if rec.Code == http.StatusNotFound {
+					break
+				}
+				if rec.Code != http.StatusAccepted {
+					results[consumerIdx].err = fmt.Errorf("consumer %d: receive status = %d, body = %s", consumerIdx, rec.Code, rec.Body.String())
+					return
+				}
+				resp := decodeResponse[receiveResponse](t, rec)
+				ids = append(ids, resp.ID)
+			}
+			mu.Lock()
+			results[consumerIdx].ids = ids
+			mu.Unlock()
+		}(c)
+	}
+
+	wg.Wait()
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("consumer %d failed: %v", i, r.err)
+		}
+	}
+
+	allIDs := make(map[string]int)
+	totalConsumed := 0
+	for _, r := range results {
+		for _, id := range r.ids {
+			if allIDs[id] > 0 {
+				t.Fatalf("duplicate delivery: message %s delivered to multiple consumers", id)
+			}
+			allIDs[id]++
+			totalConsumed++
+		}
+	}
+
+	if totalConsumed != totalMsgs {
+		t.Fatalf("total consumed = %d, want %d", totalConsumed, totalMsgs)
+	}
+
+	minCount, maxCount := totalMsgs, 0
+	for _, r := range results {
+		count := len(r.ids)
+		if count < minCount {
+			minCount = count
+		}
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+	if minCount == 0 {
+		t.Fatalf("a consumer received 0 messages: distribution min=%d max=%d", minCount, maxCount)
+	}
+}
+
+func TestHandlerStaleAckTokenAfterRedeliveryReturns409(t *testing.T) {
+	setupTestDB(t)
+
+	queueID := createTestQueue(t, "stale-token-handler")
+
+	publishTestMessage(t, queueID, []byte("poison"))
+
+	firstResp := receiveTestMessage(t, queueID)
+	oldToken := firstResp.DeliveryToken
+	receiptHandle := firstResp.ReceiptHandle
+
+	nackBody, _ := json.Marshal(AckRequest{
+		QueueId:       queueID,
+		ReceiptHandle: receiptHandle,
+		DeliveryToken: oldToken,
+	})
+	nackReq := httptest.NewRequest(http.MethodPost, "/nack", bytes.NewReader(nackBody))
+	nackRec := httptest.NewRecorder()
+	nack(nackRec, nackReq)
+	if nackRec.Code != http.StatusAccepted {
+		t.Fatalf("nack status = %d, want 202, body = %s", nackRec.Code, nackRec.Body.String())
+	}
+
+	secondResp := receiveTestMessage(t, queueID)
+	if secondResp.DeliveryToken == oldToken {
+		t.Fatal("expected new delivery token after redelivery")
+	}
+	if secondResp.ReceiptHandle != receiptHandle {
+		t.Fatalf("receipt handle changed: got %q, want %q (immutable across redeliveries)", secondResp.ReceiptHandle, receiptHandle)
+	}
+
+	ackBody, _ := json.Marshal(AckRequest{
+		QueueId:       queueID,
+		ReceiptHandle: receiptHandle,
+		DeliveryToken: oldToken,
+	})
+	ackReq := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody))
+	ackRec := httptest.NewRecorder()
+	ack(ackRec, ackReq)
+	if ackRec.Code != http.StatusConflict {
+		t.Fatalf("stale token ack status = %d, want 409, body = %s", ackRec.Code, ackRec.Body.String())
+	}
+
+	ackBody2, _ := json.Marshal(AckRequest{
+		QueueId:       queueID,
+		ReceiptHandle: receiptHandle,
+		DeliveryToken: secondResp.DeliveryToken,
+	})
+	ackReq2 := httptest.NewRequest(http.MethodPost, "/ack", bytes.NewReader(ackBody2))
+	ackRec2 := httptest.NewRecorder()
+	ack(ackRec2, ackReq2)
+	if ackRec2.Code != http.StatusAccepted {
+		t.Fatalf("fresh token ack status = %d, want 202, body = %s", ackRec2.Code, ackRec2.Body.String())
+	}
+}
+
+func TestHandlerClaimWALFailureReturns500AndRollsBack(t *testing.T) {
+	wal := setupTestDBWithFakeWAL(t)
+	queueID := createTestQueue(t, "claim-wal-fail")
+
+	publishTestMessage(t, queueID, []byte("pending"))
+
+	wal.mu.Lock()
+	wal.fail = true
+	wal.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
+	rec := httptest.NewRecorder()
+	receive(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("receive during WAL failure: status = %d, want 500, body = %s", rec.Code, rec.Body.String())
+	}
+
+	ready, inflight, _ := runtimeQueueState(t, queueID)
+	if ready != 1 || inflight != 0 {
+		t.Fatalf("after WAL failure rollback: ready=%d inflight=%d, want 1,0", ready, inflight)
+	}
+
+	wal.mu.Lock()
+	wal.fail = false
+	wal.mu.Unlock()
+
+	resp := receiveTestMessage(t, queueID)
+	if resp.ID == "" {
+		t.Fatal("expected non-empty message id after successful receive post-rollback")
 	}
 }
 
