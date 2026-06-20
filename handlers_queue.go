@@ -25,7 +25,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 	var publishRequest CreateRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&publishRequest); err != nil {
-		http.Error(w, "Bad Requst Error: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Bad Request Error: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -71,7 +71,7 @@ func getQueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
 		"id":   id,
 		"name": q.config.Name,

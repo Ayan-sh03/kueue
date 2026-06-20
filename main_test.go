@@ -190,7 +190,7 @@ func TestCreateAndGetQueue(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	getQueue(recorder, req)
 
-	if recorder.Code != http.StatusAccepted {
+	if recorder.Code != http.StatusOK {
 		t.Fatalf("get status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 
@@ -1626,7 +1626,9 @@ func TestCreatePublishAPICompatibility(t *testing.T) {
 		ID    string       `json:"id"`
 		State MessageState `json:"state"`
 	}
-	json.NewDecoder(rec.Body).Decode(&pr)
+	if err := json.NewDecoder(rec.Body).Decode(&pr); err != nil {
+		t.Fatalf("decode publish response: %v", err)
+	}
 	if pr.ID == "" {
 		t.Fatal("publish returned empty id")
 	}
