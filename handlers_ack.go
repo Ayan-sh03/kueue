@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -14,22 +13,25 @@ func ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-
-	var batchReq BatchAckRequest
-	if json.Unmarshal(body, &batchReq) == nil && len(batchReq.Acks) > 0 {
-		handleBatchAck(w, r, batchReq)
-		return
-	}
-
-	var ackReq AckRequest
-	if err := json.Unmarshal(body, &ackReq); err != nil {
+	// Single decode into a union of the batch and single-ack shapes. If the
+	// caller sent an "acks" array, treat it as a batch; otherwise fall back to
+	// the single-ack fields. This replaces the old read-all + double-unmarshal.
+	var u ackRequestUnion
+	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
 		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	if len(u.Acks) > 0 {
+		handleBatchAck(w, r, BatchAckRequest{QueueId: u.QueueId, Acks: u.Acks})
+		return
+	}
+
+	ackReq := AckRequest{
+		MessageId:     u.MessageId,
+		QueueId:       u.QueueId,
+		ReceiptHandle: u.ReceiptHandle,
+		DeliveryToken: u.DeliveryToken,
 	}
 
 	if ackReq.QueueId == "" {

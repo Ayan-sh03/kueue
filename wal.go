@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -151,6 +152,33 @@ type walStore struct {
 	nextLSN           uint64
 	latestSnapshotLSN uint64
 	syncMode          walSyncMode
+
+	// opsSinceSnapshot counts successful Append commits since the last
+	// snapshot. Bumped by the Append leader after a successful commit. The
+	// snapshot trigger polls it on each reaper tick.
+	opsSinceSnapshot atomic.Int64
+
+	// compactBatchSize bounds the number of Delete keys per Pebble batch in
+	// WAL compaction and snapshot pruning. Set from KUEUE_WAL_COMPACT_BATCH
+	// (default 1000). 0 = single unbounded batch.
+	compactBatchSize int
+
+	// Group commit state. Concurrent appends (always from different queues —
+	// each queue holds its own mutex across its Append call) accumulate into a
+	// shared Pebble batch. The first appender becomes the leader and commits
+	// the whole batch with a single fsync; the rest wait for that commit.
+	// New appenders that arrive mid-flush accumulate into a fresh batch which
+	// the leader drains in turn, so one leader can amortize many fsyncs.
+	cur      *commitGroup
+	flushing bool
+}
+
+// commitGroup is one accumulating WAL batch shared by a group of appenders.
+type commitGroup struct {
+	batch  *pebble.Batch
+	done   chan struct{}
+	err    error
+	poison error // set if encoding/staging an entry into the batch failed
 }
 
 func newWalStore(db *pebble.DB, syncMode walSyncMode) (*walStore, error) {
@@ -215,52 +243,101 @@ func (w *walStore) Append(ctx context.Context, entries []walEntry) (firstLSN, la
 		return 0, 0, nil
 	}
 
+	opts, err := w.syncMode.writeOptions()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Encode every entry's frame up front, outside the lock. The encoded frame
+	// does not depend on the LSN (the LSN is only the Pebble key), so this — the
+	// CPU-heavy part (CRC + serialization) — runs fully concurrently across
+	// appenders and keeps the critical section tiny.
+	frames := make([][]byte, len(entries))
+	for i := range entries {
+		encoded, err := encodeWalEntry(entries[i])
+		if err != nil {
+			return 0, 0, err
+		}
+		frames[i] = encoded
+	}
+
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	firstLSN = w.nextLSN
 	if uint64(len(entries))-1 > ^uint64(0)-firstLSN {
+		w.mu.Unlock()
 		return 0, 0, errors.New("WAL LSN overflow")
 	}
 	lastLSN = firstLSN + uint64(len(entries)) - 1
 	nextLSN := lastLSN + 1
 	if nextLSN == 0 {
+		w.mu.Unlock()
 		return 0, 0, errors.New("WAL next LSN overflow")
 	}
 
-	batch := w.db.NewBatch()
-	defer batch.Close()
+	if w.cur == nil {
+		w.cur = &commitGroup{batch: w.db.NewBatch(), done: make(chan struct{})}
+	}
+	myGroup := w.cur
 
-	for i, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return 0, 0, err
-		}
-		entry.LSN = firstLSN + uint64(i)
-		encoded, err := encodeWalEntry(entry)
-		if err != nil {
-			return 0, 0, err
-		}
-		if err := batch.Set(walKey(entry.LSN), encoded, nil); err != nil {
-			return 0, 0, err
+	// Stage this append's keys into the shared batch under the lock.
+	for i, frame := range frames {
+		if err := myGroup.batch.Set(walKey(firstLSN+uint64(i)), frame, nil); err != nil && myGroup.poison == nil {
+			myGroup.poison = err
 		}
 	}
-	if err := batch.Set(walMetaNextLSNKey(), encodeUint64(nextLSN), nil); err != nil {
-		return 0, 0, err
+	if err := myGroup.batch.Set(walMetaNextLSNKey(), encodeUint64(nextLSN), nil); err != nil && myGroup.poison == nil {
+		myGroup.poison = err
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, 0, err
-	}
-
-	opts, err := w.syncMode.writeOptions()
-	if err != nil {
-		return 0, 0, err
-	}
-	if err := batch.Commit(opts); err != nil {
-		return 0, 0, err
-	}
-
 	w.nextLSN = nextLSN
-	return firstLSN, lastLSN, nil
+
+	if w.flushing {
+		// A leader is already committing an earlier batch and will drain ours
+		// next. Wait for our group's commit to complete. We do not abandon on
+		// ctx cancellation here: our keys are already staged, so the only
+		// consistent outcomes are "committed" or "commit failed".
+		w.mu.Unlock()
+		<-myGroup.done
+		err := myGroup.err
+		if err == nil {
+			w.opsSinceSnapshot.Add(int64(len(frames)))
+		}
+		return firstLSN, lastLSN, err
+	}
+
+	// We are the leader. Drain the current group and any groups that accumulate
+	// while we commit, so a single goroutine amortizes many fsyncs.
+	w.flushing = true
+	group := myGroup
+	for {
+		w.cur = nil
+		w.mu.Unlock()
+
+		var commitErr error
+		if group.poison != nil {
+			commitErr = group.poison
+		} else {
+			commitErr = group.batch.Commit(opts)
+		}
+		group.batch.Close()
+
+		w.mu.Lock()
+		group.err = commitErr
+		close(group.done)
+
+		if w.cur == nil {
+			w.flushing = false
+			w.mu.Unlock()
+			break
+		}
+		group = w.cur
+	}
+
+	retErr := myGroup.err
+	if retErr == nil {
+		w.opsSinceSnapshot.Add(int64(len(frames)))
+	}
+	return firstLSN, lastLSN, retErr
 }
 
 func (w *walStore) Replay(ctx context.Context, afterLSN uint64, apply func(walEntry) error) error {
@@ -322,22 +399,27 @@ func encodeWalEntry(entry walEntry) ([]byte, error) {
 		return nil, fmt.Errorf("unknown WAL op %d", entry.Op)
 	}
 
-	payload, err := encodeWalPayload(entry.Op, entry.Payload)
-	if err != nil {
-		return nil, err
+	// Reserve the frame header up front and encode the payload directly after
+	// it. The whole frame is then a single allocation with no header/payload
+	// copy — the header is filled in place once the payload length is known.
+	w := walPayloadWriter{buf: make([]byte, walFrameHeader, walFrameHeader+128)}
+	encodeWalPayloadInto(&w, entry.Op, entry.Payload)
+	if w.err != nil {
+		return nil, w.err
 	}
+
+	frame := w.buf
+	payload := frame[walFrameHeader:]
 	if uint64(len(payload)) > walMaxUint32 {
 		return nil, fmt.Errorf("WAL payload too large: %d bytes", len(payload))
 	}
 
-	frame := make([]byte, walFrameHeader+len(payload))
 	copy(frame[0:4], walFrameMagic)
 	binary.BigEndian.PutUint16(frame[4:6], walFrameVersion)
 	frame[6] = byte(entry.Op)
 	frame[7] = entry.Flags
 	binary.BigEndian.PutUint32(frame[8:12], crc32.ChecksumIEEE(payload))
 	binary.BigEndian.PutUint32(frame[12:16], uint32(len(payload)))
-	copy(frame[16:], payload)
 	return frame, nil
 }
 
@@ -382,46 +464,52 @@ func decodeWalEntry(lsn uint64, frame []byte) (walEntry, error) {
 	}, nil
 }
 
-func encodeWalPayload(op walOp, payload any) ([]byte, error) {
+func encodeWalPayloadInto(w *walPayloadWriter, op walOp, payload any) {
 	switch op {
 	case opCreateQueue:
 		p, ok := payload.(walCreateQueuePayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL create queue payload has type %T", payload)
+			w.err = fmt.Errorf("WAL create queue payload has type %T", payload)
+			return
 		}
-		return encodeWalCreateQueuePayload(p)
+		encodeWalCreateQueuePayload(w, p)
 	case opPublishBatch:
 		p, ok := payload.(walPublishBatchPayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL publish batch payload has type %T", payload)
+			w.err = fmt.Errorf("WAL publish batch payload has type %T", payload)
+			return
 		}
-		return encodeWalPublishBatchPayload(p)
+		encodeWalPublishBatchPayload(w, p)
 	case opClaimBatch:
 		p, ok := payload.(walClaimBatchPayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL claim batch payload has type %T", payload)
+			w.err = fmt.Errorf("WAL claim batch payload has type %T", payload)
+			return
 		}
-		return encodeWalClaimBatchPayload(p)
+		encodeWalClaimBatchPayload(w, p)
 	case opAckBatch:
 		p, ok := payload.(walAckBatchPayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL ack batch payload has type %T", payload)
+			w.err = fmt.Errorf("WAL ack batch payload has type %T", payload)
+			return
 		}
-		return encodeWalAckBatchPayload(p)
+		encodeWalAckBatchPayload(w, p)
 	case opNack:
 		p, ok := payload.(walNackPayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL nack payload has type %T", payload)
+			w.err = fmt.Errorf("WAL nack payload has type %T", payload)
+			return
 		}
-		return encodeWalNackPayload(p)
+		encodeWalNackPayload(w, p)
 	case opReapBatch:
 		p, ok := payload.(walReapBatchPayload)
 		if !ok {
-			return nil, fmt.Errorf("WAL reap batch payload has type %T", payload)
+			w.err = fmt.Errorf("WAL reap batch payload has type %T", payload)
+			return
 		}
-		return encodeWalReapBatchPayload(p)
+		encodeWalReapBatchPayload(w, p)
 	default:
-		return nil, fmt.Errorf("unknown WAL op %d", op)
+		w.err = fmt.Errorf("unknown WAL op %d", op)
 	}
 }
 
@@ -455,12 +543,10 @@ func decodeWalPayload(op walOp, payload []byte) (any, error) {
 	return out, nil
 }
 
-func encodeWalCreateQueuePayload(p walCreateQueuePayload) ([]byte, error) {
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeString(p.Name)
-	writer.writeInt(p.MaxRetries)
-	return writer.bytes()
+func encodeWalCreateQueuePayload(w *walPayloadWriter, p walCreateQueuePayload) {
+	w.writeString(p.QueueID)
+	w.writeString(p.Name)
+	w.writeInt(p.MaxRetries)
 }
 
 func decodeWalCreateQueuePayload(reader *walPayloadReader) (walCreateQueuePayload, error) {
@@ -479,18 +565,16 @@ func decodeWalCreateQueuePayload(reader *walPayloadReader) (walCreateQueuePayloa
 	return walCreateQueuePayload{QueueID: queueID, Name: name, MaxRetries: maxRetries}, nil
 }
 
-func encodeWalPublishBatchPayload(p walPublishBatchPayload) ([]byte, error) {
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeCount(len(p.Messages))
+func encodeWalPublishBatchPayload(w *walPayloadWriter, p walPublishBatchPayload) {
+	w.writeString(p.QueueID)
+	w.writeCount(len(p.Messages))
 	for _, msg := range p.Messages {
-		writer.writeString(msg.MessageID)
-		writer.writeUint64(msg.Seq)
-		writer.writeBytes(msg.Body)
-		writer.writeTime(msg.EnqueuedAt)
-		writer.writeInt(msg.MaxDeliveryCount)
+		w.writeString(msg.MessageID)
+		w.writeUint64(msg.Seq)
+		w.writeBytes(msg.Body)
+		w.writeTime(msg.EnqueuedAt)
+		w.writeInt(msg.MaxDeliveryCount)
 	}
-	return writer.bytes()
 }
 
 func decodeWalPublishBatchPayload(reader *walPayloadReader) (walPublishBatchPayload, error) {
@@ -535,18 +619,16 @@ func decodeWalPublishBatchPayload(reader *walPayloadReader) (walPublishBatchPayl
 	return walPublishBatchPayload{QueueID: queueID, Messages: messages}, nil
 }
 
-func encodeWalClaimBatchPayload(p walClaimBatchPayload) ([]byte, error) {
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeCount(len(p.Claims))
+func encodeWalClaimBatchPayload(w *walPayloadWriter, p walClaimBatchPayload) {
+	w.writeString(p.QueueID)
+	w.writeCount(len(p.Claims))
 	for _, claim := range p.Claims {
-		writer.writeString(claim.MessageID)
-		writer.writeString(claim.ReceiptHandle)
-		writer.writeString(claim.DeliveryToken)
-		writer.writeTime(claim.VisibilityDeadline)
-		writer.writeInt(claim.DeliveryCount)
+		w.writeString(claim.MessageID)
+		w.writeString(claim.ReceiptHandle)
+		w.writeString(claim.DeliveryToken)
+		w.writeTime(claim.VisibilityDeadline)
+		w.writeInt(claim.DeliveryCount)
 	}
-	return writer.bytes()
 }
 
 func decodeWalClaimBatchPayload(reader *walPayloadReader) (walClaimBatchPayload, error) {
@@ -591,16 +673,14 @@ func decodeWalClaimBatchPayload(reader *walPayloadReader) (walClaimBatchPayload,
 	return walClaimBatchPayload{QueueID: queueID, Claims: claims}, nil
 }
 
-func encodeWalAckBatchPayload(p walAckBatchPayload) ([]byte, error) {
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeCount(len(p.Acks))
+func encodeWalAckBatchPayload(w *walPayloadWriter, p walAckBatchPayload) {
+	w.writeString(p.QueueID)
+	w.writeCount(len(p.Acks))
 	for _, ack := range p.Acks {
-		writer.writeString(ack.MessageID)
-		writer.writeString(ack.ReceiptHandle)
-		writer.writeString(ack.DeliveryToken)
+		w.writeString(ack.MessageID)
+		w.writeString(ack.ReceiptHandle)
+		w.writeString(ack.DeliveryToken)
 	}
-	return writer.bytes()
 }
 
 func decodeWalAckBatchPayload(reader *walPayloadReader) (walAckBatchPayload, error) {
@@ -631,22 +711,21 @@ func decodeWalAckBatchPayload(reader *walPayloadReader) (walAckBatchPayload, err
 	return walAckBatchPayload{QueueID: queueID, Acks: acks}, nil
 }
 
-func encodeWalNackPayload(p walNackPayload) ([]byte, error) {
+func encodeWalNackPayload(w *walPayloadWriter, p walNackPayload) {
 	if !isValidWalMessageState(p.TargetState) {
-		return nil, fmt.Errorf("invalid WAL nack target state %q", p.TargetState)
+		w.err = fmt.Errorf("invalid WAL nack target state %q", p.TargetState)
+		return
 	}
 
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeString(p.MessageID)
-	writer.writeString(p.ReceiptHandle)
-	writer.writeString(p.DeliveryToken)
-	writer.writeString(string(p.TargetState))
-	writer.writeBool(p.HasNewReadySeq)
+	w.writeString(p.QueueID)
+	w.writeString(p.MessageID)
+	w.writeString(p.ReceiptHandle)
+	w.writeString(p.DeliveryToken)
+	w.writeString(string(p.TargetState))
+	w.writeBool(p.HasNewReadySeq)
 	if p.HasNewReadySeq {
-		writer.writeUint64(p.NewReadySeq)
+		w.writeUint64(p.NewReadySeq)
 	}
-	return writer.bytes()
 }
 
 func decodeWalNackPayload(reader *walPayloadReader) (walNackPayload, error) {
@@ -692,23 +771,22 @@ func decodeWalNackPayload(reader *walPayloadReader) (walNackPayload, error) {
 	}, nil
 }
 
-func encodeWalReapBatchPayload(p walReapBatchPayload) ([]byte, error) {
-	var writer walPayloadWriter
-	writer.writeString(p.QueueID)
-	writer.writeCount(len(p.Reaps))
+func encodeWalReapBatchPayload(w *walPayloadWriter, p walReapBatchPayload) {
+	w.writeString(p.QueueID)
+	w.writeCount(len(p.Reaps))
 	for _, reap := range p.Reaps {
 		if !isValidWalMessageState(reap.TargetState) {
-			return nil, fmt.Errorf("invalid WAL reap target state %q", reap.TargetState)
+			w.err = fmt.Errorf("invalid WAL reap target state %q", reap.TargetState)
+			return
 		}
-		writer.writeString(reap.MessageID)
-		writer.writeString(reap.PreviousDeliveryToken)
-		writer.writeString(string(reap.TargetState))
-		writer.writeBool(reap.HasNewReadySeq)
+		w.writeString(reap.MessageID)
+		w.writeString(reap.PreviousDeliveryToken)
+		w.writeString(string(reap.TargetState))
+		w.writeBool(reap.HasNewReadySeq)
 		if reap.HasNewReadySeq {
-			writer.writeUint64(reap.NewReadySeq)
+			w.writeUint64(reap.NewReadySeq)
 		}
 	}
-	return writer.bytes()
 }
 
 func decodeWalReapBatchPayload(reader *walPayloadReader) (walReapBatchPayload, error) {
@@ -811,7 +889,16 @@ func (w *walPayloadWriter) writeCount(count int) {
 }
 
 func (w *walPayloadWriter) writeString(v string) {
-	w.writeBytes([]byte(v))
+	if w.err != nil {
+		return
+	}
+	if uint64(len(v)) > walMaxUint32 {
+		w.err = fmt.Errorf("WAL payload string length %d exceeds uint32", len(v))
+		return
+	}
+	w.writeUint32(uint32(len(v)))
+	// Appending a string to a []byte avoids the []byte(v) conversion alloc.
+	w.buf = append(w.buf, v...)
 }
 
 func (w *walPayloadWriter) writeBytes(v []byte) {
@@ -832,13 +919,6 @@ func (w *walPayloadWriter) writeTime(v time.Time) {
 		return
 	}
 	w.writeInt64(v.UTC().UnixNano())
-}
-
-func (w *walPayloadWriter) bytes() ([]byte, error) {
-	if w.err != nil {
-		return nil, w.err
-	}
-	return append([]byte(nil), w.buf...), nil
 }
 
 type walPayloadReader struct {

@@ -37,10 +37,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{
-		"id":    queueID,
-		"state": StateReady,
-	})
+	json.NewEncoder(w).Encode(idStateResponse{ID: queueID, State: StateReady})
 }
 
 func getQueue(w http.ResponseWriter, r *http.Request) {

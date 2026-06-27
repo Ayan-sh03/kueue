@@ -98,12 +98,12 @@ func receive(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]any{
-			"id":            msg.ID,
-			"body":          msg.Body,
-			"state":         StateInFlight,
-			"deliveryToken": msg.DeliveryAttemptID,
-			"receiptHandle": msg.ReceiptHandle,
+		json.NewEncoder(w).Encode(batchReceiveMessage{
+			ID:            msg.ID,
+			Body:          msg.Body,
+			State:         StateInFlight,
+			DeliveryToken: msg.DeliveryAttemptID,
+			ReceiptHandle: msg.ReceiptHandle,
 		})
 		return
 	}
@@ -134,9 +134,7 @@ func receive(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{
-		"messages": batch,
-	})
+	json.NewEncoder(w).Encode(batchReceiveResponse{Messages: batch})
 }
 
 func receiveBatch(w http.ResponseWriter, r *http.Request) {
