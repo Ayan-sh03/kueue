@@ -94,9 +94,11 @@ Code is in the root package (`package main`) split across focused files (`main.g
 
 ### Metrics
 
-Per-queue in-memory counters in `queueMetrics`, stored in a `sync.Map` (`metricsStore`). On `/metrics?id=X`, `reconcileMetricsFromDB` uses a Pebble snapshot iterator for truth and uses `snapshotMax` (CAS loop) to avoid overwriting live counters with stale snapshots.
+Per-queue in-memory atomic counters in `queueMetrics`, stored in a `sync.Map` (`metricsStore`). Counters (`readyCount`, `inFlightCount`, `deadCount`, `totalPublished`, `totalReceived`, `totalAcked`, `totalNacked`, `ackCountWindow`) are maintained on every mutating transition in the live runtime (publish, claim, ack, nack, reap-ready, reap-dead) and replayed via `ApplyWALEntry` on recovery (`recovery.go`). `/metrics?id=X` is O(1) w.r.t. queue depth: it only loads these atomics — no Pebble scan.
 
-`ackWindow` is a sliding window of ack timestamps (60s). `resetAckWindow` is called from the reaper goroutine every second to prevent unbounded growth — not just from `/metrics`.
+`reconcileMetricsFromDB` (and `reconcileMetricsFromDBIfStale`, `metricsReconcileInterval`, `queueMetrics.reconcileMu`/`lastReconcile`, and the `snapshotMax` CAS helper) in `metrics.go` are **orphaned dead code**. The live runtime never writes per-message Pebble keys (WAL stores under `wal|`), so the scan iterates a prefix that is empty on fresh data. It is retained only for the stale-scan throttle tests in `main_test.go`; full removal is #35 (Phase 2.10). Do not rely on it for correctness.
+
+`ackCountWindow` is a per-second ack counter reset by the reaper goroutine every second (`resetAckWindow` in `reaper.go`) to feed `ackRatePerSec`; uptime fallback is `totalAcked / uptimeSeconds`.
 
 ### Reaper returns transitions
 
@@ -123,13 +125,26 @@ The WAL stores:
 
 Snapshots truncate the log; replay starts from the latest snapshot LSN.
 
+**Group commit**: `Append` coalesces concurrent appends into a single Pebble batch + single fsync. Each entry's frame is encoded outside the WAL lock (the frame does not depend on the LSN — the LSN is only the Pebble key), so only LSN assignment and staging into the shared batch happen under the lock. The first appender becomes the leader, commits the accumulated batch, then drains any batches that filled up during the commit; the rest wait on their group's `done` channel. Concurrent appends only ever come from different queues (a queue holds its own `mu` across its Append), so cross-batch ordering is irrelevant. Under `KUEUE_WAL_SYNC=always` this amortizes one fsync across many queues' operations (~12× throughput at 32 concurrent producers).
+
+### Snapshots and WAL compaction (`snapshot.go`)
+
+Consistent snapshots checkpoint the live `queueManager` into a single `snapshot|<LSN>` Pebble value and advance `walmeta|latest_snapshot_lsn` in **one atomic Pebble batch (Sync)**. The snapshot LSN is `walStore.nextLSN - 1` read while all per-queue `mu` are held (so no Append can be mid-flight), making the captured state and the LSN strictly consistent. Snapshot payload (`snapshotData`) covers queue configs, `nextSeq`, ready/in-flight/dead messages with bodies, **in-flight receipt handles + delivery tokens + visibility deadlines**, and the durable metric counters (`totalPublished/Received/Acked/Nacked`, `readyCount/inFlightCount/deadCount`). `ackCountWindow` is intentionally not durable (it is recomputed by the reaper post-recovery). The frame format mirrors the WAL frame: `"KSNA"` magic + version + payload CRC + length, reused `walPayloadWriter/Reader` for the body.
+
+**Triggers**: the reaper goroutine ticks `QueueManager.maybeSnapshot` every second. It checks `KUEUE_SNAPSHOT_EVERY_OPS` (default `100000`) and `KUEUE_SNAPSHOT_EVERY_SECONDS` (default `60`); `0` disables that dimension, both zero disables snapshots entirely. On success it `compactWAL`s through the snapshot LSN and `pruneOldSnapshots` keeps the 2 newest snapshot objects. Defaults are high enough that short CI/benchmark runs never trigger a snapshot (no throughput regression in CI).
+
+**Crash safety**: snapshot data and the meta pointer land atomically. On startup `recoverQueueManager` loads the snapshot at `latest_snapshot_lsn`; if it is missing or corrupt (CRC/magic failure or truncated value), it walks the `snapshot|` prefix descending for the next-newest usable snapshot, applies that, and durably rewrites the pointer. If no usable snapshot exists, the pointer is reset to 0 and full WAL replay runs from LSN 1. So a partial commit of a snapshot never makes startup pick a corrupt/checkpoint.
+
+**Compaction**: `compactWAL(throughLSN)` deletes every `wal|<LSN>` with `LSN ≤ throughLSN` in bounded Pebble Delete batches of `KUEUE_WAL_COMPACT_BATCH` (default `1000`; `0` = single batch) using `NoSync` — safe because the authorizing snapshot batch was already `Sync`'d; a crash before compaction lands just means re-compacting on next start. WAL entries above the snapshot LSN are never deleted. `applySnapshot` reconstructs each queue's `readyList` (in stored order), `inflight` map + `deadlines` heap (fresh `deliveryRecordSeq` for heap tie-breaking), and `dead` set, then `Store`s the snapshot metric counters. WAL entries with LSN > snapshot replay on top via `ApplyWALEntry`, which strictly validates state transitions (e.g. `opAckBatch` requires the message in `StateInFlight`), so snapshot+replay is byte-identical to full replay.
+
 ### Recovery
 
 `recovery.go` rebuilds the runtime model at startup. `main()` calls `initQueueManagerFromEnv`, which:
 1. Opens/creates the `walStore` from Pebble.
 2. Creates an empty `queueManager`.
-3. Replays every WAL entry through `ApplyWALEntry`.
-4. Runs one `ReapExpired` pass to drain any in-flight messages that expired while the server was down.
+3. Loads the newest usable snapshot (per the crash-safety protocol above) and applies it.
+4. Replays WAL entries with LSN > snapshot LSN through `ApplyWALEntry`.
+5. Runs one `ReapExpired` pass to drain any in-flight messages that expired while the server was down.
 
 `ApplyWALEntry` validates consistency strictly: duplicate queue creates, missing messages, wrong states, or stale delivery tokens fail loudly and stop startup. During replay, ready channels are not signaled because there are no consumers yet.
 

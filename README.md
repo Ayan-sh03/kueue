@@ -54,6 +54,12 @@ go run main.go
 Environment variables:
 - `KUEUE_DB_PATH` - Pebble data directory (default: `./tmp/pebble`)
 - `PORT` - Server port (default: `8080`)
+- `KUEUE_WAL_SYNC` - WAL fsync mode: `none`, `batch`, or `always` (default: `none`)
+- `KUEUE_SNAPSHOT_EVERY_OPS` - Take a checkpoint after this many committed WAL entries (default: `100000`; `0` disables the ops dimension)
+- `KUEUE_SNAPSHOT_EVERY_SECONDS` - Take a checkpoint at least this often (default: `60`; `0` disables the seconds dimension). Both `0` disables snapshots entirely.
+- `KUEUE_WAL_COMPACT_BATCH` - Max keys per Pebble Delete batch during WAL compaction / snapshot pruning (default: `1000`; `0` = single unbounded batch)
+- `KUEUE_MAX_IN_MEMORY_MESSAGES` / `KUEUE_MAX_IN_MEMORY_BYTES` - Per-queue in-memory limits (`0` = unlimited)
+- `KUEUE_CPU_PROFILE` - Write a CPU profile to this path when set
 
 ## Benchmark
 

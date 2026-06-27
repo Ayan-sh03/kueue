@@ -28,10 +28,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]any{
-		"id":    ids[0],
-		"state": StateReady,
-	})
+	json.NewEncoder(w).Encode(idStateResponse{ID: ids[0], State: StateReady})
 }
 
 func publishBatch(w http.ResponseWriter, r *http.Request) {

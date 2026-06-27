@@ -29,8 +29,6 @@ func setupTestDB(t *testing.T) {
 	Db = db
 	Queues = nil
 	DeadLetterQueue = nil
-	receiveChannel = make(chan struct{}, 1)
-	queueReadyChans = map[string]chan struct{}{}
 	metricsStore = sync.Map{}
 	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
@@ -700,8 +698,6 @@ func BenchmarkReceiveLatencyVsDepth(b *testing.B) {
 			DeadLetterQueue = nil
 			metricsStore = sync.Map{}
 			messageKeyCache = sync.Map{}
-			receiveChannel = make(chan struct{}, 1)
-			queueReadyChans = map[string]chan struct{}{}
 			deliveryRecordSeq.Store(0)
 			qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
 			if err != nil {
@@ -897,8 +893,6 @@ func setupDepthBenchmarkDB(b *testing.B) string {
 	Db = db
 	Queues = nil
 	DeadLetterQueue = nil
-	receiveChannel = make(chan struct{}, 1)
-	queueReadyChans = map[string]chan struct{}{}
 	metricsStore = sync.Map{}
 	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
@@ -1348,8 +1342,6 @@ func setupTestDBWithFakeWAL(t *testing.T) *fakeWAL {
 	Db = db
 	Queues = nil
 	DeadLetterQueue = nil
-	receiveChannel = make(chan struct{}, 1)
-	queueReadyChans = map[string]chan struct{}{}
 	metricsStore = sync.Map{}
 	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"container/heap"
 	"container/list"
 	"context"
@@ -52,6 +51,14 @@ type deliveryRecord struct {
 
 var deliveryRecordSeq atomic.Uint64
 
+func init() {
+	// Batch crypto/rand reads for UUID generation. UUIDs are minted on every
+	// publish (message ID) and every claim (delivery token), so the default
+	// per-call rand syscall is a measurable throughput tax. The pool amortizes
+	// it across many UUIDs. Safe for our usage: we never fork.
+	uuid.EnableRandPool()
+}
+
 type queueRuntime struct {
 	mu sync.Mutex
 
@@ -68,6 +75,13 @@ type queueRuntime struct {
 	deadlines visibilityHeap // min-heap of *deliveryRecord
 
 	readyCh chan struct{}
+
+	// notifyCh wakes long-polling receivers. close-and-replace under notifyMu
+	// (a dedicated lock, never held with q.mu) gives lost-wakeup-free signaling
+	// without any global, cross-queue contention.
+	notifyMu sync.Mutex
+	notifyCh chan struct{}
+
 	metrics *queueMetrics
 
 	maxMessages int64
@@ -84,6 +98,7 @@ func newQueueRuntime(id string, config QueueConfig, metrics *queueMetrics) *queu
 		inflight:    make(map[string]*deliveryRecord),
 		dead:        make(map[string]*messageRecord),
 		readyCh:     make(chan struct{}, 1),
+		notifyCh:    make(chan struct{}),
 		metrics:     metrics,
 		maxMessages: parseInt64Env("KUEUE_MAX_IN_MEMORY_MESSAGES", 0),
 		maxBytes:    parseInt64Env("KUEUE_MAX_IN_MEMORY_BYTES", 0),
@@ -105,8 +120,16 @@ func parseInt64Env(name string, defaultVal int64) int64 {
 }
 
 func receiptHandleForMessage(queueID string, seq uint64, messageID string) string {
-	raw := queueID + "|" + strconv.FormatUint(seq, 10) + "|" + messageID
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+	// Build the raw handle directly into a byte buffer to avoid the intermediate
+	// string concatenation + []byte conversion allocations on the claim hot path.
+	// Output is byte-identical to base64(queueID|seq|messageID).
+	raw := make([]byte, 0, len(queueID)+1+20+1+len(messageID))
+	raw = append(raw, queueID...)
+	raw = append(raw, '|')
+	raw = strconv.AppendUint(raw, seq, 10)
+	raw = append(raw, '|')
+	raw = append(raw, messageID...)
+	return base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func (q *queueRuntime) signalReady() {
@@ -116,10 +139,40 @@ func (q *queueRuntime) signalReady() {
 	}
 }
 
+// waitChan returns the current ready-notification channel. Callers select on it
+// after re-checking for ready messages; the re-check prevents lost signals.
+func (q *queueRuntime) waitChan() <-chan struct{} {
+	q.notifyMu.Lock()
+	ch := q.notifyCh
+	q.notifyMu.Unlock()
+	return ch
+}
+
+// notify wakes all current waiters by closing the notification channel and
+// installing a fresh one for future waiters.
+func (q *queueRuntime) notify() {
+	q.notifyMu.Lock()
+	close(q.notifyCh)
+	q.notifyCh = make(chan struct{})
+	q.notifyMu.Unlock()
+}
+
 type queueManager struct {
 	mu     sync.RWMutex
 	queues map[string]*queueRuntime
 	wal    walAppender
+
+	// walStore is the concrete store when the manager is backed by a real
+	// Pebble WAL (nil in tests that use fakeWAL). It is required for snapshots
+	// and WAL compaction.
+	walStore *walStore
+
+	// snapshot configuration + trigger state. Populated only on the real
+	// (walStore-backed) path; fakeWAL-backed managers leave these zero and
+	// maybeSnapshot becomes a no-op.
+	snapshotCfg   snapshotConfig
+	lastSnapshotMu sync.Mutex
+	lastSnapshotAt time.Time
 }
 
 func newQueueManager(wal walAppender) *queueManager {
@@ -207,7 +260,7 @@ func (qm *queueManager) PublishBatch(ctx context.Context, queueID string, bodies
 			ID:               msgID,
 			QueueID:          queueID,
 			Seq:              seq,
-			Body:             bytes.Clone(body),
+			Body:             body,
 			State:            StateReady,
 			EnqueuedAt:       now,
 			DeliveryCount:    0,
@@ -385,9 +438,14 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// Validate each entry and collect valid ones for WAL.
+	// Validate each entry and collect valid ones for WAL. The dedup map is only
+	// needed when there is more than one entry — the common single-ack path
+	// skips the allocation entirely.
 	valid := make([]*deliveryRecord, 0, len(acks))
-	seen := make(map[string]bool, len(acks))
+	var seen map[string]bool
+	if len(acks) > 1 {
+		seen = make(map[string]bool, len(acks))
+	}
 	results := make([]runtimeAckResult, len(acks))
 	for i, entry := range acks {
 		results[i].ReceiptHandle = entry.ReceiptHandle
@@ -407,7 +465,9 @@ func (qm *queueManager) AckBatch(ctx context.Context, queueID string, acks []Ack
 			results[i].Error = (&ErrDeliveryTokenMismatch{Expected: dr.DeliveryToken, Got: entry.DeliveryToken}).Error()
 			continue
 		}
-		seen[entry.ReceiptHandle] = true
+		if seen != nil {
+			seen[entry.ReceiptHandle] = true
+		}
 		valid = append(valid, dr)
 		results[i].Status = "ok"
 		results[i].MessageID = dr.MessageID
@@ -572,7 +632,14 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		}
 		var pending []pendingReap
 
+		// Track whether we disturbed the heap. In steady state (visibility
+		// timeout >> reaper interval) the front entry is almost always in the
+		// future, so the loop never runs and the heap is untouched. Only then
+		// can we skip the O(N) rebuild below.
+		poppedAny := false
+
 		for len(q.deadlines) > 0 && !q.deadlines[0].Deadline.After(now) {
+			poppedAny = true
 			dr := heap.Pop(&q.deadlines).(*deliveryRecord)
 			msg, ok := q.messages[dr.MessageID]
 			if !ok {
@@ -612,12 +679,16 @@ func (qm *queueManager) ReapExpired(ctx context.Context, now time.Time) []reapTr
 		}
 
 		if len(reaps) == 0 {
-			// Nothing expired, but we may have popped stale entries from the heap.
-			// Push any valid inflight entries back.
-			q.deadlines = q.deadlines[:0]
-			for _, dr := range q.inflight {
-				dr.heapIndex = -1
-				heap.Push(&q.deadlines, dr)
+			// Nothing expired. If the loop popped only stale entries it
+			// disturbed the heap, so rebuild from the inflight map (the source
+			// of truth). If nothing was popped (the common case), the heap is
+			// already intact and the rebuild would be pure O(N) waste.
+			if poppedAny {
+				q.deadlines = q.deadlines[:0]
+				for _, dr := range q.inflight {
+					dr.heapIndex = -1
+					heap.Push(&q.deadlines, dr)
+				}
 			}
 			q.mu.Unlock()
 			continue

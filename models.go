@@ -72,6 +72,15 @@ type BatchAckRequest struct {
 	Acks    []AckEntry `json:"acks"`
 }
 
+// ackRequestUnion lets /ack decode batch and single requests in a single pass.
+type ackRequestUnion struct {
+	QueueId       string     `json:"queueId"`
+	Acks          []AckEntry `json:"acks"`
+	MessageId     string     `json:"messageId,omitempty"`
+	ReceiptHandle string     `json:"receiptHandle"`
+	DeliveryToken string     `json:"deliveryToken"`
+}
+
 type BatchPublishRequest struct {
 	Messages []Message `json:"messages"`
 	QueueId  string    `json:"queueId"`
@@ -83,6 +92,12 @@ type BatchPublishResponse struct {
 
 type batchReceiveResponse struct {
 	Messages []batchReceiveMessage `json:"messages"`
+}
+
+// idStateResponse is the {id, state} body returned by /create and /publish.
+type idStateResponse struct {
+	ID    string       `json:"id"`
+	State MessageState `json:"state"`
 }
 
 type batchReceiveMessage struct {

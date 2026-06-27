@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log"
 	"time"
 )
 
@@ -17,7 +18,8 @@ func reaper() {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			transitions := QueueManager.ReapExpired(context.Background(), time.Now())
+			now := time.Now()
+			transitions := QueueManager.ReapExpired(context.Background(), now)
 
 			signaled := map[string]struct{}{}
 			for _, t := range transitions {
@@ -33,6 +35,13 @@ func reaper() {
 				value.(*queueMetrics).resetAckWindow()
 				return true
 			})
+
+			// Checkpoint + compact the WAL if the ops/seconds thresholds are
+			// due. No-op when snapshots are disabled or the manager is backed
+			// by a fake WAL (e.g. in tests).
+			if _, err := QueueManager.maybeSnapshot(context.Background(), now); err != nil {
+				log.Printf("snapshot: %v", err)
+			}
 		}
 	}()
 

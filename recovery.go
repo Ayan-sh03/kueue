@@ -19,19 +19,47 @@ var (
 	WAL *walStore
 )
 
-// recoverQueueManager opens the WAL store, creates an empty queueManager, and
-// replays all WAL entries after the latest snapshot LSN. After replay it runs
-// one reaper pass for in-flight deliveries that already expired while the
-// process was down. Any replay error is returned and startup must not proceed.
-func recoverQueueManager(ctx context.Context, db *pebble.DB, syncMode walSyncMode) (*queueManager, *walStore, error) {
+// recoverQueueManager opens the WAL store, creates an empty queueManager,
+// loads the newest usable snapshot (if any), replays all WAL entries after
+// that snapshot's LSN, and runs one reaper pass for in-flight deliveries that
+// already expired while the process was down. Any replay error is returned and
+// startup must not proceed.
+func recoverQueueManager(ctx context.Context, db *pebble.DB, syncMode walSyncMode, snapCfg snapshotConfig) (*queueManager, *walStore, error) {
 	wal, err := newWalStore(db, syncMode)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open wal store: %w", err)
 	}
+	wal.compactBatchSize = snapCfg.compactBatchSize
 
 	qm := newQueueManager(wal)
+	qm.walStore = wal
+	qm.snapshotCfg = snapCfg
 
-	if err := wal.Replay(ctx, wal.latestSnapshotLSN, qm.ApplyWALEntry); err != nil {
+	// Load the newest usable snapshot, falling back to the next-newest if the
+	// pointer's target is missing/corrupt. On fallback, durably rewrite the
+	// pointer so the next start picks the known-good snapshot directly.
+	afterLSN := uint64(0)
+	applied, usedLSN, fellBack, err := wal.loadUsableSnapshot(ctx, wal.latestSnapshotLSN, qm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load snapshot: %w", err)
+	}
+	if applied {
+		afterLSN = usedLSN
+		if fellBack || usedLSN != wal.latestSnapshotLSN {
+			if err := wal.setLatestSnapshotLSN(usedLSN); err != nil {
+				return nil, nil, fmt.Errorf("rewrite snapshot pointer: %w", err)
+			}
+		}
+	} else if wal.latestSnapshotLSN != 0 {
+		// No usable snapshot but the meta pointer claimed one existed
+		// (corrupt/partial). Rewrite it to 0 so subsequent starts skip the
+		// corrupt scan and replay from the WAL baseline directly.
+		if err := wal.setLatestSnapshotLSN(0); err != nil {
+			return nil, nil, fmt.Errorf("rewrite snapshot pointer: %w", err)
+		}
+	}
+
+	if err := wal.Replay(ctx, afterLSN, qm.ApplyWALEntry); err != nil {
 		return nil, nil, fmt.Errorf("replay wal: %w", err)
 	}
 
@@ -43,13 +71,18 @@ func recoverQueueManager(ctx context.Context, db *pebble.DB, syncMode walSyncMod
 }
 
 // initQueueManagerFromEnv is a convenience wrapper that reads KUEUE_WAL_SYNC
-// from the environment and recovers the queue manager from the supplied DB.
+// and the snapshot thresholds from the environment and recovers the queue
+// manager from the supplied DB.
 func initQueueManagerFromEnv(ctx context.Context, db *pebble.DB) (*queueManager, *walStore, error) {
 	syncMode, err := walSyncModeFromEnv()
 	if err != nil {
 		return nil, nil, err
 	}
-	return recoverQueueManager(ctx, db, syncMode)
+	snapCfg, err := parseSnapshotConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	return recoverQueueManager(ctx, db, syncMode, snapCfg)
 }
 
 // ApplyWALEntry applies a single WAL entry to the in-memory queue manager.
