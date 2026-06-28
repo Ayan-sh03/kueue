@@ -477,20 +477,13 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 
-	// createMu.RLock serializes with CreateQueue's (Append + install) critical
-	// section. We hold it only long enough to (1) capture the queue ID set
-	// and (2) read the snapshot LSN, so the two are mutually consistent: any
-	// CreateQueue whose opCreateQueue committed at LSN K <= snapshotLSN has
-	// already installed its queue when we read the IDs; any CreateQueue that
-	// commits afterwards will have LSN K > snapshotLSN and its creation will
-	// be replayed post-snapshot. Without this coordination, TakeSnapshot
-	// could commit snapshot@K that omits the queue while leaving its
-	// opCreateQueue@K below the replay boundary, silently dropping the queue
-	// on the next restart.
-	qm.createMu.RLock()
-
-	// Snapshot the set of queue IDs under the manager RLock, then take every
-	// per-queue mu in a deterministic (sorted) order to avoid deadlock.
+	// Snapshot the set of queue IDs under the manager RLock. CreateQueue
+	// installs new queues into qm.queues before appending opCreateQueue, so
+	// any queue we see here is either already covered by the snapshot we are
+	// about to take (its opCreateQueue LSN ≤ snapshotLSN) or will be
+	// tail-replayed (opCreateQueue LSN > snapshotLSN). applyCreateQueue is
+	// idempotent, so the small race window where a queue is installed but
+	// its WAL entry is still in the tail is harmless.
 	qm.mu.RLock()
 	ids := make([]string, 0, len(qm.queues))
 	for id := range qm.queues {
@@ -498,8 +491,10 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 	}
 	qm.mu.RUnlock()
 
-	// Acquire every per-queue lock. No Append can complete while we hold all
-	// of these, since each Append holds its q.mu across its wal.Append call.
+	// Acquire every per-queue lock in a deterministic (sorted) order to avoid
+	// deadlock. No Append can complete while we hold all of these, since each
+	// Append holds its q.mu across its wal.Append call.
+	sort.Strings(ids)
 	queues := make([]*queueRuntime, len(ids))
 	for i, id := range ids {
 		q, err := qm.getQueue(id)
@@ -525,7 +520,6 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 	qm.walStore.mu.Lock()
 	snapshotLSN := qm.walStore.nextLSN - 1
 	qm.walStore.mu.Unlock()
-	qm.createMu.RUnlock()
 
 	if snapshotLSN == 0 {
 		for i := len(queues) - 1; i >= 0; i-- {

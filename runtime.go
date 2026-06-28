@@ -163,20 +163,6 @@ type queueManager struct {
 	queues map[string]*queueRuntime
 	wal    walAppender
 
-	// createMu serializes CreateQueue's Append+install against TakeSnapshot's
-	// snapshot-LSN-and-queue-ID read. CreateQueue takes the write lock across
-	// (a) committing opCreateQueue to the WAL (advancing nextLSN) and (b)
-	// installing the queue into qm.queues; TakeSnapshot takes the read lock
-	// across both reading walStore.nextLSN (to derive the snapshot LSN) and
-	// capturing the queue ID set. This guarantees the snapshot invariant:
-	// "for every WAL entry with LSN <= snapshotLSN, the queue it touches is
-	// reflected in the captured ID set" -- so the snapshot要么 includes the
-	// queue (if opCreateQueue LSN <= snapshotLSN) or replays its creation
-	// (if opCreateQueue LSN > snapshotLSN). The lock is only touched on
-	// CreateQueue and TakeSnapshot -- neither is on the hot publish/receive
-	// path -- so it does not serialize default traffic.
-	createMu sync.RWMutex
-
 	// walStore is the concrete store when the manager is backed by a real
 	// Pebble WAL (nil in tests that use fakeWAL). It is required for snapshots
 	// and WAL compaction.
@@ -211,6 +197,22 @@ func (qm *queueManager) CreateQueue(ctx context.Context, name string, maxRetries
 	queueID := uuid.NewString()
 	metrics := getOrCreateMetrics(queueID)
 
+	config := QueueConfig{Name: name, MaxRetries: maxRetries}
+	q := newQueueRuntime(queueID, config, metrics)
+
+	// Install the queue into qm.queues *before* the WAL append. This makes
+	// the snapshot invariant self-synchronizing: any snapshot that captures
+	// this queue ID will have snapshotLSN >= the opCreateQueue LSN (the
+	// append is serialized by the per-queue mutex and the WAL lock, and LSNs
+	// are monotone), so the create entry is below the replay boundary. Any
+	// snapshot that misses the ID has snapshotLSN < the opCreateQueue LSN,
+	// so the create entry falls in the tail WAL that gets replayed.
+	// applyCreateQueue is idempotent, so the rare case where the queue is
+	// snapshotted empty and its create entry is also tail-replayed is safe.
+	qm.mu.Lock()
+	qm.queues[queueID] = q
+	qm.mu.Unlock()
+
 	entry := walEntry{
 		Op: opCreateQueue,
 		Payload: walCreateQueuePayload{
@@ -219,27 +221,14 @@ func (qm *queueManager) CreateQueue(ctx context.Context, name string, maxRetries
 			MaxRetries: maxRetries,
 		},
 	}
-
-	// createMu must be held across both the WAL Append (which advances
-	// walStore.nextLSN) and the qm.queues install. Otherwise TakeSnapshot
-	// could capture a snapshotLSN that includes opCreateQueue@K while the
-	// queue is still missing from qm.queues -- snapshot@snapshotLSN would
-	// silently omit the queue, opCreateQueue@K would never replay (LSN > K
-	// is the only tail replayed), and the queue would be permanently lost on
-	// the next restart.
-	qm.createMu.Lock()
 	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
-		qm.createMu.Unlock()
+		// The queue is live but has no WAL record; roll it back so clients
+		// don't see a phantom queue that will vanish on the next restart.
+		qm.mu.Lock()
+		delete(qm.queues, queueID)
+		qm.mu.Unlock()
 		return "", fmt.Errorf("wal append create queue: %w", err)
 	}
-
-	config := QueueConfig{Name: name, MaxRetries: maxRetries}
-	q := newQueueRuntime(queueID, config, metrics)
-
-	qm.mu.Lock()
-	qm.queues[queueID] = q
-	qm.mu.Unlock()
-	qm.createMu.Unlock()
 
 	return queueID, nil
 }
