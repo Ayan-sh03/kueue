@@ -385,10 +385,12 @@ func buildSnapshotFromLegacy(queues map[string]*legacyMigrationQueue) (snapshotD
 		}
 
 		sq := snapshotQueue{
-			QueueID:    id,
-			Name:       lq.Name,
-			MaxRetries: lq.MaxRetries,
-			NextSeq:    nextSeq,
+			QueueID:     id,
+			Name:        lq.Name,
+			MaxRetries:  lq.MaxRetries,
+			NextSeq:     nextSeq,
+			MaxMessages: parseInt64Env("KUEUE_MAX_IN_MEMORY_MESSAGES", 0),
+			MaxBytes:    parseInt64Env("KUEUE_MAX_IN_MEMORY_BYTES", 0),
 		}
 
 		sq.Ready = make([]snapshotMessage, 0, len(ready))
@@ -431,11 +433,26 @@ func buildSnapshotFromLegacy(queues map[string]*legacyMigrationQueue) (snapshotD
 			})
 		}
 
+		// TotalReceived: sum of each message's delivery count. Inflight messages
+		// have been received DeliveryCount times; dead messages hit their retry
+		// cap. Ready messages have DeliveryCount=0. TotalAcked/Nacked cannot be
+		// reconstructed (acked messages were deleted from the legacy store), so
+		// we leave them as 0 — the worst visible effect is lifetime counters
+		// being understated, not an impossible state (inFlight > TotalReceived).
+		var totalReceived int64
+		for _, m := range inflight {
+			totalReceived += int64(m.DeliveryCount)
+		}
+		for _, m := range dead {
+			totalReceived += int64(m.DeliveryCount)
+		}
+
 		sq.Metrics = snapshotMetrics{
 			ReadyCount:     int64(len(ready)),
 			InFlightCount:  int64(len(inflight)),
 			DeadCount:      int64(len(dead)),
 			TotalPublished: int64(len(lq.Messages)),
+			TotalReceived:  totalReceived,
 		}
 
 		data.Queues = append(data.Queues, sq)

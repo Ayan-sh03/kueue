@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"container/list"
 	"context"
@@ -162,6 +163,20 @@ type queueManager struct {
 	queues map[string]*queueRuntime
 	wal    walAppender
 
+	// createMu serializes CreateQueue's Append+install against TakeSnapshot's
+	// snapshot-LSN-and-queue-ID read. CreateQueue takes the write lock across
+	// (a) committing opCreateQueue to the WAL (advancing nextLSN) and (b)
+	// installing the queue into qm.queues; TakeSnapshot takes the read lock
+	// across both reading walStore.nextLSN (to derive the snapshot LSN) and
+	// capturing the queue ID set. This guarantees the snapshot invariant:
+	// "for every WAL entry with LSN <= snapshotLSN, the queue it touches is
+	// reflected in the captured ID set" -- so the snapshot要么 includes the
+	// queue (if opCreateQueue LSN <= snapshotLSN) or replays its creation
+	// (if opCreateQueue LSN > snapshotLSN). The lock is only touched on
+	// CreateQueue and TakeSnapshot -- neither is on the hot publish/receive
+	// path -- so it does not serialize default traffic.
+	createMu sync.RWMutex
+
 	// walStore is the concrete store when the manager is backed by a real
 	// Pebble WAL (nil in tests that use fakeWAL). It is required for snapshots
 	// and WAL compaction.
@@ -204,7 +219,17 @@ func (qm *queueManager) CreateQueue(ctx context.Context, name string, maxRetries
 			MaxRetries: maxRetries,
 		},
 	}
+
+	// createMu must be held across both the WAL Append (which advances
+	// walStore.nextLSN) and the qm.queues install. Otherwise TakeSnapshot
+	// could capture a snapshotLSN that includes opCreateQueue@K while the
+	// queue is still missing from qm.queues -- snapshot@snapshotLSN would
+	// silently omit the queue, opCreateQueue@K would never replay (LSN > K
+	// is the only tail replayed), and the queue would be permanently lost on
+	// the next restart.
+	qm.createMu.Lock()
 	if _, _, err := qm.wal.Append(ctx, []walEntry{entry}); err != nil {
+		qm.createMu.Unlock()
 		return "", fmt.Errorf("wal append create queue: %w", err)
 	}
 
@@ -214,6 +239,7 @@ func (qm *queueManager) CreateQueue(ctx context.Context, name string, maxRetries
 	qm.mu.Lock()
 	qm.queues[queueID] = q
 	qm.mu.Unlock()
+	qm.createMu.Unlock()
 
 	return queueID, nil
 }
@@ -260,7 +286,7 @@ func (qm *queueManager) PublishBatch(ctx context.Context, queueID string, bodies
 			ID:               msgID,
 			QueueID:          queueID,
 			Seq:              seq,
-			Body:             body,
+			Body:             bytes.Clone(body),
 			State:            StateReady,
 			EnqueuedAt:       now,
 			DeliveryCount:    0,
