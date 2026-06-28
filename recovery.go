@@ -150,8 +150,14 @@ func (qm *queueManager) applyCreateQueue(p walCreateQueuePayload) error {
 	qm.mu.Lock()
 	defer qm.mu.Unlock()
 
-	if _, exists := qm.queues[p.QueueID]; exists {
-		return fmt.Errorf("create queue: queue %q already exists", p.QueueID)
+	if existing, exists := qm.queues[p.QueueID]; exists {
+		// Idempotent replay: the queue was already installed (e.g. it was
+		// present in a snapshot taken while its opCreateQueue was still in
+		// the WAL tail). Verify the config matches and treat as a no-op.
+		if existing.config.Name != p.Name || existing.config.MaxRetries != p.MaxRetries {
+			return fmt.Errorf("create queue: queue %q already exists with different config", p.QueueID)
+		}
+		return nil
 	}
 
 	config := QueueConfig{Name: p.Name, MaxRetries: p.MaxRetries}
