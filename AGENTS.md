@@ -168,7 +168,7 @@ Legacy layout scanned (all written by the pre-WAL handlers):
 
 ## Testing
 
-Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `receiveChannel`, `queueReadyChans`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `QueueManager.ReapExpired` synchronously.
+Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `QueueManager.ReapExpired` synchronously.
 
 Runtime/WAL/recovery tests typically build state through the runtime API, close the Pebble DB, reopen it, and call `recoverQueueManager` / `ApplyWALEntry` to verify that the in-memory model is rebuilt correctly.
 

@@ -477,6 +477,18 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 
+	// createMu.RLock serializes with CreateQueue's (Append + install) critical
+	// section. We hold it only long enough to (1) capture the queue ID set
+	// and (2) read the snapshot LSN, so the two are mutually consistent: any
+	// CreateQueue whose opCreateQueue committed at LSN K <= snapshotLSN has
+	// already installed its queue when we read the IDs; any CreateQueue that
+	// commits afterwards will have LSN K > snapshotLSN and its creation will
+	// be replayed post-snapshot. Without this coordination, TakeSnapshot
+	// could commit snapshot@K that omits the queue while leaving its
+	// opCreateQueue@K below the replay boundary, silently dropping the queue
+	// on the next restart.
+	qm.createMu.RLock()
+
 	// Snapshot the set of queue IDs under the manager RLock, then take every
 	// per-queue mu in a deterministic (sorted) order to avoid deadlock.
 	qm.mu.RLock()
@@ -485,7 +497,6 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 		ids = append(ids, id)
 	}
 	qm.mu.RUnlock()
-	sort.Strings(ids)
 
 	// Acquire every per-queue lock. No Append can complete while we hold all
 	// of these, since each Append holds its q.mu across its wal.Append call.
@@ -493,9 +504,8 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 	for i, id := range ids {
 		q, err := qm.getQueue(id)
 		if err != nil {
-			// Released locks already taken below would be unsafe; but a queue
-			// disappearing here is impossible since we hold no live Add path
-			// that deletes queues. Release what we have and bail.
+			// A queue disappearing here is impossible — queues are never
+			// deleted in the live runtime. Release what we hold and bail.
 			for j := 0; j < i; j++ {
 				queues[j].mu.Unlock()
 			}
@@ -504,43 +514,56 @@ func (qm *queueManager) TakeSnapshot(ctx context.Context) (uint64, error) {
 		q.mu.Lock()
 		queues[i] = q
 	}
-	defer func() {
+
+	// Read the snapshot LSN = last committed WAL LSN, under the walStore
+	// lock. Because every live Append holds its q.mu, and we hold all q.mu,
+	// no Append can be mid-flight: nextLSN-1 is exactly the highest committed
+	// LSN whose effects are reflected in the state we're about to serialize.
+	// This preserves snapshot+tail-replay ≡ full-replay: every published
+	// message whose LSN ≤ snapshotLSN is in q.messages under our lock, every
+	// post-snapshot publish has LSN > snapshotLSN and will be tail-replayed.
+	qm.walStore.mu.Lock()
+	snapshotLSN := qm.walStore.nextLSN - 1
+	qm.walStore.mu.Unlock()
+	qm.createMu.RUnlock()
+
+	if snapshotLSN == 0 {
 		for i := len(queues) - 1; i >= 0; i-- {
 			if queues[i] != nil {
 				queues[i].mu.Unlock()
 			}
 		}
-	}()
-
-	// Read the snapshot LSN = last committed WAL LSN, under the walStore lock.
-	// Because every live Append holds its q.mu, and we hold all q.mu, no
-	// Append can be mid-flight, so nextLSN-1 is exactly the highest committed
-	// LSN whose effects are reflected in the state we're about to serialize.
-	qm.walStore.mu.Lock()
-	snapshotLSN := qm.walStore.nextLSN - 1
-	qm.walStore.mu.Unlock()
-	if snapshotLSN == 0 {
 		return 0, nil // empty store, nothing to checkpoint
 	}
 
+	// Capture sorted IDs now (qm.mu was held only briefly above for ID
+	// capture, so the queue order is whatever range the map iteration gave;
+	// sort for deterministic on-disk encoding). Per-queue locks are already
+	// held, so reading q.id under each lock is safe.
+	sort.Strings(ids)
+
+	// Serialize every queue under its own lock. The fresh snapshotQueue
+	// slices are owned exclusively by this goroutine; nothing else can mutate
+	// them once we drop the lock.
 	data := snapshotData{SnapshotLSN: snapshotLSN}
 	data.Queues = make([]snapshotQueue, len(queues))
 	for i, q := range queues {
 		data.Queues[i] = serializeQueue(q, snapshotLSN)
 	}
 
-	// Encode the frame now (CPU work), before any Pebble lock.
+	// Release per-queue locks now that all state has been deep-copied into
+	// fresh snapshotQueue allocations. The encode + CRC run on those copies
+	// outside any lock so a snapshot interval cannot freeze the live runtime
+	// for the duration of a full-payload CRC.
+	for i := len(queues) - 1; i >= 0; i-- {
+		queues[i].mu.Unlock()
+		queues[i] = nil
+	}
+
+	// Encode + CRC the captured state with no queue locks held.
 	frame, err := encodeSnapshotEntry(data)
 	if err != nil {
 		return 0, fmt.Errorf("encode snapshot: %w", err)
-	}
-
-	// Release per-queue locks before the fsync to minimize hold time. Since
-	// snapshot state was captured under those locks and is now in `frame` (a
-	// fresh allocation), nothing can mutate it before commit.
-	for i := len(queues) - 1; i >= 0; i-- {
-		queues[i].mu.Unlock()
-		queues[i] = nil // mark released so the deferred unlock is a no-op
 	}
 
 	// One atomic Pebble batch: snapshot payload + meta pointer. Both land or
@@ -763,6 +786,14 @@ if snapLSN > 0 {
 			qm.applySnapshot(data)
 			return true, snapLSN, false, nil
 		}
+		// ok=true + loadErr!=nil: snapshot is corrupt → fall back to an older one.
+		// ok=false + loadErr==nil: key not found → fall back (shouldn't normally
+		//   happen, but safe to try older snapshots).
+		// ok=false + loadErr!=nil: transient I/O error → abort rather than
+		//   silently treating a healthy snapshot as if it were corrupt.
+		if loadErr != nil && !ok {
+			return false, 0, false, fmt.Errorf("read snapshot@%d: %w", snapLSN, loadErr)
+		}
 		// Fall through to fallback scan.
 	}
 
@@ -873,12 +904,11 @@ func (w *walStore) setLatestSnapshotLSN(lsn uint64) error {
 
 // ---- WAL compaction -------------------------------------------------------
 
-// compactWAL deletes every wal|<LSN> entry whose LSN is <= throughLSN, in
-// bounded Pebble Delete batches of KUEUE_WAL_COMPACT_BATCH keys (default
-// 1000; 0 = single batch). Deletions are idempotent and committed NoSync
-// because the snapshot batch that authorized this compaction was already
-// Sync'd — a crash before a NoSync compaction batch lands just means we
-// re-compact on the next start, which is safe.
+// compactWAL deletes every wal|<LSN> entry whose LSN is <= throughLSN using a
+// single Pebble DeleteRange. WAL keys are contiguous (wal|1 … wal|throughLSN),
+// so one range tombstone replaces iterating every key. Committed NoSync: the
+// snapshot that authorized this compaction was already Sync'd, so a crash
+// before this lands just means re-compaction on the next start, which is safe.
 func (w *walStore) compactWAL(ctx context.Context, throughLSN uint64) error {
 	if w == nil || w.db == nil {
 		return errors.New("wal store is not initialized")
@@ -886,71 +916,30 @@ func (w *walStore) compactWAL(ctx context.Context, throughLSN uint64) error {
 	if throughLSN == 0 {
 		return nil
 	}
-
-	batchSize := w.compactBatchSize
-	if batchSize < 0 {
-		batchSize = defaultCompactBatchSize
-	}
-
-	lower := walKey(1)
-	upper := walKey(throughLSN + 1) // exclusive
-
-	iter, err := w.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer iter.Close()
 
 	batch := w.db.NewBatch()
-	count := 0
-	commitBatch := func() error {
-		if count == 0 {
-			return nil
-		}
-		if err := batch.Commit(pebble.NoSync); err != nil {
-			return fmt.Errorf("commit compaction batch: %w", err)
-		}
-		batch.Close()
-		batch = w.db.NewBatch()
-		count = 0
-		return nil
-	}
 	defer batch.Close()
-
-	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		key := append([]byte(nil), iter.Key()...)
-		if err := batch.Delete(key, nil); err != nil {
-			return fmt.Errorf("stage delete: %w", err)
-		}
-		count++
-		if batchSize > 0 && count >= batchSize {
-			if err := commitBatch(); err != nil {
-				return err
-			}
-		}
+	// Delete [wal|1, wal|(throughLSN+1)) — all LSNs 1..throughLSN inclusive.
+	// throughLSN+1 cannot overflow: nextLSN is bounded by the overflow guard in
+	// Append, and throughLSN = snapshotLSN = nextLSN-1 at snapshot time.
+	if err := batch.DeleteRange(walKey(1), walKey(throughLSN+1), nil); err != nil {
+		return fmt.Errorf("delete range wal: %w", err)
 	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	return commitBatch()
+	return batch.Commit(pebble.NoSync)
 }
 
-// pruneOldSnapshots keeps at most the two newest snapshot objects and deletes
-// the rest in bounded batches. Called after a successful snapshot commit.
+// pruneOldSnapshots keeps the two newest snapshot objects and deletes the rest
+// using a single Pebble DeleteRange. Snapshot keys are snapshot|<8B LSN>, so
+// all keys below the second-newest form a contiguous prefix range.
 func (w *walStore) pruneOldSnapshots(ctx context.Context) error {
 	if w == nil || w.db == nil {
 		return errors.New("wal store is not initialized")
 	}
-
-	batchSize := w.compactBatchSize
-	if batchSize < 0 {
-		batchSize = defaultCompactBatchSize
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	type snap struct {
@@ -980,43 +969,22 @@ func (w *walStore) pruneOldSnapshots(ctx context.Context) error {
 		return err
 	}
 
-	// snaps is in ascending LSN order. Keep the newest two, prune the rest.
+	// snaps is in ascending LSN order. Keep the newest two, prune the rest via
+	// a single DeleteRange: [snapshotPrefix, secondNewestKey).
 	if len(snaps) <= 2 {
 		return nil
 	}
-	toDelete := snaps[:len(snaps)-2]
+
+	// secondNewestKey is the lower of the two retained snapshots; everything
+	// with a smaller key is older and safe to delete.
+	secondNewestKey := snaps[len(snaps)-2].key
 
 	batch := w.db.NewBatch()
-	count := 0
-	commitBatch := func() error {
-		if count == 0 {
-			return nil
-		}
-		if err := batch.Commit(pebble.NoSync); err != nil {
-			return fmt.Errorf("commit snapshot prune batch: %w", err)
-		}
-		batch.Close()
-		batch = w.db.NewBatch()
-		count = 0
-		return nil
-	}
 	defer batch.Close()
-
-	for _, s := range toDelete {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := batch.Delete(s.key, nil); err != nil {
-			return fmt.Errorf("stage snapshot delete: %w", err)
-		}
-		count++
-		if batchSize > 0 && count >= batchSize {
-			if err := commitBatch(); err != nil {
-				return err
-			}
-		}
+	if err := batch.DeleteRange(snapshotPrefix(), secondNewestKey, nil); err != nil {
+		return fmt.Errorf("delete range snapshots: %w", err)
 	}
-	return commitBatch()
+	return batch.Commit(pebble.NoSync)
 }
 
 // ---- trigger wiring -------------------------------------------------------
@@ -1045,6 +1013,15 @@ func (qm *queueManager) maybeSnapshot(ctx context.Context, now time.Time) (uint6
 		return 0, nil
 	}
 
+	// Capture the current snapshot LSN before taking the new one. We compact
+	// WAL only up to prevLSN (not the new lsn) so that the second-retained
+	// snapshot always has its WAL tail available: if snapshot@newLSN is corrupt
+	// on disk, recovery can fall back to snapshot@prevLSN and replay from
+	// prevLSN+1..newLSN, which we have not deleted.
+	qm.walStore.mu.Lock()
+	prevLSN := qm.walStore.latestSnapshotLSN
+	qm.walStore.mu.Unlock()
+
 	lsn, err := qm.TakeSnapshot(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("snapshot: %w", err)
@@ -1055,7 +1032,7 @@ func (qm *queueManager) maybeSnapshot(ctx context.Context, now time.Time) (uint6
 		return 0, nil
 	}
 
-	if err := qm.walStore.compactWAL(ctx, lsn); err != nil {
+	if err := qm.walStore.compactWAL(ctx, prevLSN); err != nil {
 		return lsn, fmt.Errorf("compact wal: %w", err)
 	}
 	if err := qm.walStore.pruneOldSnapshots(ctx); err != nil {
