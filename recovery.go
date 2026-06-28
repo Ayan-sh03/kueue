@@ -35,6 +35,17 @@ func recoverQueueManager(ctx context.Context, db *pebble.DB, syncMode walSyncMod
 	qm.walStore = wal
 	qm.snapshotCfg = snapCfg
 
+	// Phase 2.8: one-time migration from the legacy Pebble hot-path layout.
+	// If the durable marker is set this is a no-op. Otherwise it scans once
+	// for old-layout keys and, if present, writes a snapshot@0 + WAL meta
+	// pointers + the marker in a single atomic Sync batch. After this runs
+	// (or no-op's), the load-snapshot path below works identically for both
+	// fresh-DBs and migrated legacy DBs: load snapshot@latest_snapshot_lsn,
+	// fall back to a descending scan if missing, then replay WAL LSN > that.
+	if err := maybeMigrateLegacyLayout(ctx, db, wal); err != nil {
+		return nil, nil, fmt.Errorf("migrate legacy layout: %w", err)
+	}
+
 	// Load the newest usable snapshot, falling back to the next-newest if the
 	// pointer's target is missing/corrupt. On fallback, durably rewrite the
 	// pointer so the next start picks the known-good snapshot directly.
