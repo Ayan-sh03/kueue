@@ -757,7 +757,7 @@ func (w *walStore) loadUsableSnapshot(ctx context.Context, snapLSN uint64, qm *q
 		return false, 0, false, errors.New("wal store is not initialized")
 	}
 
-	if snapLSN > 0 {
+if snapLSN > 0 {
 		data, ok, loadErr := w.loadSnapshot(snapLSN)
 		if loadErr == nil && ok {
 			qm.applySnapshot(data)
@@ -766,12 +766,22 @@ func (w *walStore) loadUsableSnapshot(ctx context.Context, snapLSN uint64, qm *q
 		// Fall through to fallback scan.
 	}
 
-	// Walk snapshot| descending, skipping snapLSN (already tried).
-	usable, found, scanErr := w.findUsableSnapshotLSN(snapLSN)
+	// Walk snapshot| descending, skipping snapLSN (already attempted). When
+	// snapLSN == 0 there is nothing to exclude — the meta pointer is at the
+	// baseline and a snapshot@0 written by legacy-layout migration is still
+	// a valid candidate.
+	excludeLSN := snapLSN
+	if snapLSN == 0 {
+		excludeLSN = ^uint64(0) // never matches any real LSN
+	}
+	usable, found, scanErr := w.findUsableSnapshotLSN(excludeLSN)
 	if scanErr != nil {
 		return false, 0, false, scanErr
 	}
-	if !found || usable == 0 {
+	if !found {
+		// No snapshot at all in the store. usable == 0 here is the sentinel
+		// from findUsableSnapshotLSN's not-found return; a real snapshot@0
+		// written by legacy-layout migration is a valid found=true result.
 		return false, 0, false, nil
 	}
 	data, ok, loadErr := w.loadSnapshot(usable)

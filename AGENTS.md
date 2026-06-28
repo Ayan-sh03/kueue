@@ -137,14 +137,32 @@ Consistent snapshots checkpoint the live `queueManager` into a single `snapshot|
 
 **Compaction**: `compactWAL(throughLSN)` deletes every `wal|<LSN>` with `LSN ≤ throughLSN` in bounded Pebble Delete batches of `KUEUE_WAL_COMPACT_BATCH` (default `1000`; `0` = single batch) using `NoSync` — safe because the authorizing snapshot batch was already `Sync`'d; a crash before compaction lands just means re-compacting on next start. WAL entries above the snapshot LSN are never deleted. `applySnapshot` reconstructs each queue's `readyList` (in stored order), `inflight` map + `deadlines` heap (fresh `deliveryRecordSeq` for heap tie-breaking), and `dead` set, then `Store`s the snapshot metric counters. WAL entries with LSN > snapshot replay on top via `ApplyWALEntry`, which strictly validates state transitions (e.g. `opAckBatch` requires the message in `StateInFlight`), so snapshot+replay is byte-identical to full replay.
 
+### Legacy-layout migration (`migration.go`)
+
+One-time migration from the pre-WAL Pebble hot-path layout to the snapshot/WAL architecture. gated by the durable marker `migration|pebble_hot_path_imported=true`. Run by `recoverQueueManager` before snapshot loading; idempotent (marker set → no-op scan).
+
+Legacy layout scanned (all written by the pre-WAL handlers):
+- `<queueID>` → JSON `QueueConfig{Name, MaxRetries}`
+- `seq:<queueID>` → 8-byte uint64 next-sequence counter
+- `<queueID>|<8B seq>|<messageID>` → JSON `Message`
+- `ready|<queueID>|<8B seq>|<messageID>` → message key bytes (ignored — message key is authoritative)
+- `inflight|<8B deadline>|<queueID>|<messageID>` → message key bytes (ignored — message state field is authoritative)
+
+`scanLegacyLayout` walks every key in the DB, ignoring reserved modern prefixes (`wal|`, `walmeta|`, `snapshot|`, `migration|`) and the unwanted legacy `ready|`/`inflight|` indexes. For each queue seen it builds config + message records. `buildSnapshotFromLegacy` constructs a `snapshotData` at **LSN 0**: ready messages sorted by seq for FIFO delivery, in-flight messages keep their visibility deadline + delivery count + delivery token (receipt handle is recomputed via `receiptHandleForMessage`), dead messages migrate as dead, `nextSeq = max(maxObservedSeq, seqCounter) + 1`, and metric counters are derived from observed state.
+
+`commitMigrationSnapshot` writes `snapshot|0` + `walmeta|next_lsn=1` + `walmeta|latest_snapshot_lsn=0` + the marker in **one atomic Pebble batch (Sync)**. Crash safety: the batch either fully lands or doesn't; a crash before commit means the next start re-scans (idempotent). After commit, the load-snapshot path below picks up `snapshot@0` via the descending fallback scan (LSN 0 is a valid found result, not the not-found sentinel) and replays no WAL entries (none exist with LSN > 0).
+
+**Failure modes abort startup loudly, with no partial marker written**: corrupt config JSON, corrupt message JSON, message ID mismatch between key and value, invalid message state, seq value with wrong length, or a queue with messages but no config (ambiguous). The `nextLsn > 1` shortcut writes only the marker (DB is already on the new layout from a prior start) so we never re-scan a populated WAL DB. The `!hasOld` shortcut writes only the marker for a fresh DB so we never re-scan an empty store.
+
 ### Recovery
 
 `recovery.go` rebuilds the runtime model at startup. `main()` calls `initQueueManagerFromEnv`, which:
 1. Opens/creates the `walStore` from Pebble.
 2. Creates an empty `queueManager`.
-3. Loads the newest usable snapshot (per the crash-safety protocol above) and applies it.
-4. Replays WAL entries with LSN > snapshot LSN through `ApplyWALEntry`.
-5. Runs one `ReapExpired` pass to drain any in-flight messages that expired while the server was down.
+3. Runs `maybeMigrateLegacyLayout` — no-op if the durable marker exists, otherwise scans once for old-layout keys and (if present) writes `snapshot|0` + WAL meta pointers + the marker in one atomic Sync batch. See "Legacy-layout migration" above.
+4. Loads the newest usable snapshot (per the crash-safety protocol above) and applies it. For a freshly-migrated DB this is `snapshot@0` via the descending fallback scan.
+5. Replays WAL entries with LSN > snapshot LSN through `ApplyWALEntry` (none for a fresh migration — `next_lsn=1`, `latest_snapshot_lsn=0`).
+6. Runs one `ReapExpired` pass to drain any in-flight messages that expired while the server was down.
 
 `ApplyWALEntry` validates consistency strictly: duplicate queue creates, missing messages, wrong states, or stale delivery tokens fail loudly and stop startup. During replay, ready channels are not signaled because there are no consumers yet.
 
