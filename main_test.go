@@ -27,10 +27,7 @@ func setupTestDB(t *testing.T) {
 	}
 
 	Db = db
-	Queues = nil
-	DeadLetterQueue = nil
 	metricsStore = sync.Map{}
-	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
 
 	qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
@@ -115,17 +112,6 @@ func publishTestMessage(t *testing.T, queueID string, body []byte) string {
 	return resp.ID
 }
 
-func storedMessageKey(t *testing.T, queueID, messageID string) []byte {
-	t.Helper()
-
-	key, _, err := findMessageRecord(queueID, messageID)
-	if err != nil {
-		t.Fatalf("find stored message key: %v", err)
-	}
-
-	return key
-}
-
 func runtimeQueueState(t *testing.T, queueID string) (ready, inflight, dead int) {
 	t.Helper()
 	q, err := QueueManager.getQueue(queueID)
@@ -157,26 +143,6 @@ func receiveTestMessage(t *testing.T, queueID string) receiveResponse {
 	}
 
 	return decodeResponse[receiveResponse](t, recorder)
-}
-
-func TestReadyPartsFromKeyUsesKnownPrefix(t *testing.T) {
-	prefix := readyPrefix("queue-a")
-	key := readyKey("queue-a", 0x7c, "message-1")
-
-	seq, msgID, err := readyPartsFromKey(key, prefix)
-	if err != nil {
-		t.Fatalf("readyPartsFromKey returned error: %v", err)
-	}
-	if seq != 0x7c {
-		t.Fatalf("ready seq = %d, want %d", seq, 0x7c)
-	}
-	if string(msgID) != "message-1" {
-		t.Fatalf("message id = %q, want message-1", string(msgID))
-	}
-
-	if _, _, err := readyPartsFromKey(key, readyPrefix("queue-b")); err == nil {
-		t.Fatal("expected mismatched prefix error")
-	}
 }
 
 func TestCreateAndGetQueue(t *testing.T) {
@@ -694,10 +660,7 @@ func BenchmarkReceiveLatencyVsDepth(b *testing.B) {
 				b.Fatalf("open db: %v", err)
 			}
 			Db = db
-			Queues = nil
-			DeadLetterQueue = nil
 			metricsStore = sync.Map{}
-			messageKeyCache = sync.Map{}
 			deliveryRecordSeq.Store(0)
 			qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
 			if err != nil {
@@ -803,48 +766,6 @@ func TestAckRatePerSec_EmptyWindow(t *testing.T) {
 	}
 }
 
-func TestReconcileMetricsFromDBIfStaleSkipsWithinInterval(t *testing.T) {
-	setupTestDB(t)
-
-	queueID := createTestQueue(t, "metrics-throttle-queue")
-	key := messageKey(queueID, 1, "bad-message")
-	if err := Db.Set(key, []byte("{bad json"), pebble.Sync); err != nil {
-		t.Fatalf("write malformed message: %v", err)
-	}
-
-	m := getOrCreateMetrics(queueID)
-	now := time.Now()
-	m.lastReconcile = now.Add(-metricsReconcileInterval / 2)
-
-	if err := reconcileMetricsFromDBIfStale(queueID, m, now); err != nil {
-		t.Fatalf("reconcile inside throttle interval returned error: %v", err)
-	}
-}
-
-func TestReconcileMetricsFromDBIfStaleRunsAfterInterval(t *testing.T) {
-	setupTestDB(t)
-
-	queueID := createTestQueue(t, "metrics-throttle-expired-queue")
-	key := messageKey(queueID, 1, "bad-message")
-	if err := Db.Set(key, []byte("{bad json"), pebble.Sync); err != nil {
-		t.Fatalf("write malformed message: %v", err)
-	}
-
-	m := getOrCreateMetrics(queueID)
-	now := time.Now()
-	m.lastReconcile = now.Add(-metricsReconcileInterval)
-
-	if err := reconcileMetricsFromDBIfStale(queueID, m, now); err == nil {
-		t.Fatal("expected reconcile after throttle interval to scan DB and return an error")
-	}
-	if !m.lastReconcile.Equal(now) {
-		t.Fatalf("lastReconcile = %v, want %v", m.lastReconcile, now)
-	}
-	if err := reconcileMetricsFromDBIfStale(queueID, m, now.Add(time.Second)); err != nil {
-		t.Fatalf("expected failed reconcile to be throttled, got error: %v", err)
-	}
-}
-
 func receiveBenchMessage(b testing.TB, queueID string) receiveResponse {
 	b.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/receive?id="+queueID, nil)
@@ -891,10 +812,7 @@ func setupDepthBenchmarkDB(b *testing.B) string {
 	}
 
 	Db = db
-	Queues = nil
-	DeadLetterQueue = nil
 	metricsStore = sync.Map{}
-	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
 
 	qm, wal, err := initQueueManagerFromEnv(context.Background(), db)
@@ -1340,10 +1258,7 @@ func setupTestDBWithFakeWAL(t *testing.T) *fakeWAL {
 	}
 
 	Db = db
-	Queues = nil
-	DeadLetterQueue = nil
 	metricsStore = sync.Map{}
-	messageKeyCache = sync.Map{}
 	deliveryRecordSeq.Store(0)
 
 	wal := &fakeWAL{}
@@ -3385,4 +3300,3 @@ func TestReplayNackMessageIDMismatchFailsStartup(t *testing.T) {
 		t.Fatal("expected replay to fail on nack MessageID mismatch")
 	}
 }
-

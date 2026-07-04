@@ -2,8 +2,6 @@ package main
 
 import "time"
 
-var queue []int
-
 type MessageState string
 
 const (
@@ -39,10 +37,6 @@ type Queue struct {
 	Messages   []Message `json:"messages"`
 	MaxRetries int       `json:"maxRetries"`
 }
-
-var Queues []Queue
-
-var DeadLetterQueue []Message
 
 type PublishRequest struct {
 	Message Message `json:"message"`
