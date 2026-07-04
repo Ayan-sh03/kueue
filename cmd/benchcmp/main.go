@@ -112,18 +112,24 @@ func runCompare(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if baselinePath == "" || currentPath == "" {
-		fmt.Fprintln(stderr, "-baseline and -current are required")
+		if !writeError(stderr, "-baseline and -current are required\n") {
+			return 2
+		}
 		return 2
 	}
 
 	baseline, err := loadBenchmarkDocument(baselinePath)
 	if err != nil {
-		fmt.Fprintf(stderr, "load baseline: %v\n", err)
+		if !writeError(stderr, "load baseline: %v\n", err) {
+			return 2
+		}
 		return 2
 	}
 	current, err := loadBenchmarkDocument(currentPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "load current: %v\n", err)
+		if !writeError(stderr, "load current: %v\n", err) {
+			return 2
+		}
 		return 2
 	}
 
@@ -134,23 +140,34 @@ func runCompare(args []string, stdout, stderr io.Writer) int {
 
 	if summaryOut != "" {
 		if err := os.MkdirAll(filepath.Dir(summaryOut), 0o755); err != nil {
-			fmt.Fprintf(stderr, "create summary dir: %v\n", err)
+			if !writeError(stderr, "create summary dir: %v\n", err) {
+				return 2
+			}
 			return 2
 		}
 		if err := os.WriteFile(summaryOut, []byte(summary), 0o644); err != nil {
-			fmt.Fprintf(stderr, "write summary: %v\n", err)
+			if !writeError(stderr, "write summary: %v\n", err) {
+				return 2
+			}
 			return 2
 		}
 	}
 
 	if _, err := io.WriteString(stdout, summary); err != nil {
-		fmt.Fprintf(stderr, "write summary to stdout: %v\n", err)
+		if !writeError(stderr, "write summary to stdout: %v\n", err) {
+			return 2
+		}
 		return 2
 	}
 	if result.Failed() {
 		return 1
 	}
 	return 0
+}
+
+func writeError(stderr io.Writer, format string, args ...any) bool {
+	_, err := fmt.Fprintf(stderr, format, args...)
+	return err == nil
 }
 
 func loadBenchmarkDocument(path string) (benchmarkDocument, error) {
