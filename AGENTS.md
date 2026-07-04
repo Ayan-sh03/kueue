@@ -96,8 +96,6 @@ Code is in the root package (`package main`) split across focused files (`main.g
 
 Per-queue in-memory atomic counters in `queueMetrics`, stored in a `sync.Map` (`metricsStore`). Counters (`readyCount`, `inFlightCount`, `deadCount`, `totalPublished`, `totalReceived`, `totalAcked`, `totalNacked`, `ackCountWindow`) are maintained on every mutating transition in the live runtime (publish, claim, ack, nack, reap-ready, reap-dead) and replayed via `ApplyWALEntry` on recovery (`recovery.go`). `/metrics?id=X` is O(1) w.r.t. queue depth: it only loads these atomics — no Pebble scan.
 
-`reconcileMetricsFromDB` (and `reconcileMetricsFromDBIfStale`, `metricsReconcileInterval`, `queueMetrics.reconcileMu`/`lastReconcile`, and the `snapshotMax` CAS helper) in `metrics.go` are **orphaned dead code**. The live runtime never writes per-message Pebble keys (WAL stores under `wal|`), so the scan iterates a prefix that is empty on fresh data. It is retained only for the stale-scan throttle tests in `main_test.go`; full removal is #35 (Phase 2.10). Do not rely on it for correctness.
-
 `ackCountWindow` is a per-second ack counter reset by the reaper goroutine every second (`resetAckWindow` in `reaper.go`) to feed `ackRatePerSec`; uptime fallback is `totalAcked / uptimeSeconds`.
 
 ### Reaper returns transitions
@@ -168,7 +166,7 @@ Legacy layout scanned (all written by the pre-WAL handlers):
 
 ## Testing
 
-Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `messageKeyCache`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `QueueManager.ReapExpired` synchronously.
+Tests in `main_test.go` use `httptest.NewRecorder` + direct handler calls against a temp Pebble DB. No HTTP server startup. Pattern: `setupTestDB(t)` opens Pebble in `t.TempDir()` and resets global state including `metricsStore`, `QueueManager`, and `WAL`. Tests do NOT test the reaper goroutine directly — they call `QueueManager.ReapExpired` synchronously.
 
 Runtime/WAL/recovery tests typically build state through the runtime API, close the Pebble DB, reopen it, and call `recoverQueueManager` / `ApplyWALEntry` to verify that the in-memory model is rebuilt correctly.
 
@@ -178,8 +176,8 @@ There is also `cmd/bench/main_test.go` for benchmark tool tests.
 
 ## Known gotchas
 
-- `var queue []int` (line 25) and `var Queues []Queue` / `var DeadLetterQueue []Message` (lines 88-89) are legacy in-memory remnants. They should not be used.
-- Legacy Pebble key functions (`messageKey`, `readyKey`, `inflightKey`, `nextMessageSequence`, `findMessageRecord`, key builders) and `store.go` functions remain in the codebase but are off the live handler path. Some are still referenced by metrics reconciliation tests (`TestReconcileMetricsFromDBIfStale*`) and `TestReadyPartsFromKeyUsesKnownPrefix`. Full removal is #35 (Phase 2.10).
+- The live hot path does not write or scan per-message Pebble keys. Pebble stores WAL/snapshot/migration metadata; message state lives in `queueRuntime` and is recovered from snapshots + WAL replay.
+- Legacy Pebble key builders (`messageKey`, `readyKey`, `inflightKey`) remain only to seed old-layout migration tests and document the import format. Do not use them in handlers, metrics, or reaper code.
 - `reapExpiredMessages` scanned ALL keys with no prefix filter — it iterated the entire DB via a snapshot. This was the legacy reaper path; it has been removed. The live reaper uses `QueueManager.ReapExpired` which pops from a per-queue deadline min-heap.
 - Pebble `Batch.Get()` returns `(val []byte, closer io.Closer, err error)`. Always call `closer.Close()` after reading the value.
 - The `Db` package global is set in `main()` and used everywhere. Tests set it in `setupTestDB`.

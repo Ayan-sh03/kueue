@@ -42,7 +42,7 @@ POST /publish
 
 ```json
 POST /ack
-{ "queueId": "<id>", "messageId": "<id>", "deliveryToken": "<token>" }
+{ "queueId": "<id>", "receiptHandle": "<handle>", "deliveryToken": "<token>" }
 ```
 
 ## Run
@@ -60,6 +60,18 @@ Environment variables:
 - `KUEUE_WAL_COMPACT_BATCH` - Max keys per Pebble Delete batch during WAL compaction / snapshot pruning (default: `1000`; `0` = single unbounded batch)
 - `KUEUE_MAX_IN_MEMORY_MESSAGES` / `KUEUE_MAX_IN_MEMORY_BYTES` - Per-queue in-memory limits (`0` = unlimited)
 - `KUEUE_CPU_PROFILE` - Write a CPU profile to this path when set
+
+## Durability and Recovery
+
+kueue keeps live queue state in memory and persists every mutating operation to a Pebble-backed WAL. Pebble is not used as the message hot path: publish, receive, ack, nack, metrics, and reaping operate on `queueRuntime`, then recovery rebuilds that runtime from the latest snapshot plus WAL entries after the snapshot LSN.
+
+`KUEUE_WAL_SYNC=none` commits WAL batches with `pebble.NoSync`, which is fastest but can lose the most recent OS-buffered writes on process or machine failure. `batch` and `always` both commit the grouped WAL batch with `pebble.Sync`; concurrent appends are coalesced so many operations can share one fsync while preserving WAL order.
+
+Snapshots are consistent checkpoints of queues, ready/in-flight/dead messages, delivery tokens, visibility deadlines, and durable metrics. Snapshot data and the latest-snapshot pointer are written atomically; if the pointed snapshot is missing or corrupt at startup, recovery walks older snapshots and repairs the pointer. WAL compaction only deletes entries at or below a durable snapshot LSN.
+
+`KUEUE_MAX_IN_MEMORY_MESSAGES` and `KUEUE_MAX_IN_MEMORY_BYTES` are per-queue admission limits enforced on publish. They bound live queued message count or body bytes for ready/in-flight/dead runtime state; `0` means unlimited.
+
+On startup, kueue runs a one-time migration for databases created by the old Pebble message-key hot path. It scans legacy queue/message/index keys once, writes a snapshot at LSN 0 plus the migration marker in one synced batch, then uses normal snapshot + WAL replay. Corrupt or ambiguous legacy data aborts startup without writing the marker.
 
 ## Benchmark
 
