@@ -143,7 +143,6 @@ func benchmarkJSON(sections ...benchSection) string {
 		b.WriteString(`,"payloadBytes":`)
 		b.WriteString(formatTestInt(section.PayloadBytes))
 		b.WriteString(`}}]}}`)
-		b.WriteString(`}`)
 	}
 	b.WriteString(`]}`)
 	return b.String()
