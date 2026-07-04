@@ -5,6 +5,13 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: "Fail the workflow on benchmark gate violations"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   benchmark:
@@ -15,6 +22,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+
+      - name: Preserve checked-in benchmark baseline
+        run: |
+          mkdir -p benchmark-results
+          cp benchmark-results/latest.json benchmark-results/baseline.json
 
       - name: Start kueue server
         run: |
@@ -49,8 +61,31 @@ jobs:
             -json-out=benchmark-results/latest.json
           cat benchmark-results/latest.json
 
+      - name: Compare benchmark results
+        env:
+          BENCHMARK_STRICT: ${{ vars.BENCHMARK_STRICT }}
+          WORKFLOW_DISPATCH_STRICT: ${{ inputs.strict }}
+        run: |
+          strict_arg=""
+          if [ "${BENCHMARK_STRICT}" = "true" ] || [ "${WORKFLOW_DISPATCH_STRICT}" = "true" ]; then
+            strict_arg="-strict"
+          fi
+
+          set +e
+          go run ./cmd/benchcmp \
+            -baseline=benchmark-results/baseline.json \
+            -current=benchmark-results/latest.json \
+            -summary-out=benchmark-results/comparison.md \
+            ${strict_arg}
+          status=$?
+          cat benchmark-results/comparison.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: benchmark-results/latest.json
+          path: |
+            benchmark-results/latest.json
+            benchmark-results/baseline.json
+            benchmark-results/comparison.md
