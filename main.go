@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,16 @@ type app struct {
 
 	reaperCancel context.CancelFunc
 	reaperDone   <-chan struct{}
+
+	// baseCtx is the parent of every request context (installed via
+	// srv.BaseContext). It is independent of the signal context so a SIGTERM
+	// does not cancel in-flight requests immediately — they get the full drain
+	// budget first. baseCancel is fired only when the drain deadline is
+	// exceeded, to unwind stragglers cleanly before Pebble closes. inflight
+	// tracks handlers so shutdown can wait for them to return after cancelling.
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	inflight   sync.WaitGroup
 }
 
 // newRouter builds the HTTP route table on a private ServeMux so the server
@@ -57,6 +68,15 @@ func newRouter() *http.ServeMux {
 // error only on hard server failure or Pebble close error; HTTP drain timeouts
 // and reaper-stop timeouts are logged but do not change the exit code.
 func (a *app) run(ctx context.Context) error {
+	// baseCtx parents every request context but is deliberately rooted in
+	// Background, not ctx, so signalling shutdown does not instantly cancel
+	// in-flight handlers. shutdown() cancels it only after the drain budget is
+	// spent. The defer covers the clean-exit paths where it is never fired.
+	a.baseCtx, a.baseCancel = context.WithCancel(context.Background())
+	defer a.baseCancel()
+	a.srv.BaseContext = func(net.Listener) context.Context { return a.baseCtx }
+	a.srv.Handler = a.trackInflight(a.srv.Handler)
+
 	reaperCtx, cancel := context.WithCancel(ctx)
 	a.reaperCancel = cancel
 	a.reaperDone = startReaper(reaperCtx)
@@ -91,7 +111,16 @@ func (a *app) shutdown() error {
 	defer cancel()
 
 	if err := a.srv.Shutdown(shutdownCtx); err != nil {
+		// Drain deadline hit with requests still in flight. Cancel their
+		// contexts so the write path unwinds through walStore.Append's
+		// ctx.Err() guard (a clean 503) instead of racing db.Close and
+		// surfacing a closed-storage 500, then wait — bounded — for those
+		// handlers to actually return before Pebble closes underneath them.
 		log.Printf("http shutdown: %v", err)
+		if a.baseCancel != nil {
+			a.baseCancel()
+		}
+		a.waitInflight(a.shutdownTimeout)
 	}
 
 	a.stopReaper()
@@ -100,6 +129,33 @@ func (a *app) shutdown() error {
 		return fmt.Errorf("close db: %w", err)
 	}
 	return nil
+}
+
+// trackInflight wraps the handler so shutdown can wait for in-flight requests
+// to return after cancelling their contexts.
+func (a *app) trackInflight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.inflight.Add(1)
+		defer a.inflight.Done()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// waitInflight blocks until every in-flight handler has returned or timeout
+// elapses. The bound guarantees a handler that ignores its cancelled context
+// can never wedge shutdown; if it fires, we close Pebble regardless and that
+// straggler may still see a closed-storage error — the pathological case.
+func (a *app) waitInflight(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		a.inflight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Println("in-flight requests did not drain within shutdown timeout after cancel")
+	}
 }
 
 // stopReaper cancels the reaper context and waits for the goroutine to exit,
