@@ -991,6 +991,16 @@ func (qm *queueManager) maybeSnapshot(ctx context.Context, now time.Time) (uint6
 	if qm == nil || qm.walStore == nil {
 		return 0, nil
 	}
+	// Hold the close gate across the whole snapshot (take + compact + prune) so
+	// Close waits for an in-flight snapshot to finish before closing Pebble, and
+	// a tick that fires after Close cleanly skips instead of writing to a closed
+	// DB — the reaper's counterpart to the Append gate.
+	w := qm.walStore
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed.Load() {
+		return 0, nil
+	}
 	cfg := qm.snapshotCfg
 	if cfg.opsThreshold == 0 && cfg.secondsThreshold == 0 {
 		return 0, nil

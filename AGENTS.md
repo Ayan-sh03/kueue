@@ -9,7 +9,7 @@ kueue is a persistent message queue server written in Go. Single binary, no depe
 ```bash
 go test ./...          # run all tests (always run after changes)
 go build ./...          # verify compilation
-go run main.go          # run the server (PORT=8080, KUEUE_DB_PATH=./tmp/pebble)
+go run main.go          # run the server (PORT=8080, KUEUE_DB_PATH=./tmp/pebble, KUEUE_SHUTDOWN_TIMEOUT_SEC=10)
 go run ./cmd/bench      # run benchmarks against kueue and/or rabbitmq
 ```
 
@@ -103,6 +103,10 @@ Per-queue in-memory atomic counters in `queueMetrics`, stored in a `sync.Map` (`
 ### Reaper returns transitions
 
 `QueueManager.ReapExpired` returns `[]reapTransition{QueueID, ToState}`. The reaper goroutine updates per-queue metrics per transition and only calls `signalQueueReady` when `ToState == StateReady` — dead-letter transitions must not wake long-polling consumers.
+
+### Process lifecycle (graceful shutdown)
+
+`main.go` owns an `app` struct that wires the HTTP server (`http.Server` on a private `ServeMux` from `newRouter`, served via an injected `net.Listener`), the reaper goroutine, and Pebble. `signal.NotifyContext` cancels the main context on `SIGINT`/`SIGTERM` (SIGHUP ignored), which makes `app.run` enter its ordered teardown: `srv.Shutdown(ctx)` stops accepting new connections and drains in-flight handlers, then the reaper context is cancelled and `stopReaper` waits for its `done` channel (an in-flight tick is allowed to finish; the wait is bounded by the shutdown timeout so a stuck tick never blocks exit), then `db.Close()` runs last. The drain deadline is `KUEUE_SHUTDOWN_TIMEOUT_SEC` (default `10`; `0`/invalid falls back to `10`). The reaper's mutating work uses `context.Background()` so an interrupted tick is not cancelled mid-WAL-append; only the loop control observes the reaper ctx, so the current tick always runs to completion. HTTP drain timeouts and reaper-stop timeouts are logged but do not change the exit code; only a server-start failure or a Pebble close error makes `run` return non-nil (and `main` then `log.Fatalf`). The `shutdown_test.go` integration test asserts Shutdown waits for an in-flight handler to finish and that new connections are refused after teardown.
 
 ### Runtime model
 
