@@ -998,7 +998,7 @@ func (qm *queueManager) maybeSnapshot(ctx context.Context, now time.Time) (uint6
 	w := qm.walStore
 	w.closeMu.RLock()
 	defer w.closeMu.RUnlock()
-	if w.closed {
+	if w.closed.Load() {
 		return 0, nil
 	}
 	cfg := qm.snapshotCfg

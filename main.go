@@ -140,7 +140,7 @@ func (a *app) shutdown() error {
 // app). Idempotent via walStore.Close.
 func (a *app) closeStorage() error {
 	if a.wal != nil {
-		return a.wal.Close()
+		return a.wal.Close(a.shutdownTimeout)
 	}
 	if a.db != nil {
 		return a.db.Close()
@@ -252,16 +252,24 @@ func main() {
 	}
 
 	a := &app{
-		db:              db,
-		qm:              qm,
-		wal:             wal,
-		srv:             &http.Server{Handler: newRouter()},
+		db: db,
+		qm: qm,
+		wal: wal,
+		srv: &http.Server{
+			Handler: newRouter(),
+			// Bound the header read so a slow-loris client cannot hold a
+			// connection open indefinitely without completing its request.
+			ReadHeaderTimeout: 10 * time.Second,
+		},
 		ln:              ln,
 		shutdownTimeout: shutdownTimeoutFromEnv(),
 	}
 
 	// NotifyContext cancels the main context on SIGINT/SIGTERM, which makes
-	// run() enter its ordered shutdown path. SIGHUP is intentionally ignored.
+	// run() enter its ordered shutdown path. SIGHUP would otherwise terminate
+	// the process by default (bypassing graceful shutdown), so ignore it
+	// explicitly to match that intent.
+	signal.Ignore(syscall.SIGHUP)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

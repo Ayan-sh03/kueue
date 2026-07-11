@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -159,13 +160,16 @@ type walStore struct {
 	syncMode          walSyncMode
 
 	// closeMu gates db access against Close. Every storage op holds it for
-	// read; Close takes it for write, which blocks until in-flight ops release
-	// their read-lease and forces any later op to observe closed. This is what
-	// guarantees Pebble is never touched concurrently with, or after, its
-	// Close — even when a shutdown drain deadline is exceeded with a handler or
-	// reaper tick still running. closed is guarded by closeMu.
-	closeMu sync.RWMutex
-	closed  bool
+	// read; Close takes it for write, which waits (bounded) for in-flight ops to
+	// release their read-lease and forces any later op to observe closed. This
+	// guarantees Pebble is not touched concurrently with, or after, its Close —
+	// even when a shutdown drain deadline is exceeded with a handler or reaper
+	// tick still running. closed is atomic so Close can force-close after its
+	// bound without holding the write lock.
+	closeMu   sync.RWMutex
+	closed    atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 
 	// opsSinceSnapshot counts successful Append commits since the last
 	// snapshot. Bumped by the Append leader after a successful commit. The
@@ -256,7 +260,7 @@ func (w *walStore) Append(ctx context.Context, entries []walEntry) (firstLSN, la
 	// instead of writing to a closed handle.
 	w.closeMu.RLock()
 	defer w.closeMu.RUnlock()
-	if w.closed {
+	if w.closed.Load() {
 		return 0, 0, ErrStorageClosed
 	}
 	if err := ctx.Err(); err != nil {
@@ -363,25 +367,50 @@ func (w *walStore) Append(ctx context.Context, entries []walEntry) (firstLSN, la
 	return firstLSN, lastLSN, retErr
 }
 
-// Close shuts the underlying Pebble store. It takes the close gate for write,
-// which blocks until every in-flight Append/snapshot read-lease is released, so
-// no storage op is ever mid-flight when Pebble closes. Idempotent: a second
-// call is a no-op. After it returns, later storage ops fail with
-// ErrStorageClosed rather than touching a closed handle.
-func (w *walStore) Close() error {
+// Close shuts the underlying Pebble store. It marks the store closed (so new
+// storage ops fail fast with ErrStorageClosed without touching Pebble) and then
+// waits — bounded by timeout — for in-flight Append/snapshot read-leases to
+// drain before closing the handle, so no storage op is mid-flight when Pebble
+// closes. If a genuinely stuck op does not drain within the budget, Close
+// forces the close anyway so shutdown cannot hang; that straggler then observes
+// a closed handle rather than corrupting anything (Pebble rejects ops on a
+// closing DB). Idempotent: Pebble is closed only once and repeated calls return
+// the same error.
+func (w *walStore) Close(timeout time.Duration) error {
 	if w == nil {
 		return nil
 	}
-	w.closeMu.Lock()
-	defer w.closeMu.Unlock()
-	if w.closed {
-		return nil
+	w.closed.Store(true) // stop new ops immediately; they fail fast, no db touch
+
+	// Close under the write lock so no in-flight read-lease is active when
+	// Pebble closes; the helper goroutine wins the lock only once every lease
+	// has drained. If a genuinely stuck op does not drain within the budget,
+	// force the close so shutdown cannot hang. closeDB is once-guarded, so the
+	// forced path and the (later) goroutine path never double-close.
+	result := make(chan error, 1)
+	go func() {
+		w.closeMu.Lock()
+		defer w.closeMu.Unlock()
+		result <- w.closeDB()
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(timeout):
+		log.Printf("wal close: in-flight storage did not drain within %s; forcing close", timeout)
+		return w.closeDB()
 	}
-	w.closed = true
-	if w.db == nil {
-		return nil
-	}
-	return w.db.Close()
+}
+
+// closeDB closes the Pebble handle exactly once, memoizing the result so the
+// bounded-wait and forced-close paths in Close agree on the outcome.
+func (w *walStore) closeDB() error {
+	w.closeOnce.Do(func() {
+		if w.db != nil {
+			w.closeErr = w.db.Close()
+		}
+	})
+	return w.closeErr
 }
 
 func (w *walStore) Replay(ctx context.Context, afterLSN uint64, apply func(walEntry) error) error {

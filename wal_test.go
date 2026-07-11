@@ -223,10 +223,10 @@ func TestWALStoreCloseGate(t *testing.T) {
 	}
 
 	// Close, then a second Close (idempotent — must not double-close Pebble).
-	if err := store.Close(); err != nil {
+	if err := store.Close(time.Second); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if err := store.Close(); err != nil {
+	if err := store.Close(time.Second); err != nil {
 		t.Fatalf("second close: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestWALStoreCloseGate(t *testing.T) {
 	// Concurrent post-close appenders all fail cleanly; run under -race to catch
 	// any unsynchronized access to the closed flag.
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -248,6 +248,41 @@ func TestWALStoreCloseGate(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestWALStoreCloseDoesNotHangOnStuckLease proves the bounded close: if an
+// in-flight storage op never releases its read-lease, Close still returns
+// (forcing the close after its budget) instead of hanging shutdown forever.
+func TestWALStoreCloseDoesNotHangOnStuckLease(t *testing.T) {
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	store, err := newWalStore(db, walSyncNone)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("new WAL store: %v", err)
+	}
+
+	// Simulate a stuck in-flight op by holding the read-lease and never
+	// releasing it during the close attempt.
+	store.closeMu.RLock()
+
+	done := make(chan error, 1)
+	go func() { done <- store.Close(100 * time.Millisecond) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("forced close returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		store.closeMu.RUnlock()
+		t.Fatal("Close hung on a stuck read-lease instead of forcing the close")
+	}
+
+	// Releasing the lease lets the internal drain goroutine finish cleanly.
+	store.closeMu.RUnlock()
 }
 
 func TestWALStoreAppendAssignsIncreasingLSNsAndPersistsNext(t *testing.T) {
