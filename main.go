@@ -96,7 +96,7 @@ func (a *app) run(ctx context.Context) error {
 	case err := <-errCh:
 		// Server exited on its own (e.g. bind error). Tear the rest down.
 		a.stopReaper()
-		_ = a.db.Close()
+		_ = a.closeStorage()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
@@ -112,10 +112,9 @@ func (a *app) shutdown() error {
 
 	if err := a.srv.Shutdown(shutdownCtx); err != nil {
 		// Drain deadline hit with requests still in flight. Cancel their
-		// contexts so the write path unwinds through walStore.Append's
-		// ctx.Err() guard (a clean 503) instead of racing db.Close and
-		// surfacing a closed-storage 500, then wait — bounded — for those
-		// handlers to actually return before Pebble closes underneath them.
+		// contexts so the write path unwinds through walStore.Append's guards
+		// (a clean 503) instead of racing db.Close, then wait — bounded — for
+		// those handlers to return before we close storage.
 		log.Printf("http shutdown: %v", err)
 		if a.baseCancel != nil {
 			a.baseCancel()
@@ -125,8 +124,26 @@ func (a *app) shutdown() error {
 
 	a.stopReaper()
 
-	if err := a.db.Close(); err != nil {
+	// closeStorage takes the walStore close gate, which waits for any in-flight
+	// Append or reaper snapshot to finish and forces later ones to fail with
+	// ErrStorageClosed. This is the hard guarantee behind the bounded drains
+	// above: even if a straggler handler or a reaper tick outlived its timeout,
+	// Pebble is never closed underneath live storage work.
+	if err := a.closeStorage(); err != nil {
 		return fmt.Errorf("close db: %w", err)
+	}
+	return nil
+}
+
+// closeStorage closes Pebble through the walStore close gate when a walStore is
+// present, falling back to the raw handle otherwise (e.g. tests with a db-only
+// app). Idempotent via walStore.Close.
+func (a *app) closeStorage() error {
+	if a.wal != nil {
+		return a.wal.Close()
+	}
+	if a.db != nil {
+		return a.db.Close()
 	}
 	return nil
 }
@@ -143,8 +160,9 @@ func (a *app) trackInflight(next http.Handler) http.Handler {
 
 // waitInflight blocks until every in-flight handler has returned or timeout
 // elapses. The bound guarantees a handler that ignores its cancelled context
-// can never wedge shutdown; if it fires, we close Pebble regardless and that
-// straggler may still see a closed-storage error — the pathological case.
+// can never wedge shutdown; if it fires we proceed to close storage anyway,
+// and the walStore gate turns any late write into a clean ErrStorageClosed
+// (503) rather than a closed-DB failure.
 func (a *app) waitInflight(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {

@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/cockroachdb/pebble/v2"
 )
 
 func TestWALEncoderRoundTripsOperationPayloads(t *testing.T) {
@@ -196,6 +200,54 @@ func TestWALDecodeRejectsTruncatedFrame(t *testing.T) {
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "short wal frame") {
 		t.Fatalf("decode short frame err = %v, want short frame error", err)
 	}
+}
+
+// TestWALStoreCloseGate covers the shutdown close gate: Close is idempotent,
+// and appends after Close fail cleanly with ErrStorageClosed instead of
+// touching the closed handle. (Close blocking until in-flight read-leases drain
+// is a property of the RWMutex itself; the concurrent loop here exercises that
+// path under -race for the post-close case.)
+func TestWALStoreCloseGate(t *testing.T) {
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	store, err := newWalStore(db, walSyncNone)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("new WAL store: %v", err)
+	}
+
+	if _, _, err := store.Append(context.Background(), []walEntry{walCreateQueueEntry("q1")}); err != nil {
+		t.Fatalf("append before close: %v", err)
+	}
+
+	// Close, then a second Close (idempotent — must not double-close Pebble).
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+
+	// Appends after Close fail cleanly, without touching the closed DB.
+	if _, _, err := store.Append(context.Background(), []walEntry{walCreateQueueEntry("q2")}); !errors.Is(err, ErrStorageClosed) {
+		t.Fatalf("append after close err = %v, want ErrStorageClosed", err)
+	}
+
+	// Concurrent post-close appenders all fail cleanly; run under -race to catch
+	// any unsynchronized access to the closed flag.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := store.Append(context.Background(), []walEntry{walCreateQueueEntry("qN")}); !errors.Is(err, ErrStorageClosed) {
+				t.Errorf("concurrent post-close append err = %v, want ErrStorageClosed", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestWALStoreAppendAssignsIncreasingLSNsAndPersistsNext(t *testing.T) {

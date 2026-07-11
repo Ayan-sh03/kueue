@@ -146,12 +146,26 @@ func (m walSyncMode) writeOptions() (*pebble.WriteOptions, error) {
 	}
 }
 
+// ErrStorageClosed is returned by storage operations that run after the store
+// has begun closing during shutdown. Callers map it to a 503 so an in-flight
+// request drains as "server shutting down" instead of a closed-DB 500.
+var ErrStorageClosed = errors.New("storage is shutting down")
+
 type walStore struct {
 	mu                sync.Mutex
 	db                *pebble.DB
 	nextLSN           uint64
 	latestSnapshotLSN uint64
 	syncMode          walSyncMode
+
+	// closeMu gates db access against Close. Every storage op holds it for
+	// read; Close takes it for write, which blocks until in-flight ops release
+	// their read-lease and forces any later op to observe closed. This is what
+	// guarantees Pebble is never touched concurrently with, or after, its
+	// Close — even when a shutdown drain deadline is exceeded with a handler or
+	// reaper tick still running. closed is guarded by closeMu.
+	closeMu sync.RWMutex
+	closed  bool
 
 	// opsSinceSnapshot counts successful Append commits since the last
 	// snapshot. Bumped by the Append leader after a successful commit. The
@@ -235,6 +249,15 @@ func newWalStore(db *pebble.DB, syncMode walSyncMode) (*walStore, error) {
 func (w *walStore) Append(ctx context.Context, entries []walEntry) (firstLSN, lastLSN uint64, err error) {
 	if w == nil || w.db == nil {
 		return 0, 0, errors.New("WAL store is not initialized")
+	}
+	// Hold the close gate for the whole append. Close cannot run its db.Close
+	// until this read-lease is released (so an in-flight commit always finishes
+	// against an open DB), and an append arriving after Close returns cleanly
+	// instead of writing to a closed handle.
+	w.closeMu.RLock()
+	defer w.closeMu.RUnlock()
+	if w.closed {
+		return 0, 0, ErrStorageClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
@@ -338,6 +361,27 @@ func (w *walStore) Append(ctx context.Context, entries []walEntry) (firstLSN, la
 		w.opsSinceSnapshot.Add(int64(len(frames)))
 	}
 	return firstLSN, lastLSN, retErr
+}
+
+// Close shuts the underlying Pebble store. It takes the close gate for write,
+// which blocks until every in-flight Append/snapshot read-lease is released, so
+// no storage op is ever mid-flight when Pebble closes. Idempotent: a second
+// call is a no-op. After it returns, later storage ops fail with
+// ErrStorageClosed rather than touching a closed handle.
+func (w *walStore) Close() error {
+	if w == nil {
+		return nil
+	}
+	w.closeMu.Lock()
+	defer w.closeMu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.db == nil {
+		return nil
+	}
+	return w.db.Close()
 }
 
 func (w *walStore) Replay(ctx context.Context, afterLSN uint64, apply func(walEntry) error) error {

@@ -75,9 +75,10 @@ func respondPublishError(w http.ResponseWriter, err error) {
 		http.Error(w, "Queue Not Found", http.StatusNotFound)
 	case errors.Is(err, ErrMessageLimitExceeded), errors.Is(err, ErrByteLimitExceeded):
 		http.Error(w, err.Error(), http.StatusTooManyRequests)
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		// Request context cancelled — the server is draining for shutdown (or
-		// the client went away). Signal "try again", not a server fault.
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrStorageClosed):
+		// Request context cancelled or storage closed — the server is draining
+		// for shutdown (or the client went away). Signal "try again", not a
+		// server fault.
 		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "Error Saving Message: "+err.Error(), http.StatusInternalServerError)
