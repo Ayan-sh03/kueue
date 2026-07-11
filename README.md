@@ -75,30 +75,62 @@ On startup, kueue runs a one-time migration for databases created by the old Peb
 
 ## Benchmark
 
+End-to-end client workload (HTTP + producer/consumer process):
+
 ```bash
-go run ./cmd/bench --targets kueue
+go run ./cmd/bench --targets=kueue --messages=10000 --warmup=500 --runs=3
 ```
+
+In-process hot-path microbenchmarks (no HTTP client loop):
+
+```bash
+go test -run ^$ -bench BenchmarkBatch -benchmem
+go test -run ^$ -bench BenchmarkReaper -benchmem
+```
+
+On Windows, `scripts/run-benchmark.ps1` can start kueue (and optionally RabbitMQ) for the e2e runner. Methodology and more workloads: [docs/benchmarking.md](docs/benchmarking.md), [docs/performance-model.md](docs/performance-model.md).
 
 ## Performance
 
-Benchmarked with 10k messages, 256-byte payload, 1 producer, 10 consumers, batch receive (prefetch=10):
+Two different measurements — do not mix them up.
+
+### End-to-end (HTTP client workload)
+
+These numbers are **not** pure broker-core latency. They include HTTP request/response, JSON encoding, client concurrency, batching/prefetch, and the server's `KUEUE_WAL_SYNC` setting (often `none` in local benches). Treat them as whole-stack throughput under a specific harness, not as "time to pop a message from an in-memory list."
+
+**Default-style e2e** (10k messages, 256-byte payload, 1 producer, 10 consumers, batch receive prefetch=10):
 
 | Metric | Value |
 | --- | ---: |
 | Publish throughput | ~28,000 msg/s |
 | Consume throughput | ~8,700 msg/s |
-| Latency p50 | ~354 ms |
-| Latency p95 | ~742 ms |
-| Latency p99 | ~774 ms |
+| End-to-end latency p50 | ~354 ms |
+| End-to-end latency p95 | ~742 ms |
+| End-to-end latency p99 | ~774 ms |
 
-Apples-to-apples (1 message per round-trip, 1 consumer):
+**Apples-to-apples stress mode** (1 message per HTTP round-trip, 1 consumer) — **not** a typical production client config. It isolates per-request overhead and will show multi-second end-to-end latencies under this harness; that is expected for the mode, not a claim about core claim/ack cost:
 
 | Metric | Value |
 | --- | ---: |
 | Publish throughput | ~35,500 msg/s |
 | Consume throughput | ~1,700 msg/s |
-| Latency p50 | ~2,580 ms |
-| Latency p99 | ~5,590 ms |
+| End-to-end latency p50 | ~2,580 ms |
+| End-to-end latency p99 | ~5,590 ms |
+
+Reproduce e2e: `go run ./cmd/bench --targets=kueue` (see [docs/benchmarking.md](docs/benchmarking.md)). More detail and historical runs: [docs/benchmark-results.md](docs/benchmark-results.md).
+
+This project does **not** claim Kafka or RabbitMQ feature parity; any multi-target bench is a workload comparison under the shared harness only.
+
+### In-process core (microbenchmarks)
+
+For broker hot-path cost vs queue depth, use Go benchmarks. After the in-memory runtime path, batch receive/ack stay roughly **flat across depths** (no per-depth key scan). Example from [docs/performance-model.md](docs/performance-model.md) (legacy Pebble hot path vs runtime, Windows i5-1235U):
+
+| Benchmark | Legacy (ns/op) | Runtime (ns/op) | Speedup |
+| --- | ---: | ---: | ---: |
+| ReceiveLatencyVsDepth/depth_10000 | 2,807,000 | 26,052 | **~108×** |
+| BatchReceiveOnly/depth_10000 | 2,382,000 | 44,731 | **~53×** |
+
+Full table, complexity model, and reproduce commands: [docs/performance-model.md](docs/performance-model.md).
 
 ## Test
 
