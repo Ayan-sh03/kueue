@@ -57,6 +57,8 @@ Metrics reported (per OpenMessaging standard):
 Workload presets align with OpenMessaging canonical patterns:
 - Max-rate (1p/1c), competing consumers (1p/Nc), backlog drain, message size sweep
 
+E2e bench numbers include HTTP + client behavior and `KUEUE_WAL_SYNC`; they are not pure broker-core latency. For hot-path complexity and in-process microbenchmarks (claim/ack vs depth), see `docs/performance-model.md` and the README Performance section.
+
 ## Architecture
 
 Code is in the root package (`package main`) split across focused files (`main.go`, `runtime.go`, `wal.go`, `recovery.go`). There is no sub-package splitting yet.
